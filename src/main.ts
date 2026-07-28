@@ -1,0 +1,52 @@
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import { json, urlencoded } from 'express';
+
+// Patch BigInt serialization globally to support database BigInt types
+(BigInt.prototype as any).toJSON = function () {
+  return this.toString();
+};
+
+import { ValidationPipe } from '@nestjs/common';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  
+  // Global Input Validation & DTO Whitelist Sanitization (Protects against Parameter Pollution)
+  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true, forbidUnknownValues: false }));
+
+  // Body payload limit set to safe 50MB
+  app.use(json({ limit: '50mb' }));
+  app.use(urlencoded({ limit: '50mb', extended: true }));
+  
+  app.setGlobalPrefix('api');
+  
+  // Production vs Local Environment-aware CORS with full Subdomain support (*.localhost:3000 & *.fotosetgo.com)
+  app.enableCors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, curl, server-to-server)
+      if (!origin) return callback(null, true);
+
+      if (process.env.NODE_ENV === 'production') {
+        const isAllowedProd = 
+          origin === 'https://fotosetgo.com' ||
+          origin === 'https://admin.fotosetgo.com' ||
+          origin === 'https://api.fotosetgo.com' ||
+          origin.endsWith('.fotosetgo.com');
+        return callback(null, isAllowedProd);
+      } else {
+        // Development mode: Allow localhost, 127.0.0.1, and subdomains like chitrkalaclicks.localhost:3000
+        const isAllowedDev = 
+          origin.includes('localhost') || 
+          origin.includes('127.0.0.1');
+        return callback(null, isAllowedDev);
+      }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  });
+
+  await app.listen(process.env.PORT ?? 5000);
+}
+bootstrap();

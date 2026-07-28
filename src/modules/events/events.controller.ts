@@ -1,0 +1,47 @@
+import { Controller, Get, Post, Put, Delete, Body, Param, UseGuards } from '@nestjs/common';
+import { EventsService } from './events.service';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
+
+@UseGuards(JwtAuthGuard)
+@Controller('events')
+export class EventsController {
+  constructor(private eventsService: EventsService) {}
+
+  @Post()
+  async create(@CurrentUser() user: any, @Body() body: any) {
+    return this.eventsService.create(user.photographer.id, body);
+  }
+
+  @Get()
+  async findAll(@CurrentUser() user: any) {
+    return this.eventsService.findAll(user.photographer.id);
+  }
+
+  @Get(':id')
+  async findOne(@CurrentUser() user: any, @Param('id') id: string) {
+    return this.eventsService.findOne(user.photographer.id, id);
+  }
+
+  @Put(':id')
+  async update(@CurrentUser() user: any, @Param('id') id: string, @Body() body: any) {
+    return this.eventsService.update(user.photographer.id, id, body);
+  }
+
+  @Delete(':id')
+  async remove(@CurrentUser() user: any, @Param('id') id: string) {
+    return this.eventsService.softDelete(user.photographer.id, id);
+  }
+
+  @Post(':id/restore')
+  async restore(@CurrentUser() user: any, @Param('id') id: string) {
+    return this.eventsService.restore(user.photographer.id, id);
+  }
+
+  @Delete(':id/permanent')
+  async hardRemove(@CurrentUser() user: any, @Param('id') id: string) {
+    return this.eventsService.remove(user.photographer.id, id);
+  }
+}
+
+

@@ -1,0 +1,442 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum UserRole {
+  PHOTOGRAPHER
+  CLIENT
+  ADMIN
+}
+
+enum EventStatus {
+  DRAFT
+  PROCESSING
+  PUBLISHED
+  ARCHIVED
+}
+
+enum EventVisibility {
+  PUBLIC
+  PRIVATE
+  UNLISTED
+}
+
+enum PhotoStatus {
+  UPLOADING
+  UPLOADED
+  PROCESSING
+  READY
+  FAILED
+  PENDING_APPROVAL
+}
+
+model User {
+  id           String        @id @default(uuid())
+  role         UserRole      @default(PHOTOGRAPHER)
+  name         String
+  email        String        @unique
+  phone        String?
+  passwordHash String
+  avatarUrl    String?
+  isActive     Boolean       @default(true)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  photographer Photographer?
+  sessions     UserSession[]
+  loginLogs    LoginLog[]
+
+  @@map("users")
+}
+
+model Photographer {
+  id                    String         @id @default(uuid())
+  userId                String         @unique
+  user                  User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  studioName            String?
+  slug                  String         @unique
+  city                  String?
+  state                 String?
+  bio                   String?
+  website               String?
+  totalStorageUsedBytes BigInt         @default(0)
+  activePackageId       String?
+  watermarkType         String         @default("NONE") // NONE, TEXT, IMAGE
+  watermarkText         String?
+  watermarkImageKey     String?
+  watermarkPosition     String         @default("CENTER") // CENTER, BOTTOM_RIGHT, TILE
+  watermarkOpacity      Int            @default(50) // 10 to 90
+  watermarkSize         String         @default("MEDIUM") // SMALL, MEDIUM, LARGE
+  studioLogoKey         String?
+  studioSubdomain       String?        @unique
+  primaryColor          String?
+  secondaryColor        String?
+  instagramUrl          String?
+  facebookUrl           String?
+  whatsappPhone         String?
+  studioHeroBannerKey   String?
+  studioFontFamily      String?
+  seoTitle              String?
+  seoDescription        String?
+  hidePoweredBy         Boolean        @default(false)
+  customFooterText      String?
+  portfolioEnabled       Boolean        @default(false)
+  portfolioTheme         String         @default("ELEGANT") // ELEGANT, MODERN_DARK, BOLD_MINIMAL, VIBRANT
+  portfolioHeroTitle     String?
+  portfolioHeroSubtitle  String?
+  portfolioAboutTitle    String?
+  portfolioAboutText     String?
+  portfolioAboutImageKey String?
+  portfolioHeroImageKey  String?
+  portfolioMapEmbed      String?
+  portfolioPackages      Json?          // Array of pricing packages: [{ name, price, details }]
+  portfolioServices      Json?          // Array of services: [{ title, desc, price }]
+  portfolioTestimonials  Json?          // Array of testimonials: [{ name, event, text, rating }]
+  portfolioStats         Json?          // Milestones: { weddings, experience, clients, photos }
+  portfolioFaqs          Json?          // Array of FAQs: [{ question, answer }]
+  portfolioVideoUrl      String?        // Video link: YouTube/Vimeo
+  portfolioProcess       Json?          // Array of process steps: [{ step, title, desc }]
+  portfolioBtsUrl        String?        // BTS Video link or photo
+  portfolioEquipment     Json?          // Array of gear: [{ category, items }]
+  portfolioDestinations  Json?          // Array of cities/destinations covered: [string]
+  portfolioBookingPolicy String?        // Booking terms & conditions text
+  portfolioPress         Json?          // Array of press/publications: [string]
+  portfolioReels         Json?          // Array of Reels/Shorts: [{ title, url, r2Key }]
+  portfolioStyles        Json?          // Array of signature styles: [{ title, desc }]
+  portfolioPhone         String?        // Studio phone for portfolio contact page
+  portfolioEmail         String?        // Studio email for portfolio contact page
+  portfolioAddress       String?        // Studio office address for portfolio contact page
+  portfolioWhatsapp      String?        // Studio WhatsApp number for portfolio contact page
+  portfolioPhotos        PortfolioPhoto[] // Portfolio Showcase Photos
+  portfolioInquiries    PortfolioInquiry[] // Client Leads / Inquiries from portfolio website
+  portfolioReviews      PortfolioReview[]  // Client Reviews from portfolio website
+  businessCard          BusinessCard?
+  googleDriveAccessToken     String?
+  googleDriveRefreshToken    String?
+  googleDriveConnected       Boolean        @default(false)
+  autoBackupToDrive          Boolean        @default(false)  // Auto backup all events to Google Drive
+  driveBackupFullNotified    Boolean        @default(false)  // Drive full notification sent
+  videoFaceScanningEnabled   Boolean        @default(false)
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+  subscriptions         Subscription[]
+  events                Event[]
+  photos                Photo[]
+  embeddings            FaceEmbedding[]
+  uploadBatches         UploadBatch[]
+
+  @@map("photographers")
+}
+
+
+model Package {
+  id                          String         @id @default(uuid())
+  name                        String         @unique
+  maxStorageGb                Int
+  maxEventsStorageMb          Int            @default(200)   // Event media limit in MB
+  maxPortfolioStorageMb       Int            @default(0)     // Portfolio & Branding limit in MB
+  maxPhotosPerEvent           Int
+  faceSearchLimit             Int            // count per month or -1 for unlimited
+  allowCustomBranding         Boolean        @default(false)
+  price                       Int            // price in paisa or local currency
+  isActive                    Boolean        @default(true)
+  
+  // GRANULAR FEATURE FLAGS
+  featureAiPhotoSearch        Boolean        @default(false)
+  featureAiVideoSearch        Boolean        @default(false)
+  featureCustomBranding       Boolean        @default(false)
+  featureClientSelection      Boolean        @default(false)
+  featureGuestUpload          Boolean        @default(false)
+  featurePortfolioWebsite     Boolean        @default(false)
+  featureDigitalBusinessCard  Boolean        @default(false)
+  featureAutoDriveBackup      Boolean        @default(false)
+  featureDisableDownload      Boolean        @default(false)
+  featureWatermark            Boolean        @default(false)
+
+  subscriptions               Subscription[]
+
+  @@map("packages")
+}
+
+model Subscription {
+  id                  String       @id @default(uuid())
+  photographerId      String
+  photographer        Photographer @relation(fields: [photographerId], references: [id], onDelete: Cascade)
+  packageId           String
+  package             Package      @relation(fields: [packageId], references: [id])
+  startsAt            DateTime     @default(now())
+  endsAt              DateTime
+  status              String       // ACTIVE, EXPIRED, CANCELLED
+  limitBytes          BigInt       @default(209715200)
+  limitEventsBytes    BigInt       @default(209715200)
+  limitPortfolioBytes BigInt       @default(0)
+  usedBytes           BigInt       @default(0)
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+
+  @@map("subscriptions")
+}
+
+model Event {
+  id                    String            @id @default(uuid())
+  photographerId        String
+  photographer          Photographer      @relation(fields: [photographerId], references: [id], onDelete: Cascade)
+  title                 String
+  slug                  String            @unique
+  eventType             String?           // WEDDING, CORPORATE, PORTRAIT, etc.
+  description           String?
+  coverPhotoId          String?
+  eventDate             DateTime?
+  location              String?
+  status                EventStatus       @default(DRAFT)
+  visibility            EventVisibility   @default(PRIVATE)
+  allowDownload         Boolean           @default(true)
+  allowFavorites        Boolean           @default(true)
+  faceSearchEnabled     Boolean           @default(true)
+  faceScanningEnabled   Boolean           @default(false)
+  videoScanningEnabled  Boolean           @default(false)
+  passcode              String?           @default("1234")
+  maxFavorites          Int               @default(0) // 0 means unlimited selection
+  watermarkEnabled      Boolean           @default(false)
+  themeKey              String            @default("CLASSIC_LIGHT")
+  applyThemeToClientGallery Boolean       @default(false)
+  allowGuestUploads     Boolean           @default(false)
+  maxGuestUploadFiles   Int               @default(500)
+  maxGuestUploadStorage BigInt            @default(524288000) // 500 MB in Bytes
+  isDeleted             Boolean           @default(false)
+  deletedAt             DateTime?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  photos                Photo[]
+  embeddings            FaceEmbedding[]
+  uploadBatches         UploadBatch[]
+  favorites             FavoritePhoto[]
+
+  @@map("events")
+}
+
+
+model UploadBatch {
+  id             String       @id @default(uuid())
+  eventId        String
+  event          Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  photographerId String
+  photographer   Photographer @relation(fields: [photographerId], references: [id], onDelete: Cascade)
+  totalFiles     Int
+  uploadedFiles  Int          @default(0)
+  processedFiles Int          @default(0)
+  failedFiles    Int          @default(0)
+  status         String       // PENDING, COMPLETED, PROCESSING
+  createdAt      DateTime     @default(now())
+  photos         Photo[]
+
+  @@map("upload_batches")
+}
+
+model Photo {
+  id               String              @id @default(uuid())
+  eventId          String
+  event            Event               @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  photographerId   String
+  photographer     Photographer        @relation(fields: [photographerId], references: [id], onDelete: Cascade)
+  uploadBatchId    String?
+  uploadBatch      UploadBatch?        @relation(fields: [uploadBatchId], references: [id], onDelete: SetNull)
+  filenameOriginal String
+  filenameStored   String
+  r2KeyOriginal    String
+  r2KeyPreview     String?
+  r2KeyThumb       String?
+  mimeType         String
+  fileSize         BigInt
+  status           PhotoStatus         @default(UPLOADING)
+  type             String              @default("IMAGE")
+  thumbnailUrl     String?
+  duration         Float?
+  hasFaces         Boolean             @default(false)
+  faceCount        Int                 @default(0)
+  isDeleted        Boolean             @default(false)
+  deletedAt        DateTime?
+  isGuestUpload    Boolean             @default(false)
+  backedUpToDrive  Boolean             @default(false)  // Has been uploaded to Google Drive
+  driveFileId      String?                               // Google Drive file ID reference
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  embeddings       FaceEmbedding[]
+  favorites        FavoritePhoto[]
+
+  @@map("photos")
+}
+
+model FaceEmbedding {
+  id             String       @id @default(uuid())
+  photoId        String
+  photo          Photo        @relation(fields: [photoId], references: [id], onDelete: Cascade)
+  eventId        String
+  event          Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  photographerId String
+  photographer   Photographer @relation(fields: [photographerId], references: [id], onDelete: Cascade)
+  faceIndex      Int
+  bboxX          Float
+  bboxY          Float
+  bboxW          Float
+  bboxH          Float
+  confidence     Float
+  embedding      Unsupported("vector(512)")
+  clusterId      String?      // Links confirmed face groups together persistently
+  timestamp      Float?
+  createdAt      DateTime     @default(now())
+
+  @@map("face_embeddings")
+}
+
+
+
+model UserSession {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  userAgent String?
+  ipAddress String?
+  device    String?  // Desktop, Phone
+  browser   String?
+  os        String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("user_sessions")
+}
+
+model LoginLog {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ipAddress String?
+  userAgent String?
+  device    String?
+  browser   String?
+  os        String?
+  status    String   // SUCCESS, FAILED
+  createdAt DateTime @default(now())
+
+  @@map("login_logs")
+}
+
+model FavoritePhoto {
+  id              String   @id @default(uuid())
+  photoId         String
+  photo           Photo    @relation(fields: [photoId], references: [id], onDelete: Cascade)
+  eventId         String
+  event           Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  clientSessionId String   // Group key (device session or client phone/name)
+  clientName      String?  // Name of client who selected
+  clientPhone     String?  // Phone number of client who selected
+  createdAt       DateTime @default(now())
+
+  @@unique([photoId, clientSessionId])
+  @@map("favorite_photos")
+}
+
+model PortfolioPhoto {
+  id             String       @id @default(uuid())
+  photographerId String
+  photographer   Photographer @relation(fields: [photographerId], references: [id], onDelete: Cascade)
+  r2KeyOriginal  String
+  r2KeyThumb     String
+  category       String       @default("General")
+  sortOrder      Int          @default(0)
+  createdAt      DateTime     @default(now())
+
+  @@map("portfolio_photos")
+}
+
+model PortfolioInquiry {
+  id             String       @id @default(uuid())
+  photographerId String
+  photographer   Photographer @relation(fields: [photographerId], references: [id], onDelete: Cascade)
+  clientName     String
+  clientEmail    String
+  clientPhone    String
+  eventDate      String?
+  message        String
+  createdAt      DateTime     @default(now())
+
+  @@map("portfolio_inquiries")
+}
+
+model PortfolioReview {
+  id             String       @id @default(uuid())
+  photographerId String
+  photographer   Photographer @relation(fields: [photographerId], references: [id], onDelete: Cascade)
+  clientName     String
+  clientRole     String?      // e.g. "Bride", "Groom", "Wedding Guest"
+  rating         Int          // 1-5 stars
+  comment        String
+  isApproved     Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+
+  @@map("portfolio_reviews")
+}
+
+model PortfolioTheme {
+  id            String   @id @default(uuid())
+  key           String   @unique
+  name          String
+  description   String?
+  previewBg     String   @default("bg-slate-900")
+  componentName String?
+  isActive      Boolean  @default(true)
+  isDefault     Boolean  @default(false)
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("portfolio_themes")
+}
+
+model CardTheme {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  name        String
+  badgeText   String?
+  previewBg   String   @default("from-amber-200 to-yellow-500")
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("card_themes")
+}
+
+
+model BusinessCard {
+  id             String       @id @default(uuid())
+  photographerId String       @unique
+  photographer   Photographer @relation(fields: [photographerId], references: [id], onDelete: Cascade)
+  slug           String       @unique
+  theme          String       @default("ROYAL_GOLD") // ROYAL_GOLD, MATTE_DARK, NEON_GLASS, MINIMAL_WHITE
+  displayName    String?
+  jobTitle       String?      @default("Professional Wedding & Event Photographer")
+  tagline        String?
+  bio            String?
+  phone          String?
+  whatsapp       String?
+  email          String?
+  website        String?
+  city           String?
+  instagram      String?
+  facebook       String?
+  youtube        String?
+  address        String?
+  customLinks    Json?        // Array: [{ label, url }]
+  viewsCount     Int          @default(0)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@map("business_cards")
+}

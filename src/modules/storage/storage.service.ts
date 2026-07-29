@@ -4270,12 +4270,11 @@ export class StorageService implements OnModuleInit {
         console.error('[Webhook] Background Face Indexing trigger failed:', err);
       });
     } else {
-      // Mark as READY instantly if AI is disabled
+      // Mark overall photo status as READY if AI is disabled
       await this.prisma.photo.update({
         where: { id: data.photoId },
         data: { 
-          status: 'READY',
-          faceScanStatus: 'READY'
+          status: 'READY'
         }
       });
 

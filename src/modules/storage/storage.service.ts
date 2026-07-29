@@ -994,7 +994,7 @@ export class StorageService implements OnModuleInit {
 
       // Call FastAPI Face Engine with thumbnail URL
       const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://127.0.0.1:8000';
-      const response = await fetch(`${faceEngineUrl}/faces/index-photo`, {
+      const response = await fetch(`${faceEngineUrl}/index-photo`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',

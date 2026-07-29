@@ -2310,7 +2310,6 @@ export class StorageService implements OnModuleInit {
     }
 
     let triggeredCount = 0;
-    const batchSize = 10;
     
     for (let i = 0; i < photos.length; i++) {
       const photo = photos[i];
@@ -2344,21 +2343,20 @@ export class StorageService implements OnModuleInit {
           data: { status: 'PROCESSING' }
         });
 
-        // Re-trigger background worker tasks
+        // Re-trigger background worker tasks sequentially by awaiting them, or throttle them one by one
         if (photo.type === 'VIDEO') {
-          this.runBackgroundVideoProcessing(photographerId, photo.id, eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
+          await this.runBackgroundVideoProcessing(photographerId, photo.id, eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
             console.error(`Re-indexing video processing failed for video ${photo.id}:`, err);
           });
         } else {
-          this.runBackgroundFaceIndexing(photographerId, photo.id, eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
+          // Await to ensure we only process one image resizing at a time
+          await this.runBackgroundFaceIndexing(photographerId, photo.id, eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
             console.error(`Re-indexing face recognition failed for photo ${photo.id}:`, err);
           });
         }
 
-        // Throttle database and external network queries to prevent thread choking
-        if (triggeredCount % batchSize === 0) {
-          await new Promise(resolve => setTimeout(resolve, 100)); // 100ms break
-        }
+        // 150ms sleep break after processing each single photo to allow garbage collection and event loop processing
+        await new Promise(resolve => setTimeout(resolve, 150));
       }
     }
 

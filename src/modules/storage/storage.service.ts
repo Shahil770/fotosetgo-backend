@@ -4351,5 +4351,41 @@ export class StorageService implements OnModuleInit {
       this.logger.error(`[Worker Trigger] Failed for photo ${photoId}: ${err.message}`);
     });
   }
+
+  // AI Face Toggle ON hone par call hota hai
+  async triggerFaceScanForEvent(photographerId: string, eventId: string): Promise<void> {
+    this.logger.log(`[FaceScan] Triggered for event ${eventId}`);
+
+    const photos = await this.prisma.photo.findMany({
+      where: {
+        eventId,
+        photographerId,
+        type: 'IMAGE',
+        thumbnailStatus: 'READY',
+        faceScanStatus: { not: 'READY' }
+      }
+    });
+
+    this.logger.log(`[FaceScan] ${photos.length} photos need face scanning`);
+
+    for (const photo of photos) {
+      await this.prisma.photo.update({
+        where: { id: photo.id },
+        data: { faceScanStatus: 'PROCESSING' }
+      });
+
+      this.runBackgroundFaceIndexing(
+        photographerId,
+        photo.id,
+        eventId,
+        photo.r2KeyOriginal,
+        photo.uploadBatchId
+      ).catch(err => {
+        this.logger.error(`[FaceScan] Failed for photo ${photo.id}: ${err.message}`);
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  }
 }
 

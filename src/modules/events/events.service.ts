@@ -135,8 +135,9 @@ export class EventsService {
       (faceScanningEnabled === true && event.faceScanningEnabled === false) ||
       (videoScanningEnabled === true && event.videoScanningEnabled === false)
     ) {
-      this.storageService.reindexEventPhotos(photographerId, eventId).catch(err => {
-        console.error('[EventsService] Failed to trigger auto re-indexing on toggle on:', err);
+      // Sirf face scan trigger karo - thumbnail reindexing nahi
+      this.storageService.triggerFaceScanForEvent(photographerId, eventId).catch(err => {
+        console.error('[EventsService] Failed to trigger face scan on toggle on:', err);
       });
     }
 

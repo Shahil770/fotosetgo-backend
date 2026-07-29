@@ -26,6 +26,7 @@ export class StorageService implements OnModuleInit {
   private readonly logger = new Logger(StorageService.name);
   private s3Client: S3Client;
   private bucketName: string;
+  private readonly urlCache = new Map<string, { url: string; expiresAt: number }>();
 
   constructor(
     private prisma: PrismaService,
@@ -1155,11 +1156,18 @@ export class StorageService implements OnModuleInit {
   }
 
   async getReadUrl(key: string): Promise<string> {
+    const cached = this.urlCache.get(key);
+    const now = Date.now();
+    if (cached && cached.expiresAt > now + 300000) { // 5 minutes buffer
+      return cached.url;
+    }
     const getCommand = new GetObjectCommand({
       Bucket: this.bucketName,
       Key: key,
     });
-    return getSignedUrl(this.s3Client, getCommand, { expiresIn: 3600 }); // 1 hour expiration
+    const url = await getSignedUrl(this.s3Client, getCommand, { expiresIn: 3600 }); // 1 hour expiration
+    this.urlCache.set(key, { url, expiresAt: now + 3600000 });
+    return url;
   }
 
   private async extractEmbedding(selfieFile: any): Promise<number[] | null> {
@@ -1386,8 +1394,9 @@ export class StorageService implements OnModuleInit {
         const hideDirectStorageUrl = isWatermarked || (event && !event.allowDownload);
 
         if (hideDirectStorageUrl) {
-          url = `http://localhost:5000/api/public/events/${event.slug}/photos/${photo.id}/view`;
-          thumbUrl = `http://localhost:5000/api/public/events/${event.slug}/photos/${photo.id}/view?thumb=true`;
+          const apiBase = process.env.PUBLIC_API_URL || 'http://localhost:5000';
+          url = `${apiBase}/api/public/events/${event.slug}/photos/${photo.id}/view`;
+          thumbUrl = `${apiBase}/api/public/events/${event.slug}/photos/${photo.id}/view?thumb=true`;
         } else {
           url = await this.getReadUrl(photo.r2KeyOriginal);
           thumbUrl = photo.r2KeyThumb ? await this.getReadUrl(photo.r2KeyThumb) : url;
@@ -2566,8 +2575,9 @@ export class StorageService implements OnModuleInit {
         const hideDirectStorageUrl = isWatermarked || (event && !event.allowDownload);
 
         if (hideDirectStorageUrl) {
-          url = `http://localhost:5000/api/public/events/${slug}/photos/${photo.id}/view`;
-          thumbUrl = `http://localhost:5000/api/public/events/${slug}/photos/${photo.id}/view?thumb=true`;
+          const apiBase = process.env.PUBLIC_API_URL || 'http://localhost:5000';
+          url = `${apiBase}/api/public/events/${slug}/photos/${photo.id}/view`;
+          thumbUrl = `${apiBase}/api/public/events/${slug}/photos/${photo.id}/view?thumb=true`;
         } else {
           url = await this.getReadUrl(photo.r2KeyOriginal);
           thumbUrl = photo.r2KeyThumb ? await this.getReadUrl(photo.r2KeyThumb) : url;

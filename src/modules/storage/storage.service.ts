@@ -1039,6 +1039,7 @@ export class StorageService implements OnModuleInit {
           where: { id: photoId },
           data: {
             status: 'READY',
+            faceScanStatus: 'READY',
             hasFaces,
             faceCount,
             r2KeyThumb: thumbKey,

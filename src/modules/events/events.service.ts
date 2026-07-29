@@ -54,6 +54,7 @@ export class EventsService {
       include: {
         photos: {
           where: { isDeleted: false },
+          orderBy: { createdAt: 'desc' }
         },
       },
     });
@@ -62,15 +63,29 @@ export class EventsService {
       throw new NotFoundException('Event not found');
     }
 
-    const photosWithUrls = await Promise.all(
-      event.photos.map(async (photo) => {
-        const url = await this.storageService.getReadUrl(photo.r2KeyOriginal);
-        const thumbUrl = photo.r2KeyThumb
-          ? await this.storageService.getReadUrl(photo.r2KeyThumb)
-          : url;
-        return { ...photo, url, thumbUrl };
-      }),
-    );
+    // Process signed URLs in small concurrent batches (e.g., 15 at a time) 
+    // to prevent CPU event loop starvation on throttled environments like Render Free Tier.
+    const batchSize = 15;
+    const photosWithUrls = [];
+    
+    for (let i = 0; i < event.photos.length; i += batchSize) {
+      const batch = event.photos.slice(i, i + batchSize);
+      const signedBatch = await Promise.all(
+        batch.map(async (photo) => {
+          try {
+            const url = await this.storageService.getReadUrl(photo.r2KeyOriginal);
+            const thumbUrl = photo.r2KeyThumb
+              ? await this.storageService.getReadUrl(photo.r2KeyThumb)
+              : url;
+            return { ...photo, url, thumbUrl };
+          } catch (err) {
+            console.error(`[EventsService] Failed to sign URL for photo ${photo.id}:`, err);
+            return { ...photo, url: '', thumbUrl: '' };
+          }
+        })
+      );
+      photosWithUrls.push(...signedBatch);
+    }
 
     return { ...event, photos: photosWithUrls };
   }

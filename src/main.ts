@@ -32,7 +32,9 @@ async function bootstrap() {
           origin === 'https://fotosetgo.com' ||
           origin === 'https://admin.fotosetgo.com' ||
           origin === 'https://api.fotosetgo.com' ||
-          origin.endsWith('.fotosetgo.com');
+          origin.endsWith('.fotosetgo.com') ||
+          origin.includes('localhost') || 
+          origin.includes('127.0.0.1');
         return callback(null, isAllowedProd);
       } else {
         // Development mode: Allow localhost, 127.0.0.1, and subdomains like chitrkalaclicks.localhost:3000

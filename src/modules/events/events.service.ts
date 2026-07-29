@@ -37,15 +37,35 @@ export class EventsService {
       where: { photographerId, isDeleted: false },
       orderBy: { createdAt: 'desc' },
       include: {
+        photos: {
+          where: { isDeleted: false },
+        },
         _count: {
           select: { photos: { where: { isDeleted: false } } },
         },
       },
     });
 
-    // We do not resolve signed URLs for every single photo in the event list view
-    // This reduces database and network load significantly.
-    return events;
+    // Map each photo to include its signed URL (served from urlCache instantly)
+    return Promise.all(
+      events.map(async (event) => {
+        const photosWithUrls = await Promise.all(
+          event.photos.map(async (photo) => {
+            try {
+              const url = await this.storageService.getReadUrl(photo.r2KeyOriginal);
+              const thumbUrl = photo.r2KeyThumb
+                ? await this.storageService.getReadUrl(photo.r2KeyThumb)
+                : url;
+              return { ...photo, url, thumbUrl };
+            } catch (err) {
+              console.error(`[EventsService] Failed to sign URL inside findAll for photo ${photo.id}:`, err);
+              return { ...photo, url: '', thumbUrl: '' };
+            }
+          })
+        );
+        return { ...event, photos: photosWithUrls };
+      })
+    );
   }
 
   async findOne(photographerId: string, eventId: string) {

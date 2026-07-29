@@ -4308,11 +4308,10 @@ export class StorageService implements OnModuleInit {
   async triggerFaceScanForEvent(photographerId: string, eventId: string): Promise<void> {
     this.logger.log(`[FaceScan] Triggered for event ${eventId}`);
 
-    const photos = await this.prisma.photo.findMany({
+    const items = await this.prisma.photo.findMany({
       where: {
         eventId,
         photographerId,
-        type: 'IMAGE',
         // Thumbnail exist karta ho
         OR: [
           { thumbnailStatus: 'READY' },
@@ -4323,23 +4322,35 @@ export class StorageService implements OnModuleInit {
       }
     });
 
-    this.logger.log(`[FaceScan] ${photos.length} photos need face scanning`);
+    this.logger.log(`[FaceScan] ${items.length} items (photos & videos) need face scanning`);
 
-    for (const photo of photos) {
+    for (const item of items) {
       await this.prisma.photo.update({
-        where: { id: photo.id },
+        where: { id: item.id },
         data: { faceScanStatus: 'PROCESSING' }
       });
 
-      this.runBackgroundFaceIndexing(
-        photographerId,
-        photo.id,
-        eventId,
-        photo.r2KeyOriginal,
-        photo.uploadBatchId
-      ).catch(err => {
-        this.logger.error(`[FaceScan] Failed for photo ${photo.id}: ${err.message}`);
-      });
+      if (item.type === 'VIDEO') {
+        this.runBackgroundVideoProcessing(
+          photographerId,
+          item.id,
+          eventId,
+          item.r2KeyOriginal,
+          item.uploadBatchId
+        ).catch(err => {
+          this.logger.error(`[FaceScan] Failed for video ${item.id}: ${err.message}`);
+        });
+      } else {
+        this.runBackgroundFaceIndexing(
+          photographerId,
+          item.id,
+          eventId,
+          item.r2KeyOriginal,
+          item.uploadBatchId
+        ).catch(err => {
+          this.logger.error(`[FaceScan] Failed for photo ${item.id}: ${err.message}`);
+        });
+      }
 
       await new Promise(resolve => setTimeout(resolve, 200));
     }

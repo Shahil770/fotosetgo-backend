@@ -332,7 +332,7 @@ export class StorageService implements OnModuleInit {
     // Transition status to PROCESSING to kickstart thumbnail and face analysis
     const updatedPhoto = await this.prisma.photo.update({
       where: { id: photoId },
-      data: { status: 'PROCESSING' }
+      data: { status: 'PROCESSING', thumbnailStatus: 'PENDING' }
     });
 
     if (photo.type === 'VIDEO') {
@@ -340,9 +340,8 @@ export class StorageService implements OnModuleInit {
         console.error('[StorageService] Background video processing failed:', err);
       });
     } else {
-      this.runBackgroundFaceIndexing(photographerId, photoId, photo.eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
-        console.error('[StorageService] Background face indexing trigger failed:', err);
-      });
+      // Cloudflare Worker se thumbnail generate karwao (no local sharp processing)
+      this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal);
     }
 
     return updatedPhoto;
@@ -543,7 +542,7 @@ export class StorageService implements OnModuleInit {
 
     const updatedPhoto = await this.prisma.photo.update({
       where: { id: photoId },
-      data: { status: 'PROCESSING' }
+      data: { status: 'PROCESSING', thumbnailStatus: 'PENDING' }
     });
 
     if (photo.type === 'VIDEO') {
@@ -551,9 +550,8 @@ export class StorageService implements OnModuleInit {
         console.error('[StorageService] Background video processing failed:', err);
       });
     } else {
-      this.runBackgroundFaceIndexing(photographerId, photoId, photo.eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
-        console.error('[StorageService] Background face indexing trigger failed:', err);
-      });
+      // Cloudflare Worker se thumbnail generate karwao (no local sharp processing)
+      this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal);
     }
 
     this.syncToGoogleDriveInBackground(photographerId, photo).catch(err => {
@@ -2284,58 +2282,32 @@ export class StorageService implements OnModuleInit {
     
     for (let i = 0; i < photos.length; i++) {
       const photo = photos[i];
-      // Check if photo is already successfully indexed (has face embeddings in database or is READY)
-      const embeddingCount = await this.prisma.faceEmbedding.count({
-        where: { photoId: photo.id }
-      });
-
-      // Target only stuck, failed, or unindexed items (skip fully indexed ones to save tokens/resources)
-      const isStuckOrFailed = photo.status !== 'READY';
-      const needsFaceIndexing = photo.type === 'IMAGE' && embeddingCount === 0;
       
-      // Videos should also be recovered/scanned if they are stuck/failed, or if scanning is enabled and they have no embeddings.
-      const needsVideoRecovery = photo.type === 'VIDEO' && (
-        photo.status !== 'READY' || 
-        !photo.r2KeyThumb ||
-        (embeddingCount === 0 && photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled)
-      );
-
-      if (isStuckOrFailed || needsFaceIndexing || needsVideoRecovery) {
+      // Sirf thumbnails check karo - face scan ki koi zaroorat nahi yahan
+      const needsThumbnail = photo.thumbnailStatus !== 'READY' || !photo.r2KeyThumb;
+      
+      if (photo.type === 'IMAGE' && needsThumbnail) {
         triggeredCount++;
 
-        // Clear previous vector embeddings only for the item we are re-indexing
-        await this.prisma.faceEmbedding.deleteMany({
-          where: { photoId: photo.id }
-        });
-
-        // Set status to PROCESSING to track progress in the UI
+        // Reset thumbnail status to PENDING so UI shows progress
         await this.prisma.photo.update({
           where: { id: photo.id },
-          data: { status: 'PROCESSING' }
+          data: { thumbnailStatus: 'PENDING' }
         });
 
-        // Re-trigger background worker tasks sequentially by awaiting them, or throttle them one by one
-        if (photo.type === 'VIDEO') {
-          await this.runBackgroundVideoProcessing(photographerId, photo.id, eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
-            console.error(`Re-indexing video processing failed for video ${photo.id}:`, err);
-          });
-        } else {
-          // Await to ensure we only process one image resizing at a time
-          await this.runBackgroundFaceIndexing(photographerId, photo.id, eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
-            console.error(`Re-indexing face recognition failed for photo ${photo.id}:`, err);
-          });
-        }
+        // Cloudflare Worker ko POST trigger bhejo (non-blocking)
+        this.triggerCloudflareWorker(photo.id, photo.r2KeyOriginal);
 
-        // 150ms sleep break after processing each single photo to allow garbage collection and event loop processing
-        await new Promise(resolve => setTimeout(resolve, 150));
+        // Small delay to avoid overwhelming the Worker
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
     }
 
     return { 
       success: true, 
       message: triggeredCount > 0 
-        ? `Triggered re-indexing recovery for ${triggeredCount} stuck/failed items.` 
-        : `All items are already successfully indexed. No action needed.` 
+        ? `Triggered thumbnail recovery for ${triggeredCount} photos via Cloudflare Worker.` 
+        : `All thumbnails are already READY. No action needed.` 
     };
   }
 
@@ -4317,17 +4289,24 @@ export class StorageService implements OnModuleInit {
       throw new Error('Photo not found');
     }
 
-    // Update photo with thumbnail keys
-    const updatedPhoto = await this.prisma.photo.update({
+    // Update photo with thumbnail keys + set thumbnailStatus to READY
+    await this.prisma.photo.update({
       where: { id: data.photoId },
       data: {
         r2KeyThumb: data.thumbKey,
         r2KeyPreview: data.previewKey || null,
+        thumbnailStatus: 'READY'
       }
     });
 
-    // If face scanning is enabled, trigger background face indexing with previewKey
+    // If face scanning is enabled, trigger background face indexing
     if (photo.event.faceScanningEnabled) {
+      // Set faceScanStatus to PROCESSING
+      await this.prisma.photo.update({
+        where: { id: data.photoId },
+        data: { faceScanStatus: 'PROCESSING' }
+      });
+
       // Trigger AI Face indexing process asynchronously
       this.runBackgroundFaceIndexing(
         photo.photographerId,
@@ -4342,7 +4321,10 @@ export class StorageService implements OnModuleInit {
       // Mark as READY instantly if AI is disabled
       await this.prisma.photo.update({
         where: { id: data.photoId },
-        data: { status: 'READY' }
+        data: { 
+          status: 'READY',
+          faceScanStatus: 'READY'
+        }
       });
 
       // Update upload batch progress status
@@ -4353,7 +4335,21 @@ export class StorageService implements OnModuleInit {
 
     return { success: true };
   }
+
+  // Helper: Cloudflare Worker ko POST trigger bhejta hai thumbnail generation ke liye
+  async triggerCloudflareWorker(photoId: string, r2KeyOriginal: string): Promise<void> {
+    const workerUrl = 'https://fotosetgo-thumbnail-generator.sahilshah778800.workers.dev';
+
+    fetch(workerUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        objectKey: r2KeyOriginal,
+        photoId: photoId
+      })
+    }).catch(err => {
+      this.logger.error(`[Worker Trigger] Failed for photo ${photoId}: ${err.message}`);
+    });
+  }
 }
-
-
 

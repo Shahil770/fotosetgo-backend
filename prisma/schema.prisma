@@ -253,6 +253,8 @@ model Photo {
   mimeType         String
   fileSize         BigInt
   status           PhotoStatus         @default(UPLOADING)
+  thumbnailStatus  String              @default("PENDING")
+  faceScanStatus   String              @default("PENDING")
   type             String              @default("IMAGE")
   thumbnailUrl     String?
   duration         Float?

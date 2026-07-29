@@ -914,7 +914,7 @@ export class StorageService implements OnModuleInit {
     let faceCount = 0;
     let hasFaces = false;
     let thumbKey: string | null = null;
-    let facePreviewKey: string | null = null;
+    let facePreviewKey: string | null = currentPhoto.r2KeyPreview || null;
 
     // Download original once, generate both display thumbnail (300px) and face-scan preview (800px) only if needed
     try {
@@ -924,7 +924,10 @@ export class StorageService implements OnModuleInit {
       try {
         if (currentPhoto.r2KeyThumb) {
           thumbKey = currentPhoto.r2KeyThumb;
-        } else {
+        }
+
+        // If preview doesn't exist but face scanning is enabled, OR thumbnail is missing, download & generate
+        if (!thumbKey || (event?.faceScanningEnabled && !facePreviewKey)) {
           const getCommand = new GetObjectCommand({
             Bucket: this.bucketName,
             Key: r2KeyOriginal,
@@ -935,47 +938,37 @@ export class StorageService implements OnModuleInit {
           }
           imageBuffer = Buffer.from(await s3Response.Body.transformToByteArray());
 
-          // 300px display thumbnail
-          const thumbBuffer = await sharp(imageBuffer)
-            .resize(300)
-            .jpeg({ quality: 80 })
-            .toBuffer();
+          // Generate 300px display thumbnail if missing
+          if (!thumbKey) {
+            const thumbBuffer = await sharp(imageBuffer)
+              .resize(300)
+              .jpeg({ quality: 80 })
+              .toBuffer();
 
-          thumbKey = `${photographerId}/events/${eventId}/thumbs/${photoId}.jpg`;
-          await this.s3Client.send(new PutObjectCommand({
-            Bucket: this.bucketName,
-            Key: thumbKey,
-            Body: thumbBuffer,
-            ContentType: 'image/jpeg',
-          }));
-        }
-
-        // 800px face-scan preview (only if face scanning is needed — generated from same download)
-        if (event?.faceScanningEnabled) {
-          if (!imageBuffer) {
-            const getCommand = new GetObjectCommand({
+            thumbKey = `${photographerId}/events/${eventId}/thumbs/${photoId}.jpg`;
+            await this.s3Client.send(new PutObjectCommand({
               Bucket: this.bucketName,
-              Key: r2KeyOriginal,
-            });
-            const s3Response = await this.s3Client.send(getCommand);
-            if (!s3Response.Body) {
-              throw new Error('S3 response body is empty');
-            }
-            imageBuffer = Buffer.from(await s3Response.Body.transformToByteArray());
+              Key: thumbKey,
+              Body: thumbBuffer,
+              ContentType: 'image/jpeg',
+            }));
           }
 
-          const previewBuffer = await sharp(imageBuffer)
-            .resize(800)
-            .jpeg({ quality: 85 })
-            .toBuffer();
+          // Generate 800px preview if missing and face scanning is enabled
+          if (event?.faceScanningEnabled && !facePreviewKey) {
+            const previewBuffer = await sharp(imageBuffer)
+              .resize(800)
+              .jpeg({ quality: 85 })
+              .toBuffer();
 
-          facePreviewKey = `${photographerId}/events/${eventId}/previews/${photoId}.jpg`;
-          await this.s3Client.send(new PutObjectCommand({
-            Bucket: this.bucketName,
-            Key: facePreviewKey,
-            Body: previewBuffer,
-            ContentType: 'image/jpeg',
-          }));
+            facePreviewKey = `${photographerId}/events/${eventId}/previews/${photoId}.jpg`;
+            await this.s3Client.send(new PutObjectCommand({
+              Bucket: this.bucketName,
+              Key: facePreviewKey,
+              Body: previewBuffer,
+              ContentType: 'image/jpeg',
+            }));
+          }
         }
       } catch (thumbErr) {
         console.error(`[StorageService] Post-upload thumbnail/preview generation failed for photo ${photoId}:`, thumbErr);

@@ -921,21 +921,15 @@ export class StorageService implements OnModuleInit {
 
     let faceCount = 0;
     let hasFaces = false;
-    let thumbKey: string | null = null;
-    let facePreviewKey: string | null = currentPhoto.r2KeyPreview || null;
+    let thumbKey: string | null = currentPhoto.r2KeyThumb || null;
 
-    // Download original once, generate both display thumbnail (300px) and face-scan preview (800px) only if needed
     try {
       const event = await this.prisma.event.findUnique({ where: { id: eventId } });
       let imageBuffer: Buffer | null = null;
 
       try {
-        if (currentPhoto.r2KeyThumb) {
-          thumbKey = currentPhoto.r2KeyThumb;
-        }
-
-        // If preview doesn't exist but face scanning is enabled, OR thumbnail is missing, download & generate
-        if (!thumbKey || (event?.faceScanningEnabled && !facePreviewKey)) {
+        // If thumbnail is missing, generate it from original
+        if (!thumbKey) {
           const getCommand = new GetObjectCommand({
             Bucket: this.bucketName,
             Key: r2KeyOriginal,
@@ -946,40 +940,22 @@ export class StorageService implements OnModuleInit {
           }
           imageBuffer = Buffer.from(await s3Response.Body.transformToByteArray());
 
-          // Generate 300px display thumbnail if missing
-          if (!thumbKey) {
-            const thumbBuffer = await sharp(imageBuffer)
-              .resize(300)
-              .jpeg({ quality: 80 })
-              .toBuffer();
+          // Generate 300px display thumbnail
+          const thumbBuffer = await sharp(imageBuffer)
+            .resize(300)
+            .jpeg({ quality: 80 })
+            .toBuffer();
 
-            thumbKey = `${photographerId}/events/${eventId}/thumbs/${photoId}.jpg`;
-            await this.s3Client.send(new PutObjectCommand({
-              Bucket: this.bucketName,
-              Key: thumbKey,
-              Body: thumbBuffer,
-              ContentType: 'image/jpeg',
-            }));
-          }
-
-          // Generate 800px preview if missing and face scanning is enabled
-          if (event?.faceScanningEnabled && !facePreviewKey) {
-            const previewBuffer = await sharp(imageBuffer)
-              .resize(800)
-              .jpeg({ quality: 85 })
-              .toBuffer();
-
-            facePreviewKey = `${photographerId}/events/${eventId}/previews/${photoId}.jpg`;
-            await this.s3Client.send(new PutObjectCommand({
-              Bucket: this.bucketName,
-              Key: facePreviewKey,
-              Body: previewBuffer,
-              ContentType: 'image/jpeg',
-            }));
-          }
+          thumbKey = `${photographerId}/events/${eventId}/thumbs/${photoId}.jpg`;
+          await this.s3Client.send(new PutObjectCommand({
+            Bucket: this.bucketName,
+            Key: thumbKey,
+            Body: thumbBuffer,
+            ContentType: 'image/jpeg',
+          }));
         }
       } catch (thumbErr) {
-        console.error(`[StorageService] Post-upload thumbnail/preview generation failed for photo ${photoId}:`, thumbErr);
+        console.error(`[StorageService] Post-upload thumbnail generation failed for photo ${photoId}:`, thumbErr);
       }
 
       if (!event?.faceScanningEnabled) {
@@ -1002,19 +978,18 @@ export class StorageService implements OnModuleInit {
         return;
       }
 
-
-      // Use the 800px preview URL for FastAPI (much faster than original, no accuracy loss)
+      // Use the 300px thumbnail URL directly for FastAPI AI Face Indexing
       let faceIndexUrl: string;
-      if (facePreviewKey) {
-        const previewCommand = new GetObjectCommand({ Bucket: this.bucketName, Key: facePreviewKey });
-        faceIndexUrl = await getSignedUrl(this.s3Client, previewCommand, { expiresIn: 600 });
+      if (thumbKey) {
+        const thumbCommand = new GetObjectCommand({ Bucket: this.bucketName, Key: thumbKey });
+        faceIndexUrl = await getSignedUrl(this.s3Client, thumbCommand, { expiresIn: 600 });
       } else {
-        // Fallback to original if preview generation failed
+        // Fallback to original if thumbnail key generation failed
         const origCommand = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
         faceIndexUrl = await getSignedUrl(this.s3Client, origCommand, { expiresIn: 600 });
       }
 
-      // Call FastAPI Face Engine with preview URL
+      // Call FastAPI Face Engine with thumbnail URL
       const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://127.0.0.1:8000';
       const response = await fetch(`${faceEngineUrl}/faces/index-photo`, {
         method: 'POST',
@@ -1024,7 +999,6 @@ export class StorageService implements OnModuleInit {
         },
         body: JSON.stringify({ imageUrl: faceIndexUrl }),
       });
-
 
       if (response.ok) {
         const result = await response.json();
@@ -1152,13 +1126,7 @@ export class StorageService implements OnModuleInit {
 
       await this.updateBatchProgress(uploadBatchId, false);
     } finally {
-      // Auto-cleanup temporary face preview (800px) from R2 storage like video temp_frames
-      if (facePreviewKey) {
-        this.s3Client.send(new DeleteObjectCommand({
-          Bucket: this.bucketName,
-          Key: facePreviewKey,
-        })).catch(cleanErr => console.error(`[StorageService] Failed to cleanup face preview ${facePreviewKey}:`, cleanErr));
-      }
+      // Previews are no longer created, so no deletion is necessary
     }
   }
 

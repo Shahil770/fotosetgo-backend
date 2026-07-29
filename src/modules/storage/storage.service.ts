@@ -4361,12 +4361,13 @@ export class StorageService implements OnModuleInit {
         eventId,
         photographerId,
         type: 'IMAGE',
-        faceScanStatus: { not: 'READY' },
-        // Thumbnail exist karta ho - ya to status READY hai ya r2KeyThumb already set hai (purani photos)
+        // Thumbnail exist karta ho
         OR: [
           { thumbnailStatus: 'READY' },
           { r2KeyThumb: { not: null } }
-        ]
+        ],
+        // Face embeddings nahi hain abhi tak
+        embeddings: { none: {} }
       }
     });
 

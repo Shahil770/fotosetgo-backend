@@ -27,6 +27,7 @@ export class StorageService implements OnModuleInit {
   private s3Client: S3Client;
   private bucketName: string;
   private readonly urlCache = new Map<string, { url: string; expiresAt: number }>();
+  private readonly activeEventScans = new Set<string>();
 
   constructor(
     private prisma: PrismaService,
@@ -4251,21 +4252,11 @@ export class StorageService implements OnModuleInit {
       }
     });
 
-    // If face scanning is enabled, trigger background face indexing
+    // If face scanning is enabled, trigger background batch face indexing
     if (photo.event.faceScanningEnabled) {
-      // Set faceScanStatus to PROCESSING
-      await this.prisma.photo.update({
-        where: { id: data.photoId },
-        data: { faceScanStatus: 'PROCESSING' }
-      });
-
-      // Trigger AI Face indexing process asynchronously
-      this.runBackgroundFaceIndexing(
+      this.triggerFaceScanForEvent(
         photo.photographerId,
-        photo.id,
-        photo.eventId,
-        photo.r2KeyOriginal,
-        photo.uploadBatchId
+        photo.eventId
       ).catch(err => {
         console.error('[Webhook] Background Face Indexing trigger failed:', err);
       });
@@ -4303,55 +4294,154 @@ export class StorageService implements OnModuleInit {
     });
   }
 
-  // AI Face Toggle ON hone par call hota hai
+  // AI Face Toggle ON hone par ya Thumbnail complete hone par Batch Scan chalata hai (with Auto-Recheck loop)
   async triggerFaceScanForEvent(photographerId: string, eventId: string): Promise<void> {
-    this.logger.log(`[FaceScan] Triggered for event ${eventId}`);
+    // Duplicate overlapping scan loops se bachane ke liye Lock check karo
+    if (this.activeEventScans.has(eventId)) {
+      this.logger.log(`[BatchFaceScan] Event ${eventId} scan loop is already running. New ready items will be auto-picked up.`);
+      return;
+    }
 
-    const items = await this.prisma.photo.findMany({
-      where: {
-        eventId,
-        photographerId,
-        // Thumbnail exist karta ho
-        OR: [
-          { thumbnailStatus: 'READY' },
-          { r2KeyThumb: { not: null } }
-        ],
-        // Face embeddings nahi hain abhi tak
-        embeddings: { none: {} }
-      }
-    });
+    this.activeEventScans.add(eventId);
 
-    this.logger.log(`[FaceScan] ${items.length} items (photos & videos) need face scanning`);
-
-    for (const item of items) {
-      await this.prisma.photo.update({
-        where: { id: item.id },
-        data: { faceScanStatus: 'PROCESSING' }
-      });
-
-      if (item.type === 'VIDEO') {
-        this.runBackgroundVideoProcessing(
-          photographerId,
-          item.id,
-          eventId,
-          item.r2KeyOriginal,
-          item.uploadBatchId
-        ).catch(err => {
-          this.logger.error(`[FaceScan] Failed for video ${item.id}: ${err.message}`);
+    try {
+      while (true) {
+        // Fetch ready thumbnails that haven't been face scanned yet
+        const pendingItems = await this.prisma.photo.findMany({
+          where: {
+            eventId,
+            photographerId,
+            faceScanStatus: { notIn: ['PROCESSING'] },
+            OR: [
+              { thumbnailStatus: 'READY' },
+              { r2KeyThumb: { not: null } }
+            ],
+            embeddings: { none: {} }
+          },
+          take: 50
         });
-      } else {
-        this.runBackgroundFaceIndexing(
-          photographerId,
-          item.id,
-          eventId,
-          item.r2KeyOriginal,
-          item.uploadBatchId
-        ).catch(err => {
-          this.logger.error(`[FaceScan] Failed for photo ${item.id}: ${err.message}`);
-        });
-      }
 
-      await new Promise(resolve => setTimeout(resolve, 200));
+        if (pendingItems.length === 0) {
+          this.logger.log(`[BatchFaceScan] All ready items for event ${eventId} are scanned. Loop finished.`);
+          break;
+        }
+
+        this.logger.log(`[BatchFaceScan] Found ${pendingItems.length} items to batch scan for event ${eventId}`);
+
+        const photos = pendingItems.filter(p => p.type === 'IMAGE');
+        const videos = pendingItems.filter(p => p.type === 'VIDEO');
+
+        // Mark items as PROCESSING
+        const itemIds = pendingItems.map(p => p.id);
+        await this.prisma.photo.updateMany({
+          where: { id: { in: itemIds } },
+          data: { faceScanStatus: 'PROCESSING' }
+        });
+
+        // 1. Process Batch of Photos in 1 SINGLE HTTP Request to Modal GPU (/faces/index-batch-photos)
+        if (photos.length > 0) {
+          try {
+            const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://127.0.0.1:8000';
+            const photoBatchPayload: { photoId: string; imageUrl: string }[] = [];
+
+            for (const photo of photos) {
+              const readKey = photo.r2KeyThumb || photo.r2KeyOriginal;
+              const signedUrl = await this.getReadUrl(readKey);
+              if (signedUrl) {
+                photoBatchPayload.push({ photoId: photo.id, imageUrl: signedUrl });
+              }
+            }
+
+            if (photoBatchPayload.length > 0) {
+              const response = await fetch(`${faceEngineUrl}/faces/index-batch-photos`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
+                },
+                body: JSON.stringify({ items: photoBatchPayload })
+              });
+
+              if (response.ok) {
+                const batchResult = await response.json();
+                const results = batchResult.results || [];
+
+                for (const res of results) {
+                  const photoId = res.photoId;
+                  const faces = res.faces || [];
+                  const hasFaces = faces.length > 0;
+                  const faceCount = faces.length;
+
+                  if (hasFaces) {
+                    const faceData = faces.map((f: any) => ({
+                      photoId,
+                      eventId,
+                      photographerId,
+                      faceIndex: f.faceIndex,
+                      bboxX: f.bbox.x,
+                      bboxY: f.bbox.y,
+                      bboxW: f.bbox.w,
+                      bboxH: f.bbox.h,
+                      confidence: f.confidence,
+                      embedding: f.embedding,
+                    }));
+
+                    const values = faceData.map((f: any) => {
+                      const vectorStr = `[${f.embedding.join(',')}]`;
+                      return `('${uuidv4()}', '${f.photoId}', '${f.eventId}', '${f.photographerId}', ${f.faceIndex}, ${f.bboxX}, ${f.bboxY}, ${f.bboxW}, ${f.bboxH}, ${f.confidence}, '${vectorStr}'::vector, NULL)`;
+                    }).join(',');
+
+                    await this.prisma.$executeRawUnsafe(`
+                      INSERT INTO face_embeddings ("id", "photoId", "eventId", "photographerId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding", "clusterId")
+                      VALUES ${values}
+                    `);
+                  }
+
+                  await this.prisma.photo.update({
+                    where: { id: photoId },
+                    data: {
+                      status: 'READY',
+                      faceScanStatus: 'READY',
+                      hasFaces,
+                      faceCount
+                    }
+                  });
+
+                  const p = photos.find(item => item.id === photoId);
+                  if (p && p.uploadBatchId) {
+                    await this.updateBatchProgress(p.uploadBatchId, true);
+                  }
+                }
+              }
+            }
+          } catch (batchErr) {
+            this.logger.error(`[BatchFaceScan] Photo batch scanning failed for event ${eventId}:`, batchErr);
+            const photoIds = photos.map(p => p.id);
+            await this.prisma.photo.updateMany({
+              where: { id: { in: photoIds } },
+              data: { faceScanStatus: 'PENDING' }
+            });
+          }
+        }
+
+        // 2. Process Videos
+        for (const video of videos) {
+          await this.runBackgroundVideoProcessing(
+            photographerId,
+            video.id,
+            eventId,
+            video.r2KeyOriginal,
+            video.uploadBatchId
+          ).catch(err => {
+            this.logger.error(`[BatchFaceScan] Video scan failed for ${video.id}:`, err);
+          });
+        }
+
+        // Re-check sleep pause (300ms) before checking if new ready thumbnails appeared in the meantime
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    } finally {
+      this.activeEventScans.delete(eventId);
     }
   }
 }

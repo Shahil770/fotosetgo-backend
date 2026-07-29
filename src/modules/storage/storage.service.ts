@@ -2310,8 +2310,10 @@ export class StorageService implements OnModuleInit {
     }
 
     let triggeredCount = 0;
-
-    for (const photo of photos) {
+    const batchSize = 10;
+    
+    for (let i = 0; i < photos.length; i++) {
+      const photo = photos[i];
       // Check if photo is already successfully indexed (has face embeddings in database or is READY)
       const embeddingCount = await this.prisma.faceEmbedding.count({
         where: { photoId: photo.id }
@@ -2351,6 +2353,11 @@ export class StorageService implements OnModuleInit {
           this.runBackgroundFaceIndexing(photographerId, photo.id, eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
             console.error(`Re-indexing face recognition failed for photo ${photo.id}:`, err);
           });
+        }
+
+        // Throttle database and external network queries to prevent thread choking
+        if (triggeredCount % batchSize === 0) {
+          await new Promise(resolve => setTimeout(resolve, 100)); // 100ms break
         }
       }
     }

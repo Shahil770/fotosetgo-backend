@@ -66,7 +66,7 @@ export class EventsService {
     // Process signed URLs in small concurrent batches (e.g., 15 at a time) 
     // to prevent CPU event loop starvation on throttled environments like Render Free Tier.
     const batchSize = 15;
-    const photosWithUrls = [];
+    const photosWithUrls: any[] = [];
     
     for (let i = 0; i < event.photos.length; i += batchSize) {
       const batch = event.photos.slice(i, i + batchSize);

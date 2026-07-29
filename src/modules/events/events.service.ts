@@ -37,30 +37,15 @@ export class EventsService {
       where: { photographerId, isDeleted: false },
       orderBy: { createdAt: 'desc' },
       include: {
-        photos: {
-          where: { isDeleted: false },
-        },
         _count: {
           select: { photos: { where: { isDeleted: false } } },
         },
       },
     });
 
-    // Map each photo to include its dynamically signed GET URL
-    return Promise.all(
-      events.map(async (event) => {
-        const photosWithUrls = await Promise.all(
-          event.photos.map(async (photo) => {
-            const url = await this.storageService.getReadUrl(photo.r2KeyOriginal);
-            const thumbUrl = photo.r2KeyThumb
-              ? await this.storageService.getReadUrl(photo.r2KeyThumb)
-              : url;
-            return { ...photo, url, thumbUrl };
-          }),
-        );
-        return { ...event, photos: photosWithUrls };
-      }),
-    );
+    // We do not resolve signed URLs for every single photo in the event list view
+    // This reduces database and network load significantly.
+    return events;
   }
 
   async findOne(photographerId: string, eventId: string) {

@@ -43,9 +43,16 @@ export class StorageService implements OnModuleInit {
       maxSockets: 500,
     });
 
+    const endpoint = process.env.R2_ENDPOINT_URL || '';
+    if (!endpoint) {
+      this.logger.error('CRITICAL: R2_ENDPOINT_URL is not defined in environment variables!');
+    } else {
+      this.logger.log(`Initializing R2 S3Client with endpoint: ${endpoint}`);
+    }
+
     this.s3Client = new S3Client({
       region: 'auto',
-      endpoint: process.env.R2_ENDPOINT_URL || '',
+      endpoint: endpoint,
       credentials: {
         accessKeyId: process.env.R2_ACCESS_KEY_ID || '',
         secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '',

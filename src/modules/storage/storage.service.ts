@@ -748,109 +748,56 @@ export class StorageService implements OnModuleInit {
       let hasFaces = false;
 
       if (photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled && duration > 0) {
-        // Extract frame every 2 seconds
-        const framePattern = path.join(tempDir, `${photoId}_frame_%04d.jpg`);
-        await execPromise(`"${ffmpegPath}" -y -i "${tempVideoPath}" -vf "fps=1/2" "${framePattern}"`);
-
-        // Scan each generated frame
-        const files = fs.readdirSync(tempDir);
-        const frameFiles = files.filter(f => f.startsWith(`${photoId}_frame_`) && f.endsWith('.jpg')).sort();
-
         const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://127.0.0.1:8000';
         
-        for (let idx = 0; idx < frameFiles.length; idx++) {
-          // Mid-loop check: Check if video was deleted during frame scanning
-          const loopVideo = await this.prisma.photo.findUnique({
-            where: { id: photoId },
-            select: { isDeleted: true }
+        try {
+          // Get signed read URL for video
+          const getCmd = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
+          const videoSignedUrl = await getSignedUrl(this.s3Client, getCmd, { expiresIn: 3600 });
+
+          // Call Modal GPU Video Indexing Endpoint (/faces/index-video)
+          const response = await fetch(`${faceEngineUrl}/faces/index-video`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
+            },
+            body: JSON.stringify({ videoUrl: videoSignedUrl }),
           });
-          if (!loopVideo || loopVideo.isDeleted) {
-            console.log(`[StorageService] Video ${photoId} deleted mid-process. Terminating frame scanning.`);
-            return;
-          }
 
-          const frameFile = frameFiles[idx];
-          const framePath = path.join(tempDir, frameFile);
-          const timestamp = (idx * 2) + 1;
+          if (response.ok) {
+            const result = await response.json();
+            if (result.faces && result.faces.length > 0) {
+              hasFaces = true;
+              faceCount = result.faces.length;
 
-          // Resize frame to 800px before uploading — much faster for FastAPI, no accuracy loss
-          const frameKey = `temp_frames/${photoId}_${frameFile}`;
-          let frameBuffer = fs.readFileSync(framePath);
-          try {
-            frameBuffer = await sharp(frameBuffer)
-              .resize(800)
-              .jpeg({ quality: 85 })
-              .toBuffer();
-          } catch (resizeErr) {
-            console.error(`[StorageService] Frame resize failed, using original frame:`, resizeErr);
-            frameBuffer = fs.readFileSync(framePath); // fallback to original
-          }
+              const faceData = result.faces.map((f: any) => ({
+                photoId,
+                eventId,
+                photographerId,
+                faceIndex: f.faceIndex,
+                bboxX: f.bbox.x,
+                bboxY: f.bbox.y,
+                bboxW: f.bbox.w,
+                bboxH: f.bbox.h,
+                confidence: f.confidence,
+                embedding: f.embedding,
+                timestamp: f.timestamp || 0,
+              }));
 
-          await this.s3Client.send(new PutObjectCommand({
-            Bucket: this.bucketName,
-            Key: frameKey,
-            Body: frameBuffer,
-            ContentType: 'image/jpeg',
-          }));
+              const values = faceData.map((f: any) => {
+                const vectorStr = `[${f.embedding.join(',')}]`;
+                return `('${uuidv4()}', '${f.photoId}', '${f.eventId}', '${f.photographerId}', ${f.faceIndex}, ${f.bboxX}, ${f.bboxY}, ${f.bboxW}, ${f.bboxH}, ${f.confidence}, '${vectorStr}'::vector, NULL, ${f.timestamp})`;
+              }).join(',');
 
-          const getFrameCommand = new GetObjectCommand({
-            Bucket: this.bucketName,
-            Key: frameKey,
-          });
-          const readUrl = await getSignedUrl(this.s3Client, getFrameCommand, { expiresIn: 600 });
-
-          // Call FastAPI
-          try {
-            const response = await fetch(`${faceEngineUrl}/faces/index-photo`, {
-              method: 'POST',
-              headers: { 
-                'Content-Type': 'application/json',
-                'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
-              },
-              body: JSON.stringify({ imageUrl: readUrl }),
-            });
-
-            if (response.ok) {
-              const result = await response.json();
-              if (result.faces && result.faces.length > 0) {
-                hasFaces = true;
-                faceCount += result.faces.length;
-
-                // Save embeddings with timestamp
-                const faceData = result.faces.map((f: any) => ({
-                  photoId,
-                  eventId,
-                  photographerId,
-                  faceIndex: f.faceIndex,
-                  bboxX: f.bbox.x,
-                  bboxY: f.bbox.y,
-                  bboxW: f.bbox.w,
-                  bboxH: f.bbox.h,
-                  confidence: f.confidence,
-                  embedding: f.embedding,
-                  timestamp,
-                }));
-
-                const values = faceData.map((f: any) => {
-                  const vectorStr = `[${f.embedding.join(',')}]`;
-                  return `('${uuidv4()}', '${f.photoId}', '${f.eventId}', '${f.photographerId}', ${f.faceIndex}, ${f.bboxX}, ${f.bboxY}, ${f.bboxW}, ${f.bboxH}, ${f.confidence}, '${vectorStr}'::vector, NULL, ${f.timestamp})`;
-                }).join(',');
-
-                await this.prisma.$executeRawUnsafe(`
-                  INSERT INTO face_embeddings ("id", "photoId", "eventId", "photographerId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding", "clusterId", "timestamp")
-                  VALUES ${values}
-                `);
-              }
+              await this.prisma.$executeRawUnsafe(`
+                INSERT INTO face_embeddings ("id", "photoId", "eventId", "photographerId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding", "clusterId", "timestamp")
+                VALUES ${values}
+              `);
             }
-          } catch (scanErr) {
-            console.error(`[StorageService] Failed to scan video frame ${frameFile}:`, scanErr);
-          } finally {
-            // Clean up frame from R2
-            await this.s3Client.send(new DeleteObjectCommand({
-              Bucket: this.bucketName,
-              Key: frameKey,
-            })).catch(() => {});
           }
+        } catch (videoScanErr) {
+          this.logger.error(`[StorageService] Modal video face scan failed for video ${photoId}:`, videoScanErr);
         }
       }
 
@@ -860,6 +807,8 @@ export class StorageService implements OnModuleInit {
         where: { id: photoId },
         data: {
           status: 'READY',
+          thumbnailStatus: 'READY',
+          faceScanStatus: 'READY',
           hasFaces,
           faceCount,
           r2KeyThumb: thumbKey,

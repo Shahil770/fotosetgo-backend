@@ -4306,7 +4306,12 @@ export class StorageService implements OnModuleInit {
 
     try {
       while (true) {
-        // Fetch ready thumbnails that haven't been face scanned yet
+        // Check if there are active uploads in progress for this event
+        const activeUploadingCount = await this.prisma.photo.count({
+          where: { eventId, status: 'UPLOADING' }
+        });
+
+        // Fetch ready thumbnails that haven't been face scanned yet (batch of up to 150 photos)
         const pendingItems = await this.prisma.photo.findMany({
           where: {
             eventId,
@@ -4318,11 +4323,17 @@ export class StorageService implements OnModuleInit {
             ],
             embeddings: { none: {} }
           },
-          take: 50
+          take: 150
         });
 
         if (pendingItems.length === 0) {
           this.logger.log(`[BatchFaceScan] All ready items for event ${eventId} are scanned. Loop finished.`);
+          break;
+        }
+
+        // Rule: If uploading is currently active and we have less than 150 ready items, defer scanning until 150 accumulate or uploading finishes
+        if (activeUploadingCount > 0 && pendingItems.length < 150) {
+          this.logger.log(`[BatchFaceScan] Uploading in progress (${activeUploadingCount} uploading). Waiting for 150 items or upload finish. Current ready: ${pendingItems.length}`);
           break;
         }
 

@@ -210,7 +210,7 @@ export class StorageService implements OnModuleInit {
     // Use Events-only limit to avoid portfolio overflow blocking event uploads
     const limitBytes = activeSubscription
       ? (activeSubscription.limitEventsBytes ?? activeSubscription.limitBytes)
-      : BigInt(50 * 1024 * 1024 * 1024); // 50 GB fallback for testing
+      : BigInt(200 * 1024 * 1024);
 
     // Calculate events-only used bytes (exclude portfolio/branding files)
     const eventsUsedAgg = await this.prisma.photo.aggregate({

@@ -802,13 +802,15 @@ export class StorageService implements OnModuleInit {
       }
 
 
+      const videoScanRan = photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled && duration > 0;
+
       // Update database record
       await this.prisma.photo.update({
         where: { id: photoId },
         data: {
           status: 'READY',
           thumbnailStatus: 'READY',
-          faceScanStatus: 'READY',
+          faceScanStatus: videoScanRan ? 'READY' : 'PENDING',
           hasFaces,
           faceCount,
           r2KeyThumb: thumbKey,

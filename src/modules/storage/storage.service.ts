@@ -28,13 +28,14 @@ export class StorageService implements OnModuleInit {
   private bucketName: string;
   private readonly urlCache = new Map<string, { url: string; expiresAt: number }>();
   private readonly activeEventScans = new Set<string>();
+  private workerDispatchCounter = 0;
 
   constructor(
     private prisma: PrismaService,
     private googleDriveService: GoogleDriveService,
   ) {
     this.bucketName = process.env.R2_BUCKET_NAME || 'fotosetgo-photos';
-    
+
     const httpAgent = new http.Agent({
       keepAlive: true,
       maxSockets: 500,
@@ -50,7 +51,7 @@ export class StorageService implements OnModuleInit {
     } else {
       this.logger.log(`Initializing R2 S3Client with endpoint: ${endpoint}`);
     }
-    
+
     const faceEngine = process.env.FACE_ENGINE_URL || '';
     this.logger.log(`FACE_ENGINE_URL configured as: [${faceEngine}]`);
 
@@ -229,7 +230,7 @@ export class StorageService implements OnModuleInit {
     const isVideo = data.mimeType.startsWith('video/') || data.filename.match(/\.(mp4|mkv|mov|webm)$/i);
     const fileUuid = uuidv4();
     const cleanFilename = data.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
-    
+
     // Set dynamic R2 Path under unified photographer folder
     const objectKey = isVideo
       ? `${photographerId}/events/${eventId}/videos/${fileUuid}_${cleanFilename}`
@@ -460,7 +461,7 @@ export class StorageService implements OnModuleInit {
     const isVideo = data.mimeType.startsWith('video/') || data.filename.match(/\.(mp4|mkv|mov|webm)$/i);
     const fileUuid = uuidv4();
     const cleanFilename = data.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
-    
+
     // Set R2 Path
     const objectKey = isVideo
       ? `${photographer.id}/events/${event.id}/videos/${fileUuid}_${cleanFilename}`
@@ -613,7 +614,7 @@ export class StorageService implements OnModuleInit {
         Key: photo.r2KeyOriginal,
       });
       const response = await this.s3Client.send(command);
-      
+
       if (!response.Body) {
         throw new Error('R2 response body is empty');
       }
@@ -671,7 +672,7 @@ export class StorageService implements OnModuleInit {
       await this.updateBatchProgress(uploadBatchId, true);
       return;
     }
-    
+
     // Defer processing for pending guest uploads
     if (currentVideo.status === 'PENDING_APPROVAL') {
       console.log(`[StorageService] Video ${photoId} is pending approval. Deferring processing until approved.`);
@@ -699,7 +700,7 @@ export class StorageService implements OnModuleInit {
       if (!s3Response.Body) {
         throw new Error('S3 video body is empty');
       }
-      
+
       const responseByteArray = await s3Response.Body.transformToByteArray();
       fs.writeFileSync(tempVideoPath, Buffer.from(responseByteArray));
 
@@ -750,7 +751,7 @@ export class StorageService implements OnModuleInit {
 
       if (photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled && duration > 0) {
         const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://127.0.0.1:8000';
-        
+
         try {
           // Get signed read URL for video
           const getCmd = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
@@ -831,7 +832,7 @@ export class StorageService implements OnModuleInit {
       await this.prisma.photo.update({
         where: { id: photoId },
         data: { status: 'FAILED' },
-      }).catch(() => {});
+      }).catch(() => { });
 
       await this.updateBatchProgress(uploadBatchId, false);
     } finally {
@@ -844,7 +845,7 @@ export class StorageService implements OnModuleInit {
         for (const file of frameFiles) {
           fs.unlinkSync(path.join(tempDir, file));
         }
-      } catch (cleanupErr) {}
+      } catch (cleanupErr) { }
     }
   }
 
@@ -921,7 +922,7 @@ export class StorageService implements OnModuleInit {
             r2KeyThumb: thumbKey,
           },
         });
-        
+
         // Auto-backup to Google Drive if enabled (non-blocking)
         this.triggerAutoBackupIfEnabled(photographerId, photoId).catch(err =>
           console.error('[AutoBackup] Photo trigger failed:', err)
@@ -946,7 +947,7 @@ export class StorageService implements OnModuleInit {
       const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://127.0.0.1:8000';
       const response = await fetch(`${faceEngineUrl}/faces/index-photo`, {
         method: 'POST',
-        headers: { 
+        headers: {
           'Content-Type': 'application/json',
           'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
         },
@@ -1060,7 +1061,7 @@ export class StorageService implements OnModuleInit {
         console.error(`FastAPI returned non-200 status for photo ${photoId}: ${response.status} - ${errText}`);
         await this.prisma.photo.update({
           where: { id: photoId },
-          data: { 
+          data: {
             status: 'FAILED',
             r2KeyThumb: thumbKey,
           }
@@ -1072,7 +1073,7 @@ export class StorageService implements OnModuleInit {
       console.error('[StorageService] FastAPI background face recognition failed:', err);
       await this.prisma.photo.update({
         where: { id: photoId },
-        data: { 
+        data: {
           status: 'FAILED',
           r2KeyThumb: thumbKey,
         }
@@ -1197,10 +1198,10 @@ export class StorageService implements OnModuleInit {
 
     return Promise.all(
       matchedPhotos.map(async (photo) => {
-        const r2Key = photo.event.allowDownload 
-          ? photo.r2KeyOriginal 
+        const r2Key = photo.event.allowDownload
+          ? photo.r2KeyOriginal
           : (photo.r2KeyThumb || photo.r2KeyOriginal);
-          
+
         const url = await this.getReadUrl(r2Key);
         const thumbUrl = photo.r2KeyThumb
           ? await this.getReadUrl(photo.r2KeyThumb)
@@ -1385,7 +1386,7 @@ export class StorageService implements OnModuleInit {
           Bucket: this.bucketName,
           Key: facePreviewKey
         });
-        await this.s3Client.send(previewCommand).catch(() => {});
+        await this.s3Client.send(previewCommand).catch(() => { });
       }
     } catch (err) {
       console.error('Failed to delete photo or thumbnail from R2:', err);
@@ -1666,7 +1667,7 @@ export class StorageService implements OnModuleInit {
     this.prisma.photographer.update({
       where: { id: photographerId },
       data: { totalStorageUsedBytes: totalBytes }
-    }).catch(() => {});
+    }).catch(() => { });
 
     // Retrieve active subscription and package dual limits
     const activeSub = await this.prisma.subscription.findFirst({
@@ -2232,13 +2233,13 @@ export class StorageService implements OnModuleInit {
     }
 
     let triggeredCount = 0;
-    
+
     for (let i = 0; i < photos.length; i++) {
       const photo = photos[i];
-      
+
       // Sirf thumbnails check karo - face scan ki koi zaroorat nahi yahan
       const needsThumbnail = photo.thumbnailStatus !== 'READY' || !photo.r2KeyThumb;
-      
+
       if (photo.type === 'IMAGE' && needsThumbnail) {
         triggeredCount++;
 
@@ -2256,11 +2257,11 @@ export class StorageService implements OnModuleInit {
       }
     }
 
-    return { 
-      success: true, 
-      message: triggeredCount > 0 
-        ? `Triggered thumbnail recovery for ${triggeredCount} photos via Cloudflare Worker.` 
-        : `All thumbnails are already READY. No action needed.` 
+    return {
+      success: true,
+      message: triggeredCount > 0
+        ? `Triggered thumbnail recovery for ${triggeredCount} photos via Cloudflare Worker.`
+        : `All thumbnails are already READY. No action needed.`
     };
   }
 
@@ -2398,7 +2399,7 @@ export class StorageService implements OnModuleInit {
       hasClientSelection = activeSub?.package ? activeSub.package.featureClientSelection : false;
       hasAiFaceSearch = activeSub?.package ? activeSub.package.featureAiPhotoSearch : false;
     }
- 
+
     return {
       id: event.id,
       title: event.title,
@@ -2438,30 +2439,30 @@ export class StorageService implements OnModuleInit {
       } : null
     };
   }
- 
+
   async getPublicEventPhotos(slug: string, passcode?: string) {
     const event = await this.prisma.event.findUnique({
       where: { slug }
     });
- 
+
     if (!event) {
       throw new NotFoundException('Event not found');
     }
- 
+
     if (event.status === 'DRAFT') {
       throw new BadRequestException('This event is currently in draft.');
     }
- 
+
     const requiresPasscode = event.visibility === 'PRIVATE' || (event.passcode && event.passcode !== '');
     if (requiresPasscode) {
       if (!passcode || passcode !== event.passcode) {
         throw new UnauthorizedException('Invalid event passcode');
       }
     }
- 
+
     return this.getPublicPhotos(event.id, event.slug);
   }
- 
+
   private async getPublicPhotos(eventId: string, slug: string) {
     const event = await this.prisma.event.findUnique({
       where: { id: eventId },
@@ -2472,7 +2473,7 @@ export class StorageService implements OnModuleInit {
       where: { eventId, status: 'READY', isDeleted: false },
       orderBy: { createdAt: 'desc' }
     });
- 
+
     const isWatermarked = event && event.watermarkEnabled;
 
     return Promise.all(
@@ -2600,7 +2601,7 @@ export class StorageService implements OnModuleInit {
           photos: []
         });
       }
-      
+
       const group = groupsMap.get(key)!;
       const url = await this.getReadUrl(fav.photo.r2KeyOriginal);
       const thumbUrl = fav.photo.r2KeyThumb
@@ -2951,8 +2952,8 @@ export class StorageService implements OnModuleInit {
       })
     );
 
-    const aboutImageUrl = photographer.portfolioAboutImageKey 
-      ? await this.getReadUrl(photographer.portfolioAboutImageKey) 
+    const aboutImageUrl = photographer.portfolioAboutImageKey
+      ? await this.getReadUrl(photographer.portfolioAboutImageKey)
       : null;
 
     const heroImageUrl = photographer.portfolioHeroImageKey
@@ -3488,12 +3489,12 @@ export class StorageService implements OnModuleInit {
       if (!key) return;
       try {
         await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: key }));
-      } catch {}
+      } catch { }
     };
 
     await deleteIfKeyExists(photographer.portfolioAboutImageKey);
     await deleteIfKeyExists(photographer.portfolioHeroImageKey);
-    
+
     // Also delete any direct video keys
     if (photographer.portfolioVideoUrl) {
       await deleteIfKeyExists(photographer.portfolioVideoUrl);
@@ -3501,7 +3502,7 @@ export class StorageService implements OnModuleInit {
     if (photographer.portfolioBtsUrl) {
       await deleteIfKeyExists(photographer.portfolioBtsUrl);
     }
-    
+
     // Clean reels keys
     if (photographer.portfolioReels && Array.isArray(photographer.portfolioReels)) {
       for (const r of photographer.portfolioReels as any[]) {
@@ -3561,12 +3562,12 @@ export class StorageService implements OnModuleInit {
       })
     );
 
-    const aboutImageUrl = photographer.portfolioAboutImageKey 
-      ? await this.getReadUrl(photographer.portfolioAboutImageKey) 
+    const aboutImageUrl = photographer.portfolioAboutImageKey
+      ? await this.getReadUrl(photographer.portfolioAboutImageKey)
       : null;
 
-    const heroImageUrl = photographer.portfolioHeroImageKey 
-      ? await this.getReadUrl(photographer.portfolioHeroImageKey) 
+    const heroImageUrl = photographer.portfolioHeroImageKey
+      ? await this.getReadUrl(photographer.portfolioHeroImageKey)
       : null;
 
     const freshVideoUrl = await this.getFreshVideoUrl(photographer.portfolioVideoUrl);
@@ -3884,8 +3885,8 @@ export class StorageService implements OnModuleInit {
             .t { fill: rgba(255,255,255,${textOpacity}); font-size: ${fontSize}px; font-family: Arial,sans-serif; font-weight: bold; letter-spacing: 1px; }
             .s { fill: rgba(0,0,0,${textOpacity * 0.4}); font-size: ${fontSize}px; font-family: Arial,sans-serif; font-weight: bold; letter-spacing: 1px; }
           </style>
-          <text x="${w/2 + 1}" y="${h * 0.72}" text-anchor="middle" class="s">${text}</text>
-          <text x="${w/2}" y="${h * 0.70}" text-anchor="middle" class="t">${text}</text>
+          <text x="${w / 2 + 1}" y="${h * 0.72}" text-anchor="middle" class="s">${text}</text>
+          <text x="${w / 2}" y="${h * 0.70}" text-anchor="middle" class="t">${text}</text>
         </svg>
       `);
 
@@ -4172,7 +4173,7 @@ export class StorageService implements OnModuleInit {
     const isVideo = file.mimetype.startsWith('video/') || file.originalname.match(/\.(mp4|mkv|mov|webm)$/i);
     const fileUuid = uuidv4();
     const cleanFilename = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-    
+
     // Set R2 Path
     const objectKey = isVideo
       ? `${photographer.id}/events/${event.id}/videos/${fileUuid}_${cleanFilename}`
@@ -4264,7 +4265,7 @@ export class StorageService implements OnModuleInit {
       // Mark overall photo status as READY if AI is disabled
       await this.prisma.photo.update({
         where: { id: data.photoId },
-        data: { 
+        data: {
           status: 'READY'
         }
       });
@@ -4278,11 +4279,15 @@ export class StorageService implements OnModuleInit {
     return { success: true };
   }
 
-  // Helper: Cloudflare Worker ko POST trigger bhejta hai thumbnail generation ke liye
+  // Helper: Round-Robin dispatching through Go Worker Cluster / Cloudflare Worker
   async triggerCloudflareWorker(photoId: string, r2KeyOriginal: string): Promise<void> {
-    const workerUrl = 'https://fotosetgo-thumbnail-generator.sahilshah778800.workers.dev';
+    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || 'https://fotosetgo-thumbnail-generator.sahilshah778800.workers.dev';
+    const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
 
-    fetch(workerUrl, {
+    const selectedUrl = workerUrls[this.workerDispatchCounter % workerUrls.length];
+    this.workerDispatchCounter = (this.workerDispatchCounter + 1) % 1000000;
+
+    fetch(selectedUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -4290,7 +4295,7 @@ export class StorageService implements OnModuleInit {
         photoId: photoId
       })
     }).catch(err => {
-      this.logger.error(`[Worker Trigger] Failed for photo ${photoId}: ${err.message}`);
+      this.logger.error(`[Worker Trigger] Failed for photo ${photoId} via ${selectedUrl}: ${err.message}`);
     });
   }
 

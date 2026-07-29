@@ -49,6 +49,9 @@ export class StorageService implements OnModuleInit {
     } else {
       this.logger.log(`Initializing R2 S3Client with endpoint: ${endpoint}`);
     }
+    
+    const faceEngine = process.env.FACE_ENGINE_URL || '';
+    this.logger.log(`FACE_ENGINE_URL configured as: [${faceEngine}]`);
 
     this.s3Client = new S3Client({
       region: 'auto',

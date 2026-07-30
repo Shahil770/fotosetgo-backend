@@ -4299,6 +4299,52 @@ export class StorageService implements OnModuleInit {
     });
   }
 
+  // Helper: Bheje gaye ready photos ke batch ko Go Worker Cluster dwara process karwa kar bulk DB update karta hai
+  async processBatchThumbnailsViaGoWorker(photos: { id: string; r2KeyOriginal: string }[]): Promise<void> {
+    if (!photos || photos.length === 0) return;
+
+    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || 'https://fotosetgo-thumbnail-generator.sahilshah778800.workers.dev';
+    const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
+
+    const chunkSize = 20;
+    for (let i = 0; i < photos.length; i += chunkSize) {
+      const chunk = photos.slice(i, i + chunkSize);
+      const selectedUrl = workerUrls[this.workerDispatchCounter % workerUrls.length];
+      this.workerDispatchCounter = (this.workerDispatchCounter + 1) % 1000000;
+
+      const payload = {
+        items: chunk.map(p => ({ photoId: p.id, objectKey: p.r2KeyOriginal }))
+      };
+
+      try {
+        const res = await fetch(selectedUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (res.ok) {
+          const data: any = await res.json();
+          if (data && data.results) {
+            const readyItems = data.results.filter((r: any) => r.success);
+            for (const item of readyItems) {
+              await this.prisma.photo.update({
+                where: { id: item.photoId },
+                data: {
+                  r2KeyThumb: item.thumbKey,
+                  r2KeyPreview: item.thumbKey,
+                  thumbnailStatus: 'READY'
+                }
+              }).catch(() => {});
+            }
+          }
+        }
+      } catch (err) {
+        this.logger.error(`[GoWorkerBatch] Error processing batch via ${selectedUrl}: ${err.message}`);
+      }
+    }
+  }
+
   // AI Face Toggle ON hone par ya Thumbnail complete hone par Batch Scan chalata hai (with Auto-Recheck loop)
   async triggerFaceScanForEvent(photographerId: string, eventId: string): Promise<void> {
     // Duplicate overlapping scan loops se bachane ke liye Lock check karo

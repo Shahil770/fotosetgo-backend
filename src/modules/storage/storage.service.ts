@@ -4292,8 +4292,12 @@ export class StorageService implements OnModuleInit {
     const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || 'https://fotosetgo-thumb-worker-1.onrender.com';
     const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
 
-    const selectedUrl = workerUrls[this.workerDispatchCounter % workerUrls.length];
+    let selectedUrl = workerUrls[this.workerDispatchCounter % workerUrls.length];
     this.workerDispatchCounter = (this.workerDispatchCounter + 1) % 1000000;
+
+    if (!selectedUrl.endsWith('/generate-thumbnail') && !selectedUrl.endsWith('/generate-batch-thumbnails')) {
+      selectedUrl = `${selectedUrl.replace(/\/$/, '')}/generate-thumbnail`;
+    }
 
     this.logger.log(`[Worker Trigger] Dispatching photo ${photoId} to Go Worker: ${selectedUrl}`);
 
@@ -4337,8 +4341,12 @@ export class StorageService implements OnModuleInit {
     const chunkSize = 20;
     for (let i = 0; i < photos.length; i += chunkSize) {
       const chunk = photos.slice(i, i + chunkSize);
-      const selectedUrl = workerUrls[this.workerDispatchCounter % workerUrls.length];
+      let selectedUrl = workerUrls[this.workerDispatchCounter % workerUrls.length];
       this.workerDispatchCounter = (this.workerDispatchCounter + 1) % 1000000;
+
+      if (!selectedUrl.endsWith('/generate-thumbnail') && !selectedUrl.endsWith('/generate-batch-thumbnails')) {
+        selectedUrl = `${selectedUrl.replace(/\/$/, '')}/generate-thumbnail`;
+      }
 
       const payload = {
         items: chunk.map(p => ({ photoId: p.id, objectKey: p.r2KeyOriginal }))

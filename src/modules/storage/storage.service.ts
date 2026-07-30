@@ -567,8 +567,10 @@ export class StorageService implements OnModuleInit {
         console.error('[StorageService] Background video processing failed:', err);
       });
     } else {
-      // Cloudflare Worker se thumbnail generate karwao (no local sharp processing)
-      this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal);
+      // Cloudflare Worker se thumbnail generate karwao (await HTTP dispatch)
+      await this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
+        this.logger.error(`[completeUpload] Worker trigger error for ${photoId}: ${err.message}`);
+      });
     }
 
     this.syncToGoogleDriveInBackground(photographerId, photo).catch(err => {
@@ -4293,14 +4295,16 @@ export class StorageService implements OnModuleInit {
 
     this.logger.log(`[Worker Trigger] Dispatching photo ${photoId} to Go Worker: ${selectedUrl}`);
 
-    fetch(selectedUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        objectKey: r2KeyOriginal,
-        photoId: photoId
-      })
-    }).then(async res => {
+    try {
+      const res = await fetch(selectedUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          objectKey: r2KeyOriginal,
+          photoId: photoId
+        })
+      });
+
       this.logger.log(`[Worker Trigger] Response status from ${selectedUrl} for photo ${photoId}: ${res.status}`);
       if (res.ok) {
         const data: any = await res.json();
@@ -4312,11 +4316,13 @@ export class StorageService implements OnModuleInit {
             thumbKey: result.thumbKey,
             secretKey: process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123'
           }).catch(err => this.logger.error(`[Worker Trigger] Local DB update error for ${photoId}: ${err.message}`));
+        } else {
+          this.logger.error(`[Worker Trigger] Worker returned error for ${photoId}: ${result?.error}`);
         }
       }
-    }).catch(err => {
+    } catch (err: any) {
       this.logger.error(`[Worker Trigger] Failed for photo ${photoId} via ${selectedUrl}: ${err.message}`);
-    });
+    }
   }
 
   // Helper: Bheje gaye ready photos ke batch ko Go Worker Cluster dwara process karwa kar bulk DB update karta hai

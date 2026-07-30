@@ -70,6 +70,20 @@ export class StorageService implements OnModuleInit {
         socketTimeout: 45000,
       }),
     });
+
+    this.startWorkerKeepAlivePingLoop();
+  }
+
+  private startWorkerKeepAlivePingLoop(): void {
+    // Every 10 minutes, ping all configured Go Workers so they stay 100% awake 24/7 on Render
+    setInterval(() => {
+      const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || '';
+      if (!rawUrls) return;
+      const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
+      for (const url of workerUrls) {
+        fetch(`${url.replace(/\/$/, '')}/health`).catch(() => {});
+      }
+    }, 10 * 60 * 1000);
   }
 
 

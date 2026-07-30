@@ -241,7 +241,7 @@ export class StorageService implements OnModuleInit {
       throw new BadRequestException('Events storage limit exceeded. Please upgrade your plan.');
     }
 
-    const isVideo = data.mimeType.startsWith('video/') || data.filename.match(/\.(mp4|mkv|mov|webm)$/i);
+    const isVideo = (data.mimeType && data.mimeType.startsWith('video/')) || !!data.filename.match(/\.(mp4|mkv|mov|webm|avi|flv|m4v)$/i);
     const fileUuid = uuidv4();
     const cleanFilename = data.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
 

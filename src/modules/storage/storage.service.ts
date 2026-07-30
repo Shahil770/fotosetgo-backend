@@ -513,6 +513,7 @@ export class StorageService implements OnModuleInit {
   }
 
   async completeUpload(photographerId: string, photoId: string) {
+    this.logger.log(`[completeUpload] Browser upload complete signal received for photoId: ${photoId}`);
     const photo = await this.prisma.photo.findFirst({
       where: { id: photoId, photographerId },
     });

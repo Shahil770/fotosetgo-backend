@@ -4295,7 +4295,7 @@ export class StorageService implements OnModuleInit {
 
   // Helper: Round-Robin dispatching through Go Worker Cluster / Cloudflare Worker
   async triggerCloudflareWorker(photoId: string, r2KeyOriginal: string): Promise<void> {
-    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || 'https://fotosetgo-thumbnail-generator.sahilshah778800.workers.dev';
+    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || 'https://fotosetgo-thumb-worker-1.onrender.com';
     const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
 
     const selectedUrl = workerUrls[this.workerDispatchCounter % workerUrls.length];
@@ -4317,7 +4317,7 @@ export class StorageService implements OnModuleInit {
   async processBatchThumbnailsViaGoWorker(photos: { id: string; r2KeyOriginal: string }[]): Promise<void> {
     if (!photos || photos.length === 0) return;
 
-    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || 'https://fotosetgo-thumbnail-generator.sahilshah778800.workers.dev';
+    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || 'https://fotosetgo-thumb-worker-1.onrender.com';
     const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
 
     const chunkSize = 20;

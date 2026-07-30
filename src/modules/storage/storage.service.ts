@@ -4313,6 +4313,18 @@ export class StorageService implements OnModuleInit {
       })
     }).then(async res => {
       this.logger.log(`[Worker Trigger] Response status from ${selectedUrl} for photo ${photoId}: ${res.status}`);
+      if (res.ok) {
+        const data: any = await res.json();
+        const result = data?.results?.[0];
+        if (result && result.success && result.thumbKey) {
+          this.logger.log(`[Worker Trigger] Updating DB thumbnailStatus to READY for photo: ${photoId}`);
+          await this.completeThumbnailWebhook({
+            photoId: photoId,
+            thumbKey: result.thumbKey,
+            secretKey: process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123'
+          }).catch(err => this.logger.error(`[Worker Trigger] Local DB update error for ${photoId}: ${err.message}`));
+        }
+      }
     }).catch(err => {
       this.logger.error(`[Worker Trigger] Failed for photo ${photoId} via ${selectedUrl}: ${err.message}`);
     });

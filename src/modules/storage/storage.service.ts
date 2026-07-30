@@ -81,7 +81,7 @@ export class StorageService implements OnModuleInit {
       if (!rawUrls) return;
       const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
       for (const url of workerUrls) {
-        fetch(`${url.replace(/\/$/, '')}/health`).catch(() => {});
+        fetch(`${url.replace(/\/$/, '')}/health`).catch(() => { });
       }
     }, 10 * 60 * 1000);
   }
@@ -213,7 +213,8 @@ export class StorageService implements OnModuleInit {
         subscriptions: {
           where: { status: 'ACTIVE' },
           orderBy: { startsAt: 'desc' },
-          take: 1
+          take: 1,
+          include: { package: true }
         }
       }
     });
@@ -226,7 +227,12 @@ export class StorageService implements OnModuleInit {
     if (!activeSubscription) {
       throw new BadRequestException('No active subscription found. Please subscribe to a plan to start uploading.');
     }
-    const limitBytes = activeSubscription.limitEventsBytes ?? activeSubscription.limitBytes;
+
+    // Dynamic dual limit resolution: take the maximum of package limit vs subscription stored limit
+    const pkgMb = activeSubscription.package?.maxEventsStorageMb ?? 5000;
+    const pkgLimitBytes = BigInt(pkgMb) * BigInt(1024 * 1024);
+    const subLimitBytes = activeSubscription.limitEventsBytes ?? activeSubscription.limitBytes ?? BigInt(0);
+    const limitBytes = pkgLimitBytes > subLimitBytes ? pkgLimitBytes : subLimitBytes;
 
     // Calculate events-only used bytes (exclude portfolio/branding files)
     const eventsUsedAgg = await this.prisma.photo.aggregate({
@@ -241,7 +247,7 @@ export class StorageService implements OnModuleInit {
       throw new BadRequestException('Events storage limit exceeded. Please upgrade your plan.');
     }
 
-    const isVideo = (data.mimeType && data.mimeType.startsWith('video/')) || !!data.filename.match(/\.(mp4|mkv|mov|webm|avi|flv|m4v)$/i);
+    const isVideo = data.mimeType.startsWith('video/') || data.filename.match(/\.(mp4|mkv|mov|webm)$/i);
     const fileUuid = uuidv4();
     const cleanFilename = data.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
 
@@ -4371,7 +4377,7 @@ export class StorageService implements OnModuleInit {
                   r2KeyPreview: item.thumbKey,
                   thumbnailStatus: 'READY'
                 }
-              }).catch(() => {});
+              }).catch(() => { });
             }
           }
         }

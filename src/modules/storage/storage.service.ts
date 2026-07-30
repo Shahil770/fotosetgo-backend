@@ -356,8 +356,10 @@ export class StorageService implements OnModuleInit {
         console.error('[StorageService] Background video processing failed:', err);
       });
     } else {
-      // Cloudflare Worker se thumbnail generate karwao (no local sharp processing)
-      this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal);
+      // Cloudflare Worker se thumbnail generate karwao (await HTTP dispatch)
+      await this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
+        this.logger.error(`[approveGuestPhoto] Worker trigger error for ${photoId}: ${err.message}`);
+      });
     }
 
     return updatedPhoto;
@@ -2259,7 +2261,7 @@ export class StorageService implements OnModuleInit {
       });
 
       this.logger.log(`[Reindex] Batch dispatching ${needsThumbnailPhotos.length} photos to Go Worker Cluster...`);
-      this.processBatchThumbnailsViaGoWorker(needsThumbnailPhotos.map(p => ({ id: p.id, r2KeyOriginal: p.r2KeyOriginal })))
+      await this.processBatchThumbnailsViaGoWorker(needsThumbnailPhotos.map(p => ({ id: p.id, r2KeyOriginal: p.r2KeyOriginal })))
         .catch(err => this.logger.error(`[Reindex] Batch worker error: ${err.message}`));
     }
 

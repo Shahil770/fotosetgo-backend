@@ -4301,6 +4301,8 @@ export class StorageService implements OnModuleInit {
     const selectedUrl = workerUrls[this.workerDispatchCounter % workerUrls.length];
     this.workerDispatchCounter = (this.workerDispatchCounter + 1) % 1000000;
 
+    this.logger.log(`[Worker Trigger] Dispatching photo ${photoId} to Go Worker: ${selectedUrl}`);
+
     fetch(selectedUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -4308,6 +4310,8 @@ export class StorageService implements OnModuleInit {
         objectKey: r2KeyOriginal,
         photoId: photoId
       })
+    }).then(async res => {
+      this.logger.log(`[Worker Trigger] Response status from ${selectedUrl} for photo ${photoId}: ${res.status}`);
     }).catch(err => {
       this.logger.error(`[Worker Trigger] Failed for photo ${photoId} via ${selectedUrl}: ${err.message}`);
     });

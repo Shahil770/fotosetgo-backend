@@ -50,9 +50,10 @@ export class AuthService {
         freePackage = await tx.package.create({
           data: {
             name: 'Free',
-            maxStorageGb: 0, // representing 200 MB limit
-            maxPhotosPerEvent: 100,
-            faceSearchLimit: 100,
+            maxStorageGb: 5,
+            maxEventsStorageMb: 5000,
+            maxPhotosPerEvent: 1000,
+            faceSearchLimit: 500,
             allowCustomBranding: false,
             price: 0,
             isActive: true,
@@ -60,8 +61,13 @@ export class AuthService {
         });
       }
 
-      // Create a subscription with 200 MB storage limit (209715200 bytes)
-      const limitBytes = BigInt(200 * 1024 * 1024);
+      // Calculate limit dynamically from Package record
+      const eventsMb = freePackage.maxEventsStorageMb || 5000;
+      const portfolioMb = freePackage.maxPortfolioStorageMb || 0;
+      const limitEventsBytes = BigInt(eventsMb) * BigInt(1024 * 1024);
+      const limitPortfolioBytes = BigInt(portfolioMb) * BigInt(1024 * 1024);
+      const limitBytes = limitEventsBytes + limitPortfolioBytes;
+
       await tx.subscription.create({
         data: {
           photographerId: photographer.id,
@@ -70,6 +76,8 @@ export class AuthService {
           endsAt: new Date(new Date().setFullYear(new Date().getFullYear() + 10)), // 10 years
           status: 'ACTIVE',
           limitBytes,
+          limitEventsBytes,
+          limitPortfolioBytes,
           usedBytes: BigInt(0),
         },
       });

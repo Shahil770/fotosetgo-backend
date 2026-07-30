@@ -451,7 +451,7 @@ export class StorageService implements OnModuleInit {
     // 1. Verify Photographer level storage limit
     const photographer = event.photographer;
     const activeSubscription = photographer.subscriptions[0];
-    const limitBytes = activeSubscription ? activeSubscription.limitBytes : BigInt(200 * 1024 * 1024);
+    const limitBytes = activeSubscription?.limitEventsBytes ?? activeSubscription?.limitBytes ?? BigInt(5000 * 1024 * 1024);
     const totalStorageUsedBytes = photographer.totalStorageUsedBytes || BigInt(0);
 
     if (totalStorageUsedBytes + BigInt(data.fileSize) > limitBytes) {
@@ -2189,7 +2189,7 @@ export class StorageService implements OnModuleInit {
     }
 
     const activeSubscription = photographer.subscriptions[0];
-    const limitBytes = activeSubscription ? activeSubscription.limitBytes : BigInt(200 * 1024 * 1024);
+    const limitBytes = activeSubscription?.limitEventsBytes ?? activeSubscription?.limitBytes ?? BigInt(5000 * 1024 * 1024);
     const totalStorageUsedBytes = photographer.totalStorageUsedBytes || BigInt(0);
 
     if (totalStorageUsedBytes + sizeAccumulator > limitBytes) {
@@ -4158,7 +4158,7 @@ export class StorageService implements OnModuleInit {
     // 1. Verify Photographer level storage limit
     const photographer = event.photographer;
     const activeSubscription = photographer.subscriptions[0];
-    const limitBytes = activeSubscription ? activeSubscription.limitBytes : BigInt(200 * 1024 * 1024);
+    const limitBytes = activeSubscription?.limitEventsBytes ?? activeSubscription?.limitBytes ?? BigInt(5000 * 1024 * 1024);
     const totalStorageUsedBytes = photographer.totalStorageUsedBytes || BigInt(0);
 
     if (totalStorageUsedBytes + BigInt(file.size) > limitBytes) {

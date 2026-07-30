@@ -140,16 +140,14 @@ export class BillingService implements OnModuleInit {
       throw new NotFoundException(`Package ${data.packageName} not found`);
     }
 
-    const storageGb = targetPackage.maxStorageGb;
-    const limitBytes = storageGb === 0
-      ? BigInt(200 * 1024 * 1024)
-      : BigInt(storageGb * 1024 * 1024 * 1024);
-
-    const limitEventsBytes = BigInt((targetPackage.maxEventsStorageMb || 200) * 1024 * 1024);
+    const eventsMb = targetPackage.maxEventsStorageMb || 5000;
+    const portfolioMb = targetPackage.maxPortfolioStorageMb || 0;
+    const limitEventsBytes = BigInt(eventsMb) * BigInt(1024 * 1024);
     const isPortfolioEnabled = targetPackage.featurePortfolioWebsite || targetPackage.featureCustomBranding;
     const limitPortfolioBytes = isPortfolioEnabled
-      ? BigInt((targetPackage.maxPortfolioStorageMb || 0) * 1024 * 1024)
+      ? BigInt(portfolioMb * 1024 * 1024)
       : BigInt(0);
+    const limitBytes = limitEventsBytes + limitPortfolioBytes;
 
     await this.prisma.subscription.updateMany({
       where: { photographerId, status: 'ACTIVE' },
@@ -190,7 +188,7 @@ export class BillingService implements OnModuleInit {
     return {
       success: true,
       packageName: targetPackage.name,
-      maxStorageGb: storageGb,
+      maxStorageGb: targetPackage.maxStorageGb,
       limitBytes: limitBytes.toString(),
     };
   }

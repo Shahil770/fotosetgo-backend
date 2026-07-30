@@ -171,8 +171,8 @@ model Subscription {
   startsAt            DateTime     @default(now())
   endsAt              DateTime
   status              String       // ACTIVE, EXPIRED, CANCELLED
-  limitBytes          BigInt       @default(209715200)
-  limitEventsBytes    BigInt       @default(209715200)
+  limitBytes          BigInt       @default(5242880000)
+  limitEventsBytes    BigInt       @default(5242880000)
   limitPortfolioBytes BigInt       @default(0)
   usedBytes           BigInt       @default(0)
   createdAt           DateTime     @default(now())

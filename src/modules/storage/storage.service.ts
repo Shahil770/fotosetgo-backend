@@ -2231,7 +2231,7 @@ export class StorageService implements OnModuleInit {
       where: { eventId, photographerId }
     });
 
-    // Correct eventId for any face embeddings that are out of sync (e.g., from old events before restore)
+    // Correct eventId for any face embeddings that are out of sync
     const photoIds = photos.map(p => p.id);
     if (photoIds.length > 0) {
       await this.prisma.faceEmbedding.updateMany({
@@ -2247,35 +2247,24 @@ export class StorageService implements OnModuleInit {
       });
     }
 
-    let triggeredCount = 0;
+    const needsThumbnailPhotos = photos.filter(p => p.type === 'IMAGE' && (p.thumbnailStatus !== 'READY' || !p.r2KeyThumb));
 
-    for (let i = 0; i < photos.length; i++) {
-      const photo = photos[i];
+    if (needsThumbnailPhotos.length > 0) {
+      const pendingPhotoIds = needsThumbnailPhotos.map(p => p.id);
+      await this.prisma.photo.updateMany({
+        where: { id: { in: pendingPhotoIds } },
+        data: { thumbnailStatus: 'PENDING', status: 'PROCESSING' }
+      });
 
-      // Sirf thumbnails check karo - face scan ki koi zaroorat nahi yahan
-      const needsThumbnail = photo.thumbnailStatus !== 'READY' || !photo.r2KeyThumb;
-
-      if (photo.type === 'IMAGE' && needsThumbnail) {
-        triggeredCount++;
-
-        // Reset thumbnail status to PENDING so UI shows progress
-        await this.prisma.photo.update({
-          where: { id: photo.id },
-          data: { thumbnailStatus: 'PENDING' }
-        });
-
-        // Cloudflare Worker ko POST trigger bhejo (non-blocking)
-        this.triggerCloudflareWorker(photo.id, photo.r2KeyOriginal);
-
-        // Small delay to avoid overwhelming the Worker
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
+      this.logger.log(`[Reindex] Batch dispatching ${needsThumbnailPhotos.length} photos to Go Worker Cluster...`);
+      this.processBatchThumbnailsViaGoWorker(needsThumbnailPhotos.map(p => ({ id: p.id, r2KeyOriginal: p.r2KeyOriginal })))
+        .catch(err => this.logger.error(`[Reindex] Batch worker error: ${err.message}`));
     }
 
     return {
       success: true,
-      message: triggeredCount > 0
-        ? `Triggered thumbnail recovery for ${triggeredCount} photos via Cloudflare Worker.`
+      message: needsThumbnailPhotos.length > 0
+        ? `Triggered batch thumbnail recovery for ${needsThumbnailPhotos.length} photos via Go Worker Cluster.`
         : `All thumbnails are already READY. No action needed.`
     };
   }

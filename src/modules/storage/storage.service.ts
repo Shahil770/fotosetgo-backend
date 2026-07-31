@@ -728,7 +728,7 @@ export class StorageService implements OnModuleInit {
       let faceCount = 0;
       let hasFaces = false;
 
-      if (photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled && duration > 0) {
+      if (photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled) {
         const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
 
         try {

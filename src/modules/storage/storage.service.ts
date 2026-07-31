@@ -893,16 +893,9 @@ export class StorageService implements OnModuleInit {
         return;
       }
 
-      // Use the 300px thumbnail URL directly for FastAPI AI Face Indexing
-      let faceIndexUrl: string;
-      if (thumbKey) {
-        const thumbCommand = new GetObjectCommand({ Bucket: this.bucketName, Key: thumbKey });
-        faceIndexUrl = await getSignedUrl(this.s3Client, thumbCommand, { expiresIn: 600 });
-      } else {
-        // Fallback to original if thumbnail key generation failed
-        const origCommand = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
-        faceIndexUrl = await getSignedUrl(this.s3Client, origCommand, { expiresIn: 600 });
-      }
+      // Use the Original photo URL for maximum clarity AI Face Indexing
+      const origCommand = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
+      const faceIndexUrl = await getSignedUrl(this.s3Client, origCommand, { expiresIn: 600 });
 
       // Call FastAPI Face Engine with thumbnail URL
       const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://127.0.0.1:8000';
@@ -4383,7 +4376,7 @@ export class StorageService implements OnModuleInit {
             const photoBatchPayload: { photoId: string; imageUrl: string }[] = [];
 
             for (const photo of photos) {
-              const readKey = photo.r2KeyThumb || photo.r2KeyOriginal;
+              const readKey = photo.r2KeyOriginal;
               const signedUrl = await this.getReadUrl(readKey);
               if (signedUrl) {
                 photoBatchPayload.push({ photoId: photo.id, imageUrl: signedUrl });

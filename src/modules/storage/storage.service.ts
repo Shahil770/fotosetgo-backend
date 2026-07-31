@@ -4295,11 +4295,7 @@ export class StorageService implements OnModuleInit {
 
   async triggerCloudflareWorker(photoId: string, r2KeyOriginal: string): Promise<void> {
     const modalUrl = (process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run') + '/generate-thumbnail';
-    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || modalUrl;
-    const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
-
-    let selectedUrl = workerUrls[this.workerDispatchCounter % workerUrls.length];
-    this.workerDispatchCounter = (this.workerDispatchCounter + 1) % 1000000;
+    let selectedUrl = process.env.USE_MODAL_THUMBNAILS !== 'false' ? modalUrl : (process.env.THUMBNAIL_WORKER_URL || modalUrl);
 
     if (!selectedUrl.endsWith('/generate-thumbnail') && !selectedUrl.endsWith('/generate-batch-thumbnails')) {
       selectedUrl = `${selectedUrl.replace(/\/$/, '')}/generate-thumbnail`;
@@ -4341,19 +4337,15 @@ export class StorageService implements OnModuleInit {
     if (!photos || photos.length === 0) return;
 
     const modalUrl = (process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run') + '/generate-thumbnail';
-    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || modalUrl;
-    const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
+    let selectedUrl = process.env.USE_MODAL_THUMBNAILS !== 'false' ? modalUrl : (process.env.THUMBNAIL_WORKER_URL || modalUrl);
+
+    if (!selectedUrl.endsWith('/generate-thumbnail') && !selectedUrl.endsWith('/generate-batch-thumbnails')) {
+      selectedUrl = `${selectedUrl.replace(/\/$/, '')}/generate-thumbnail`;
+    }
 
     const chunkSize = 20;
     for (let i = 0; i < photos.length; i += chunkSize) {
       const chunk = photos.slice(i, i + chunkSize);
-      let selectedUrl = workerUrls[this.workerDispatchCounter % workerUrls.length];
-      this.workerDispatchCounter = (this.workerDispatchCounter + 1) % 1000000;
-
-      if (!selectedUrl.endsWith('/generate-thumbnail') && !selectedUrl.endsWith('/generate-batch-thumbnails')) {
-        selectedUrl = `${selectedUrl.replace(/\/$/, '')}/generate-thumbnail`;
-      }
-
       const payload = {
         items: chunk.map(p => ({ photoId: p.id, objectKey: p.r2KeyOriginal }))
       };

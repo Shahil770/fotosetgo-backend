@@ -576,8 +576,9 @@ export class StorageService implements OnModuleInit {
     });
 
     if (photo.type === 'VIDEO') {
-      this.runBackgroundVideoProcessing(photographerId, photoId, photo.eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
-        console.error('[StorageService] Background video duration extraction failed:', err);
+      // Trigger event face scanning loop which handles video scanning cleanly once thumbnail is ready
+      this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
+        console.error('[StorageService] Video face scan loop trigger failed:', err);
       });
     }
 

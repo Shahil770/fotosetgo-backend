@@ -714,13 +714,8 @@ export class StorageService implements OnModuleInit {
       const getCmd = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
       const videoSignedUrl = await getSignedUrl(this.s3Client, getCmd, { expiresIn: 3600 });
 
-      // 2. Extract Duration via FFprobe over Signed HTTP URL (0 MB RAM overhead)
-      try {
-        const { stdout } = await execPromise(`"${ffprobePath}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoSignedUrl}"`);
-        duration = parseFloat(stdout.trim()) || 0;
-      } catch (durationErr) {
-        console.error('[StorageService] Failed to extract duration via ffprobe signed URL:', durationErr);
-      }
+      // 2. Safe Duration Extraction (ffprobe-static removed to prevent Linux Segfaults on HTTPS URLs)
+      duration = 0;
 
       // 3. Video Face Scanning (Check Global & Event Toggles)
       const photographer = await this.prisma.photographer.findUnique({
@@ -783,15 +778,13 @@ export class StorageService implements OnModuleInit {
         }
       }
 
-      const videoScanRan = photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled && duration > 0;
-
       // Update database record with Modal generated thumbnail key & duration
       await this.prisma.photo.update({
         where: { id: photoId },
         data: {
           status: 'READY',
           thumbnailStatus: 'READY',
-          faceScanStatus: videoScanRan ? 'READY' : 'PENDING',
+          faceScanStatus: 'READY',
           hasFaces,
           faceCount,
           r2KeyThumb: computedThumbKey,

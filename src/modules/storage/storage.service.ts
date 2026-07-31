@@ -2200,7 +2200,7 @@ export class StorageService implements OnModuleInit {
       });
     }
 
-    const needsThumbnailItems = photos.filter(p => p.thumbnailStatus !== 'READY' || !p.r2KeyThumb);
+    const needsThumbnailItems = photos.filter(p => p.status !== 'READY' || p.thumbnailStatus !== 'READY' || !p.r2KeyThumb);
 
     if (needsThumbnailItems.length > 0) {
       const pendingPhotoIds = needsThumbnailItems.map(p => p.id);

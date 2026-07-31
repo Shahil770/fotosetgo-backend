@@ -704,66 +704,25 @@ export class StorageService implements OnModuleInit {
       await this.updateBatchProgress(uploadBatchId, true);
       return;
     }
-
-    const tempDir = path.join(__dirname, '../../../../scratch');
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true });
-    }
-
-    const tempVideoPath = path.join(tempDir, `${photoId}_video.mp4`);
-    const tempThumbPath = path.join(tempDir, `${photoId}_thumb.jpg`);
-    let thumbKey: string | null = null;
     let duration = 0;
+    const computedThumbKey = r2KeyOriginal.includes('/videos/') 
+      ? r2KeyOriginal.replace('/videos/', '/thumbs/').replace(/\.[^/.]+$/, '.jpg')
+      : r2KeyOriginal.replace('/photos/', '/thumbs/').replace(/\.[^/.]+$/, '.jpg');
 
     try {
-      // 1. Download video from R2
-      const getCommand = new GetObjectCommand({
-        Bucket: this.bucketName,
-        Key: r2KeyOriginal,
-      });
-      const s3Response = await this.s3Client.send(getCommand);
-      if (!s3Response.Body) {
-        throw new Error('S3 video body is empty');
-      }
+      // 1. Get Signed URL for 0-RAM Metadata extraction
+      const getCmd = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
+      const videoSignedUrl = await getSignedUrl(this.s3Client, getCmd, { expiresIn: 3600 });
 
-      const responseByteArray = await s3Response.Body.transformToByteArray();
-      fs.writeFileSync(tempVideoPath, Buffer.from(responseByteArray));
-
-      // 2. Generate Thumbnail via FFmpeg
-      await execPromise(`"${ffmpegPath}" -y -i "${tempVideoPath}" -ss 00:00:02 -vframes 1 "${tempThumbPath}"`);
-
-      // 3. Get Duration via FFprobe
+      // 2. Extract Duration via FFprobe over Signed HTTP URL (0 MB RAM overhead)
       try {
-        const { stdout } = await execPromise(`"${ffprobePath}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${tempVideoPath}"`);
+        const { stdout } = await execPromise(`"${ffprobePath}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoSignedUrl}"`);
         duration = parseFloat(stdout.trim()) || 0;
       } catch (durationErr) {
-        console.error('[StorageService] Failed to extract duration:', durationErr);
+        console.error('[StorageService] Failed to extract duration via ffprobe signed URL:', durationErr);
       }
 
-      // 4. Upload Thumbnail to R2 — resized to 300px for consistency with photo thumbnails
-      if (fs.existsSync(tempThumbPath)) {
-        let thumbBuffer = fs.readFileSync(tempThumbPath);
-        try {
-          thumbBuffer = await sharp(thumbBuffer)
-            .resize(300)
-            .jpeg({ quality: 80 })
-            .toBuffer();
-        } catch (resizeErr) {
-          console.error('[StorageService] Video thumb resize failed, using raw frame:', resizeErr);
-          thumbBuffer = fs.readFileSync(tempThumbPath); // fallback
-        }
-
-        thumbKey = `${photographerId}/events/${eventId}/thumbs/v_${photoId}.jpg`;
-
-        await this.s3Client.send(new PutObjectCommand({
-          Bucket: this.bucketName,
-          Key: thumbKey,
-          Body: thumbBuffer,
-          ContentType: 'image/jpeg',
-        }));
-      }
-
-      // 5. Video Face Scanning (Check Global & Event Toggles)
+      // 3. Video Face Scanning (Check Global & Event Toggles)
       const photographer = await this.prisma.photographer.findUnique({
         where: { id: photographerId },
       });
@@ -775,13 +734,9 @@ export class StorageService implements OnModuleInit {
       let hasFaces = false;
 
       if (photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled && duration > 0) {
-        const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://127.0.0.1:8000';
+        const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
 
         try {
-          // Get signed read URL for video
-          const getCmd = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
-          const videoSignedUrl = await getSignedUrl(this.s3Client, getCmd, { expiresIn: 3600 });
-
           // Call Modal GPU Video Indexing Endpoint (/faces/index-video)
           const response = await fetch(`${faceEngineUrl}/faces/index-video`, {
             method: 'POST',
@@ -828,10 +783,9 @@ export class StorageService implements OnModuleInit {
         }
       }
 
-
       const videoScanRan = photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled && duration > 0;
 
-      // Update database record
+      // Update database record with Modal generated thumbnail key & duration
       await this.prisma.photo.update({
         where: { id: photoId },
         data: {
@@ -840,8 +794,8 @@ export class StorageService implements OnModuleInit {
           faceScanStatus: videoScanRan ? 'READY' : 'PENDING',
           hasFaces,
           faceCount,
-          r2KeyThumb: thumbKey,
-          thumbnailUrl: thumbKey ? `https://pub-d4d6b7ea94e00e300402.r2.dev/${thumbKey}` : null,
+          r2KeyThumb: computedThumbKey,
+          thumbnailUrl: `https://pub-d4d6b7ea94e00e300402.r2.dev/${computedThumbKey}`,
           duration,
         },
       });
@@ -860,17 +814,6 @@ export class StorageService implements OnModuleInit {
       }).catch(() => { });
 
       await this.updateBatchProgress(uploadBatchId, false);
-    } finally {
-      // Clean up local temp files
-      if (fs.existsSync(tempVideoPath)) fs.unlinkSync(tempVideoPath);
-      if (fs.existsSync(tempThumbPath)) fs.unlinkSync(tempThumbPath);
-      try {
-        const files = fs.readdirSync(tempDir);
-        const frameFiles = files.filter(f => f.startsWith(`${photoId}_frame_`));
-        for (const file of frameFiles) {
-          fs.unlinkSync(path.join(tempDir, file));
-        }
-      } catch (cleanupErr) { }
     }
   }
 

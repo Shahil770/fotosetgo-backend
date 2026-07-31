@@ -2200,24 +2200,30 @@ export class StorageService implements OnModuleInit {
       });
     }
 
-    const needsThumbnailPhotos = photos.filter(p => p.type === 'IMAGE' && (p.thumbnailStatus !== 'READY' || !p.r2KeyThumb));
+    const needsThumbnailItems = photos.filter(p => p.thumbnailStatus !== 'READY' || !p.r2KeyThumb);
 
-    if (needsThumbnailPhotos.length > 0) {
-      const pendingPhotoIds = needsThumbnailPhotos.map(p => p.id);
+    if (needsThumbnailItems.length > 0) {
+      const pendingPhotoIds = needsThumbnailItems.map(p => p.id);
       await this.prisma.photo.updateMany({
         where: { id: { in: pendingPhotoIds } },
         data: { thumbnailStatus: 'PENDING', status: 'PROCESSING' }
       });
 
-      this.logger.log(`[Reindex] Batch dispatching ${needsThumbnailPhotos.length} photos to Go Worker Cluster...`);
-      await this.processBatchThumbnailsViaGoWorker(needsThumbnailPhotos.map(p => ({ id: p.id, r2KeyOriginal: p.r2KeyOriginal })))
+      this.logger.log(`[Reindex] Batch dispatching ${needsThumbnailItems.length} items (photos & videos) to Modal Engine...`);
+      await this.processBatchThumbnailsViaGoWorker(needsThumbnailItems.map(p => ({ id: p.id, r2KeyOriginal: p.r2KeyOriginal })))
         .catch(err => this.logger.error(`[Reindex] Batch worker error: ${err.message}`));
+
+      // Re-trigger background video processing for any stuck videos
+      for (const item of needsThumbnailItems.filter(p => p.type === 'VIDEO')) {
+        this.runBackgroundVideoProcessing(photographerId, item.id, item.eventId, item.r2KeyOriginal, item.uploadBatchId)
+          .catch(err => this.logger.error(`[Reindex] Video processing error for ${item.id}: ${err.message}`));
+      }
     }
 
     return {
       success: true,
-      message: needsThumbnailPhotos.length > 0
-        ? `Triggered batch thumbnail recovery for ${needsThumbnailPhotos.length} photos via Go Worker Cluster.`
+      message: needsThumbnailItems.length > 0
+        ? `Triggered batch thumbnail recovery for ${needsThumbnailItems.length} items (photos & videos) via Modal Engine.`
         : `All thumbnails are already READY. No action needed.`
     };
   }

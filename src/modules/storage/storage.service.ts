@@ -570,14 +570,14 @@ export class StorageService implements OnModuleInit {
       data: { status: 'PROCESSING', thumbnailStatus: 'PENDING' }
     });
 
+    // Modal Cloud Engine handles thumbnails for both Photos and Videos seamlessly
+    await this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
+      this.logger.error(`[completeUpload] Thumbnail engine trigger error for ${photoId}: ${err.message}`);
+    });
+
     if (photo.type === 'VIDEO') {
       this.runBackgroundVideoProcessing(photographerId, photoId, photo.eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
-        console.error('[StorageService] Background video processing failed:', err);
-      });
-    } else {
-      // Cloudflare Worker se thumbnail generate karwao (await HTTP dispatch)
-      await this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
-        this.logger.error(`[completeUpload] Worker trigger error for ${photoId}: ${err.message}`);
+        console.error('[StorageService] Background video duration extraction failed:', err);
       });
     }
 
@@ -4293,9 +4293,9 @@ export class StorageService implements OnModuleInit {
     return { success: true };
   }
 
-  // Helper: Round-Robin dispatching through Go Worker Cluster / Cloudflare Worker
   async triggerCloudflareWorker(photoId: string, r2KeyOriginal: string): Promise<void> {
-    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || 'https://fotosetgo-thumb-worker-1.onrender.com';
+    const modalUrl = (process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run') + '/generate-thumbnail';
+    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || modalUrl;
     const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
 
     let selectedUrl = workerUrls[this.workerDispatchCounter % workerUrls.length];
@@ -4305,7 +4305,7 @@ export class StorageService implements OnModuleInit {
       selectedUrl = `${selectedUrl.replace(/\/$/, '')}/generate-thumbnail`;
     }
 
-    this.logger.log(`[Worker Trigger] Dispatching photo ${photoId} to Go Worker: ${selectedUrl}`);
+    this.logger.log(`[Worker Trigger] Dispatching item ${photoId} to Modal Thumbnail Engine: ${selectedUrl}`);
 
     try {
       const res = await fetch(selectedUrl, {
@@ -4337,11 +4337,11 @@ export class StorageService implements OnModuleInit {
     }
   }
 
-  // Helper: Bheje gaye ready photos ke batch ko Go Worker Cluster dwara process karwa kar bulk DB update karta hai
   async processBatchThumbnailsViaGoWorker(photos: { id: string; r2KeyOriginal: string }[]): Promise<void> {
     if (!photos || photos.length === 0) return;
 
-    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || 'https://fotosetgo-thumb-worker-1.onrender.com';
+    const modalUrl = (process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run') + '/generate-thumbnail';
+    const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || modalUrl;
     const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
 
     const chunkSize = 20;

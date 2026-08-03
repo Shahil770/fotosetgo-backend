@@ -576,10 +576,13 @@ export class StorageService implements OnModuleInit {
     });
 
     if (photo.type === 'VIDEO') {
-      // Trigger event face scanning loop which handles video scanning cleanly once thumbnail is ready
-      this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
-        console.error('[StorageService] Video face scan loop trigger failed:', err);
-      });
+      const event = await this.prisma.event.findUnique({ where: { id: photo.eventId } });
+      if (event && event.videoScanningEnabled) {
+        // Trigger event face scanning loop which handles video scanning cleanly once thumbnail is ready
+        this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
+          console.error('[StorageService] Video face scan loop trigger failed:', err);
+        });
+      }
     }
 
     this.syncToGoogleDriveInBackground(photographerId, photo).catch(err => {
@@ -785,7 +788,8 @@ export class StorageService implements OnModuleInit {
         data: {
           status: 'READY',
           thumbnailStatus: 'READY',
-          faceScanStatus: 'READY',
+          // Set to READY ONLY if video scanning ran, else set to PENDING
+          faceScanStatus: (photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled) ? 'READY' : 'PENDING',
           hasFaces,
           faceCount,
           r2KeyThumb: computedThumbKey,
@@ -4329,21 +4333,35 @@ export class StorageService implements OnModuleInit {
       return;
     }
 
+    const eventObj = await this.prisma.event.findUnique({ where: { id: eventId } });
+    if (!eventObj) return;
+
     this.activeEventScans.add(eventId);
 
     try {
       while (true) {
+        // Enforce toggle settings dynamically
+        if (!eventObj.faceScanningEnabled && !eventObj.videoScanningEnabled) {
+          this.logger.log(`[BatchFaceScan] Both photo and video scanning toggles are disabled. Aborting loop.`);
+          break;
+        }
+
         // Check if there are active uploads in progress for this event
         const activeUploadingCount = await this.prisma.photo.count({
           where: { eventId, status: 'UPLOADING' }
         });
 
         // Fetch ready thumbnails that haven't been face scanned yet (batch of up to 150 photos)
+        const typeFilter: string[] = [];
+        if (eventObj.faceScanningEnabled) typeFilter.push('IMAGE');
+        if (eventObj.videoScanningEnabled) typeFilter.push('VIDEO');
+
         const pendingItems = await this.prisma.photo.findMany({
           where: {
             eventId,
             photographerId,
-            faceScanStatus: { notIn: ['PROCESSING'] },
+            faceScanStatus: { notIn: ['PROCESSING', 'READY'] },
+            type: { in: typeFilter },
             OR: [
               { thumbnailStatus: 'READY' },
               { r2KeyThumb: { not: null } }

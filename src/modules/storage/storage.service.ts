@@ -2188,12 +2188,11 @@ export class StorageService implements OnModuleInit {
     }
 
     const needsThumbnailItems = photos.filter(p => p.status !== 'READY' || p.thumbnailStatus !== 'READY' || !p.r2KeyThumb);
-
     if (needsThumbnailItems.length > 0) {
       const pendingPhotoIds = needsThumbnailItems.map(p => p.id);
       await this.prisma.photo.updateMany({
         where: { id: { in: pendingPhotoIds } },
-        data: { thumbnailStatus: 'PENDING', status: 'PROCESSING' }
+        data: { thumbnailStatus: 'PENDING', status: 'PROCESSING', faceScanStatus: 'PENDING' }
       });
 
       this.logger.log(`[Reindex] Batch dispatching ${needsThumbnailItems.length} items (photos & videos) to Modal Engine...`);
@@ -2204,6 +2203,18 @@ export class StorageService implements OnModuleInit {
       for (const item of needsThumbnailItems.filter(p => p.type === 'VIDEO')) {
         this.runBackgroundVideoProcessing(photographerId, item.id, item.eventId, item.r2KeyOriginal, item.uploadBatchId)
           .catch(err => this.logger.error(`[Reindex] Video processing error for ${item.id}: ${err.message}`));
+      }
+    } else {
+      // If thumbnails are already ready but face scan is stuck, trigger Face Scan engine
+      const eventObj = await this.prisma.event.findUnique({ where: { id: eventId } });
+      if (eventObj && eventObj.faceScanningEnabled) {
+        this.logger.log(`[Reindex] Thumbnails already ready. Re-triggering Face Scan loop for event: ${eventId}`);
+        // Reset stuck PROCESSING status to PENDING
+        await this.prisma.photo.updateMany({
+          where: { eventId, faceScanStatus: 'PROCESSING' },
+          data: { faceScanStatus: 'PENDING' }
+        });
+        this.triggerFaceScanForEvent(photographerId, eventId).catch(() => {});
       }
     }
 

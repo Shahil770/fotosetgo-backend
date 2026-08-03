@@ -4332,7 +4332,8 @@ export class StorageService implements OnModuleInit {
                 data: {
                   r2KeyThumb: item.thumbKey,
                   r2KeyPreview: item.previewKey || null,
-                  thumbnailStatus: 'READY'
+                  thumbnailStatus: 'READY',
+                  status: 'READY'
                 }
               }).catch(() => { });
             }

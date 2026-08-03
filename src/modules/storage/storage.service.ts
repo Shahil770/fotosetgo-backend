@@ -570,19 +570,20 @@ export class StorageService implements OnModuleInit {
       data: { status: 'PROCESSING', thumbnailStatus: 'PENDING' }
     });
 
-    // Modal Cloud Engine handles thumbnails for both Photos and Videos seamlessly
-    await this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
+    // Fire-and-forget: return instantly to browser so upload queue is never blocked
+    // Modal thumbnail engine runs in background without holding up the next upload
+    this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
       this.logger.error(`[completeUpload] Thumbnail engine trigger error for ${photoId}: ${err.message}`);
     });
 
     if (photo.type === 'VIDEO') {
-      const event = await this.prisma.event.findUnique({ where: { id: photo.eventId } });
-      if (event && event.videoScanningEnabled) {
-        // Trigger event face scanning loop which handles video scanning cleanly once thumbnail is ready
-        this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
-          console.error('[StorageService] Video face scan loop trigger failed:', err);
-        });
-      }
+      this.prisma.event.findUnique({ where: { id: photo.eventId } }).then(event => {
+        if (event && event.videoScanningEnabled) {
+          this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
+            console.error('[StorageService] Video face scan loop trigger failed:', err);
+          });
+        }
+      }).catch(() => {});
     }
 
     this.syncToGoogleDriveInBackground(photographerId, photo).catch(err => {

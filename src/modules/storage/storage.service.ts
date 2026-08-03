@@ -4377,8 +4377,9 @@ export class StorageService implements OnModuleInit {
             const photoBatchPayload: { photoId: string; imageUrl: string }[] = [];
 
             for (const photo of photos) {
-              const readKey = photo.r2KeyOriginal;
-              const signedUrl = await this.getReadUrl(readKey);
+              // Target preview key first, fallback to original if preview key is not set
+              const previewKey = photo.r2KeyOriginal.replace("/photos/", "/previews/").replace("/Photos/", "/previews/");
+              const signedUrl = await this.getReadUrl(previewKey).catch(() => null) || await this.getReadUrl(photo.r2KeyOriginal);
               if (signedUrl) {
                 photoBatchPayload.push({ photoId: photo.id, imageUrl: signedUrl });
               }
@@ -4440,8 +4441,21 @@ export class StorageService implements OnModuleInit {
                   });
 
                   const p = photos.find(item => item.id === photoId);
-                  if (p && p.uploadBatchId) {
-                    await this.updateBatchProgress(p.uploadBatchId, true);
+                  if (p) {
+                    // Delete temporary preview file from R2 to save space
+                    const previewKey = p.r2KeyOriginal.replace("/photos/", "/previews/").replace("/Photos/", "/previews/");
+                    try {
+                      await this.s3Client.send(new DeleteObjectCommand({
+                        Bucket: this.bucketName,
+                        Key: previewKey,
+                      }));
+                    } catch (delErr: any) {
+                      this.logger.error(`[Cleanup] Failed to delete temporary preview file ${previewKey}: ${delErr.message}`);
+                    }
+
+                    if (p.uploadBatchId) {
+                      await this.updateBatchProgress(p.uploadBatchId, true);
+                    }
                   }
                 }
               }

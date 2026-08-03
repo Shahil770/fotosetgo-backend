@@ -4230,14 +4230,14 @@ export class StorageService implements OnModuleInit {
   }
 
   async triggerCloudflareWorker(photoId: string, r2KeyOriginal: string): Promise<void> {
-    const modalUrl = (process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run') + '/generate-thumbnail';
+    const modalUrl = (process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run') + '/generate-thumbnail';
     let selectedUrl = process.env.USE_MODAL_THUMBNAILS !== 'false' ? modalUrl : (process.env.THUMBNAIL_WORKER_URL || modalUrl);
 
     if (!selectedUrl.endsWith('/generate-thumbnail') && !selectedUrl.endsWith('/generate-batch-thumbnails')) {
       selectedUrl = `${selectedUrl.replace(/\/$/, '')}/generate-thumbnail`;
     }
 
-    this.logger.log(`[Worker Trigger] Dispatching item ${photoId} to Modal Thumbnail Engine: ${selectedUrl}`);
+    this.logger.log(`[Worker Trigger] Dispatching item ${photoId} to Modal CPU Thumbnail Engine: ${selectedUrl}`);
 
     try {
       const res = await fetch(selectedUrl, {
@@ -4272,7 +4272,7 @@ export class StorageService implements OnModuleInit {
   async processBatchThumbnailsViaGoWorker(photos: { id: string; r2KeyOriginal: string }[]): Promise<void> {
     if (!photos || photos.length === 0) return;
 
-    const modalUrl = (process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run') + '/generate-thumbnail';
+    const modalUrl = (process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run') + '/generate-thumbnail';
     let selectedUrl = process.env.USE_MODAL_THUMBNAILS !== 'false' ? modalUrl : (process.env.THUMBNAIL_WORKER_URL || modalUrl);
 
     if (!selectedUrl.endsWith('/generate-thumbnail') && !selectedUrl.endsWith('/generate-batch-thumbnails')) {

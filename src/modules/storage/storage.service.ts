@@ -709,17 +709,40 @@ export class StorageService implements OnModuleInit {
       return;
     }
     let duration = 0;
-    const computedThumbKey = r2KeyOriginal.includes('/videos/') 
+    // Fallback computed thumb key (used if Modal doesn't return actual key)
+    const computedThumbKey = r2KeyOriginal.includes('/videos/')
       ? r2KeyOriginal.replace('/videos/', '/thumbs/').replace(/\.[^/.]+$/, '.jpg')
       : r2KeyOriginal.replace('/photos/', '/thumbs/').replace(/\.[^/.]+$/, '.jpg');
 
+    // This will be set to actual key returned by Modal CPU thumbnail engine
+    let actualThumbKey: string | null = null;
+
     try {
-      // 1. Get Signed URL for 0-RAM Metadata extraction
+      // 1. Get Signed URL for R2 video
       const getCmd = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
       const videoSignedUrl = await getSignedUrl(this.s3Client, getCmd, { expiresIn: 3600 });
 
-      // 2. Safe Duration Extraction (ffprobe-static removed to prevent Linux Segfaults on HTTPS URLs)
-      duration = 0;
+      // 2. Call CPU Thumbnail Engine first to get actual thumbnail key
+      try {
+        const thumbnailEngineUrl = process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run';
+        const thumbRes = await fetch(`${thumbnailEngineUrl}/generate-thumbnail`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: [{ photoId, objectKey: r2KeyOriginal }] })
+        });
+        if (thumbRes.ok) {
+          const thumbData: any = await thumbRes.json();
+          const thumbResult = (thumbData?.results || []).find((r: any) => r.photoId === photoId && r.success);
+          if (thumbResult?.thumbKey) {
+            actualThumbKey = thumbResult.thumbKey;
+            this.logger.log(`[VideoProcessing] Got actual thumbKey from Modal for video ${photoId}: ${actualThumbKey}`);
+          }
+        }
+      } catch (thumbErr: any) {
+        this.logger.error(`[VideoProcessing] CPU thumbnail engine failed for video ${photoId}: ${thumbErr.message}`);
+      }
+
+      const finalThumbKey = actualThumbKey || computedThumbKey;
 
       // 3. Video Face Scanning (Check Global & Event Toggles)
       const photographer = await this.prisma.photographer.findUnique({
@@ -782,18 +805,17 @@ export class StorageService implements OnModuleInit {
         }
       }
 
-      // Update database record with Modal generated thumbnail key & duration
+      // Update DB with ACTUAL thumbKey from Modal (not assumed path)
       await this.prisma.photo.update({
         where: { id: photoId },
         data: {
           status: 'READY',
           thumbnailStatus: 'READY',
-          // Set to READY ONLY if video scanning ran, else set to PENDING
           faceScanStatus: (photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled) ? 'READY' : 'PENDING',
           hasFaces,
           faceCount,
-          r2KeyThumb: computedThumbKey,
-          thumbnailUrl: `https://pub-d4d6b7ea94e00e300402.r2.dev/${computedThumbKey}`,
+          r2KeyThumb: finalThumbKey,
+          thumbnailUrl: `https://pub-d4d6b7ea94e00e300402.r2.dev/${finalThumbKey}`,
           duration,
         },
       });
@@ -4327,20 +4349,18 @@ export class StorageService implements OnModuleInit {
 
   // AI Face Toggle ON hone par ya Thumbnail complete hone par Batch Scan chalata hai (with Auto-Recheck loop)
   async triggerFaceScanForEvent(photographerId: string, eventId: string): Promise<void> {
-    // Duplicate overlapping scan loops se bachane ke liye Lock check karo
-    if (this.activeEventScans.has(eventId)) {
-      this.logger.log(`[BatchFaceScan] Event ${eventId} scan loop is already running. New ready items will be auto-picked up.`);
-      return;
-    }
-
-    const eventObj = await this.prisma.event.findUnique({ where: { id: eventId } });
-    if (!eventObj) return;
+    const initialEventObj = await this.prisma.event.findUnique({ where: { id: eventId } });
+    if (!initialEventObj) return;
 
     this.activeEventScans.add(eventId);
 
     try {
       while (true) {
-        // Enforce toggle settings dynamically
+        // Re-fetch event settings on EVERY iteration so toggle changes are picked up dynamically
+        const eventObj = await this.prisma.event.findUnique({ where: { id: eventId } });
+        if (!eventObj) break;
+
+        // Enforce toggle settings dynamically (fresh from DB)
         if (!eventObj.faceScanningEnabled && !eventObj.videoScanningEnabled) {
           this.logger.log(`[BatchFaceScan] Both photo and video scanning toggles are disabled. Aborting loop.`);
           break;
@@ -4351,7 +4371,7 @@ export class StorageService implements OnModuleInit {
           where: { eventId, status: 'UPLOADING' }
         });
 
-        // Fetch ready thumbnails that haven't been face scanned yet (batch of up to 150 photos)
+        // Build type filter from FRESH event settings
         const typeFilter: string[] = [];
         if (eventObj.faceScanningEnabled) typeFilter.push('IMAGE');
         if (eventObj.videoScanningEnabled) typeFilter.push('VIDEO');

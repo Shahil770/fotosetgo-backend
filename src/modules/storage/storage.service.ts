@@ -4258,6 +4258,7 @@ export class StorageService implements OnModuleInit {
           await this.completeThumbnailWebhook({
             photoId: photoId,
             thumbKey: result.thumbKey,
+            previewKey: result.previewKey || null,
             secretKey: process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123'
           }).catch(err => this.logger.error(`[Worker Trigger] Local DB update error for ${photoId}: ${err.message}`));
         } else {
@@ -4302,7 +4303,7 @@ export class StorageService implements OnModuleInit {
                 where: { id: item.photoId },
                 data: {
                   r2KeyThumb: item.thumbKey,
-                  r2KeyPreview: item.thumbKey,
+                  r2KeyPreview: item.previewKey || null,
                   thumbnailStatus: 'READY'
                 }
               }).catch(() => { });

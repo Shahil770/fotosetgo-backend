@@ -4280,17 +4280,19 @@ export class StorageService implements OnModuleInit {
     }
 
     const chunkSize = 20;
+    const chunks: { photoId: string; objectKey: string }[][] = [];
     for (let i = 0; i < photos.length; i += chunkSize) {
-      const chunk = photos.slice(i, i + chunkSize);
-      const payload = {
-        items: chunk.map(p => ({ photoId: p.id, objectKey: p.r2KeyOriginal }))
-      };
+      chunks.push(photos.slice(i, i + chunkSize).map(p => ({ photoId: p.id, objectKey: p.r2KeyOriginal })));
+    }
 
+    this.logger.log(`[GoWorkerBatch] Dispatching ${chunks.length} parallel batches to CPU Resizer...`);
+
+    const promises = chunks.map(async (chunk, index) => {
       try {
         const res = await fetch(selectedUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
+          body: JSON.stringify({ items: chunk })
         });
 
         if (res.ok) {
@@ -4307,12 +4309,16 @@ export class StorageService implements OnModuleInit {
                 }
               }).catch(() => { });
             }
+            this.logger.log(`[GoWorkerBatch] Batch #${index + 1} processed ${readyItems.length}/${chunk.length} items successfully.`);
           }
         }
-      } catch (err) {
-        this.logger.error(`[GoWorkerBatch] Error processing batch via ${selectedUrl}: ${err.message}`);
+      } catch (err: any) {
+        this.logger.error(`[GoWorkerBatch] Error in parallel batch #${index + 1} via ${selectedUrl}: ${err.message}`);
       }
-    }
+    });
+
+    // Run all batch calls concurrently so Modal scale-out starts immediately
+    await Promise.all(promises);
   }
 
   // AI Face Toggle ON hone par ya Thumbnail complete hone par Batch Scan chalata hai (with Auto-Recheck loop)

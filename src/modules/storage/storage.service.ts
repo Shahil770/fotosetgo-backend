@@ -2886,7 +2886,7 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Photo not found');
     }
 
-    const readKey = isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : photo.r2KeyOriginal;
+    const readKey = isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : (photo.r2KeyPreview || photo.r2KeyOriginal);
 
     const getCommand = new GetObjectCommand({
       Bucket: this.bucketName,
@@ -4076,12 +4076,7 @@ export class StorageService implements OnModuleInit {
       hasCustomBranding = activeSub?.package ? activeSub.package.featureCustomBranding : false;
     }
 
-    let watermarkType = hasCustomBranding ? (photographer ? photographer.watermarkType : 'NONE') : 'IMAGE';
-    
-    // Fallback: If watermark type is set to IMAGE but no watermark image has been uploaded, fallback to TEXT to prevent clean photo theft
-    if (watermarkType === 'IMAGE' && (!photographer || !photographer.watermarkImageKey)) {
-      watermarkType = 'TEXT';
-    }
+    const watermarkType = hasCustomBranding ? (photographer ? photographer.watermarkType : 'NONE') : 'IMAGE';
 
     const sizeSetting = hasCustomBranding ? (photographer ? photographer.watermarkSize : 'MEDIUM') : 'LARGE';
     const position = hasCustomBranding ? (photographer ? photographer.watermarkPosition : 'CENTER') : 'CENTER';

@@ -764,9 +764,9 @@ export class StorageService implements OnModuleInit {
     try {
       // Use $executeRaw for atomic increment — avoids fetching full batch row (reduces network transfer)
       if (isSuccess) {
-        await this.prisma.$executeRaw`UPDATE "UploadBatch" SET "processedFiles" = "processedFiles" + 1 WHERE id = ${uploadBatchId}`;
+        await this.prisma.$executeRaw`UPDATE "upload_batches" SET "processedFiles" = "processedFiles" + 1 WHERE id = ${uploadBatchId}`;
       } else {
-        await this.prisma.$executeRaw`UPDATE "UploadBatch" SET "failedFiles" = "failedFiles" + 1 WHERE id = ${uploadBatchId}`;
+        await this.prisma.$executeRaw`UPDATE "upload_batches" SET "failedFiles" = "failedFiles" + 1 WHERE id = ${uploadBatchId}`;
       }
       // Check completion with lightweight count query
       const batch = await this.prisma.uploadBatch.findUnique({

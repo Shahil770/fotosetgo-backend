@@ -969,12 +969,6 @@ export class StorageService implements OnModuleInit {
       return;
     }
 
-    // Defer processing for pending guest uploads
-    if (currentVideo.status === 'PENDING_APPROVAL') {
-      console.log(`[StorageService] Video ${photoId} is pending approval. Deferring processing until approved.`);
-      await this.updateBatchProgress(uploadBatchId, true);
-      return;
-    }
     let duration = 0;
     // Fallback computed thumb key (used if Modal doesn't return actual key)
     const computedThumbKey = r2KeyOriginal.includes('/videos/')
@@ -1073,10 +1067,11 @@ export class StorageService implements OnModuleInit {
       }
 
       // Update DB with ACTUAL thumbKey from Modal (not assumed path)
+      const isPendingApproval = currentVideo.status === 'PENDING_APPROVAL';
       await this.prisma.photo.update({
         where: { id: photoId },
         data: {
-          status: 'READY',
+          status: isPendingApproval ? 'PENDING_APPROVAL' : 'READY',
           thumbnailStatus: 'READY',
           faceScanStatus: (photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled) ? 'READY' : 'PENDING',
           hasFaces,

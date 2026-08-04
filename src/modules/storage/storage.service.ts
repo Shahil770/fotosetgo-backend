@@ -133,6 +133,7 @@ export class StorageService implements OnModuleInit {
         ];
         if (event.slug) {
           keys.push(`cache:public:event:${event.slug}`);
+          keys.push(`cache:public:event:limits:${event.slug}`);
           // Scan and delete all passcode variants for the photos list cache
           const matchKeys = await this.redis.keys(`cache:public:photos:${event.slug}:*`);
           if (matchKeys && matchKeys.length > 0) {
@@ -1624,6 +1625,16 @@ export class StorageService implements OnModuleInit {
 
 
   async getGuestUploadLimitsStatus(slug: string) {
+    const cacheKey = `cache:public:event:limits:${slug}`;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
+        return JSON.parse(cached);
+      }
+    } catch (err) {
+      this.logger.error(`[Limits Cache] Redis read failed:`, err.message);
+    }
+
     const event = await this.prisma.event.findUnique({
       where: { slug },
       select: {
@@ -1647,13 +1658,21 @@ export class StorageService implements OnModuleInit {
     const maxFiles = event.maxGuestUploadFiles || 0;
     const maxStorage = event.maxGuestUploadStorage ? event.maxGuestUploadStorage.toString() : '0';
 
-    return {
+    const result = {
       allowGuestUploads: event.allowGuestUploads,
       maxGuestUploadFiles: maxFiles,
       maxGuestUploadStorage: maxStorage,
       currentGuestCount: guestPhotosStats._count.id || 0,
       currentGuestSize: guestPhotosStats._sum.fileSize ? guestPhotosStats._sum.fileSize.toString() : '0'
     };
+
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(result), 'EX', 600); // 10 minutes cache TTL
+    } catch (err) {
+      this.logger.error(`[Limits Cache] Redis write failed:`, err.message);
+    }
+
+    return result;
   }
   async calculateStorageFromR2(userIdOrPhotographerId: string): Promise<bigint> {
     const photographer = await this.prisma.photographer.findFirst({

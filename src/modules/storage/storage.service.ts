@@ -536,8 +536,19 @@ export class StorageService implements OnModuleInit {
     // Maintain PENDING_APPROVAL status until photographer approves
     const updatedPhoto = await this.prisma.photo.update({
       where: { id: photoId },
-      data: { status: 'PENDING_APPROVAL' }
+      data: { status: 'PENDING_APPROVAL', thumbnailStatus: 'PENDING' }
     });
+
+    // Generate thumbnail immediately in background so it can be previewed in admin panel!
+    if (photo.type === 'VIDEO') {
+      this.runBackgroundVideoProcessing(photo.photographerId, photoId, photo.eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
+        console.error('[StorageService] Background video processing failed:', err);
+      });
+    } else {
+      this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
+        this.logger.error(`[completeGuestUpload] Worker trigger error for ${photoId}: ${err.message}`);
+      });
+    }
 
     return updatedPhoto;
   }
@@ -551,28 +562,45 @@ export class StorageService implements OnModuleInit {
 
   async approveGuestPhoto(photographerId: string, photoId: string) {
     const photo = await this.prisma.photo.findFirst({
-      where: { id: photoId, photographerId, status: 'PENDING_APPROVAL' }
+      where: { id: photoId, photographerId, status: 'PENDING_APPROVAL' },
+      include: { event: true }
     });
 
     if (!photo) {
       throw new NotFoundException('Pending guest photo not found');
     }
 
-    // Transition status to PROCESSING to kickstart thumbnail and face analysis
-    const updatedPhoto = await this.prisma.photo.update({
-      where: { id: photoId },
-      data: { status: 'PROCESSING', thumbnailStatus: 'PENDING' }
-    });
+    const hasThumbnail = !!photo.r2KeyThumb;
 
-    if (photo.type === 'VIDEO') {
-      this.runBackgroundVideoProcessing(photographerId, photoId, photo.eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
-        console.error('[StorageService] Background video processing failed:', err);
+    let updatedPhoto;
+    if (hasThumbnail) {
+      updatedPhoto = await this.prisma.photo.update({
+        where: { id: photoId },
+        data: { status: 'READY' }
       });
+
+      if (photo.event.faceScanningEnabled) {
+        this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
+          console.error('[StorageService] Face scan trigger failed on approve:', err);
+        });
+      }
+      
+      await this.invalidateEventCache(photo.eventId);
     } else {
-      // Cloudflare Worker se thumbnail generate karwao (await HTTP dispatch)
-      await this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
-        this.logger.error(`[approveGuestPhoto] Worker trigger error for ${photoId}: ${err.message}`);
+      updatedPhoto = await this.prisma.photo.update({
+        where: { id: photoId },
+        data: { status: 'PROCESSING', thumbnailStatus: 'PENDING' }
       });
+
+      if (photo.type === 'VIDEO') {
+        this.runBackgroundVideoProcessing(photographerId, photoId, photo.eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
+          console.error('[StorageService] Background video processing failed:', err);
+        });
+      } else {
+        await this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
+          this.logger.error(`[approveGuestPhoto] Worker trigger error for ${photoId}: ${err.message}`);
+        });
+      }
     }
 
     return updatedPhoto;
@@ -2907,8 +2935,8 @@ export class StorageService implements OnModuleInit {
 
     const readKey = isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : photo.r2KeyOriginal;
 
-    // Direct CDN redirection for VIDEO types to avoid server RAM exhaustion
-    if (photo.type === 'VIDEO') {
+    // Direct CDN redirection for VIDEO types or Guest Uploads to avoid server RAM exhaustion
+    if (photo.type === 'VIDEO' || photo.isGuestUpload) {
       const directUrl = await this.getReadUrl(readKey);
       return { redirectUrl: directUrl };
     }
@@ -4530,24 +4558,34 @@ export class StorageService implements OnModuleInit {
       }
     });
 
-    // If face scanning is enabled, trigger background batch face indexing
-    if (photo.event.faceScanningEnabled) {
-      this.triggerFaceScanForEvent(
-        photo.photographerId,
-        photo.eventId
-      ).catch(err => {
-        console.error('[Webhook] Background Face Indexing trigger failed:', err);
-      });
-    } else {
-      // Mark overall photo status as READY if AI is disabled
-      await this.prisma.photo.update({
-        where: { id: data.photoId },
-        data: {
-          status: 'READY'
-        }
-      });
+    // If photo is a pending guest upload, do NOT transition status to READY!
+    const isPendingApproval = photo.status === 'PENDING_APPROVAL';
 
-      // Update upload batch progress status
+    if (!isPendingApproval) {
+      // If face scanning is enabled, trigger background batch face indexing
+      if (photo.event.faceScanningEnabled) {
+        this.triggerFaceScanForEvent(
+          photo.photographerId,
+          photo.eventId
+        ).catch(err => {
+          console.error('[Webhook] Background Face Indexing trigger failed:', err);
+        });
+      } else {
+        // Mark overall photo status as READY if AI is disabled
+        await this.prisma.photo.update({
+          where: { id: data.photoId },
+          data: {
+            status: 'READY'
+          }
+        });
+
+        // Update upload batch progress status
+        if (photo.uploadBatchId) {
+          await this.updateBatchProgress(photo.uploadBatchId, true);
+        }
+      }
+    } else {
+      // For pending guest uploads, update the upload batch progress status
       if (photo.uploadBatchId) {
         await this.updateBatchProgress(photo.uploadBatchId, true);
       }

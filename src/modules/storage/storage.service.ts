@@ -4181,7 +4181,8 @@ export class StorageService implements OnModuleInit {
           }
         } else {
           const fs = require('fs');
-          const logoPath = 'c:\\app\\photo\\public\\assets\\images\\logo\\fotosetgo.png';
+          const path = require('path');
+          const logoPath = path.join(process.cwd(), 'assets', 'logo', 'fotosetgo.png');
           if (fs.existsSync(logoPath)) {
             watermarkRaw = fs.readFileSync(logoPath);
           }

@@ -1,17 +1,37 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, Inject } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
 import { StorageService } from '../storage/storage.service';
+import Redis from 'ioredis';
 
 @Injectable()
 export class EventsService {
   constructor(
     private prisma: PrismaService,
     private storageService: StorageService,
+    @Inject('REDIS_CLIENT') private redis: Redis,
   ) { }
+
+  private async invalidateCache(photographerId: string, eventId?: string) {
+    try {
+      const keys = [`cache:events:list:${photographerId}`];
+      if (eventId) {
+        keys.push(`cache:event:detail:${eventId}`);
+        // Fetch event slug if we want to clear public slug caches
+        const event = await this.prisma.event.findUnique({ where: { id: eventId }, select: { slug: true } });
+        if (event?.slug) {
+          keys.push(`cache:public:event:${event.slug}`);
+          keys.push(`cache:public:photos:${event.slug}`);
+        }
+      }
+      await this.redis.del(...keys);
+    } catch (err) {
+      console.error('[EventsService] Failed to invalidate Redis cache:', err);
+    }
+  }
 
   async create(photographerId: string, data: any) {
     const slug = data.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') + '-' + Math.floor(1000 + Math.random() * 9000);
-    return this.prisma.event.create({
+    const event = await this.prisma.event.create({
       data: {
         photographerId,
         title: data.title,
@@ -30,9 +50,19 @@ export class EventsService {
         applyThemeToClientGallery: data.applyThemeToClientGallery !== undefined ? data.applyThemeToClientGallery : false,
       },
     });
+    await this.invalidateCache(photographerId);
+    return event;
   }
 
   async findAll(photographerId: string) {
+    const cacheKey = `cache:events:list:${photographerId}`;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch (err) {
+      console.error('[EventsService] Redis get failed inside findAll:', err);
+    }
+
     const events = await this.prisma.event.findMany({
       where: { photographerId, isDeleted: false },
       orderBy: { createdAt: 'desc' },
@@ -47,7 +77,7 @@ export class EventsService {
     });
 
     // Map each photo to include its signed URL (served from urlCache instantly)
-    return Promise.all(
+    const results = await Promise.all(
       events.map(async (event) => {
         const photosWithUrls = await Promise.all(
           event.photos.map(async (photo) => {
@@ -66,9 +96,25 @@ export class EventsService {
         return { ...event, photos: photosWithUrls };
       })
     );
+
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(results), 'EX', 600); // 10 minutes cache TTL
+    } catch (err) {
+      console.error('[EventsService] Redis set failed inside findAll:', err);
+    }
+
+    return results;
   }
 
   async findOne(photographerId: string, eventId: string) {
+    const cacheKey = `cache:event:detail:${eventId}`;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch (err) {
+      console.error('[EventsService] Redis get failed inside findOne:', err);
+    }
+
     const event = await this.prisma.event.findFirst({
       where: { id: eventId, photographerId, isDeleted: false },
       include: {
@@ -107,7 +153,15 @@ export class EventsService {
       photosWithUrls.push(...signedBatch);
     }
 
-    return { ...event, photos: photosWithUrls };
+    const result = { ...event, photos: photosWithUrls };
+
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(result), 'EX', 600); // 10 minutes cache TTL
+    } catch (err) {
+      console.error('[EventsService] Redis set failed inside findOne:', err);
+    }
+
+    return result;
   }
 
   async update(photographerId: string, eventId: string, data: any) {
@@ -141,7 +195,7 @@ export class EventsService {
       });
     }
 
-    return this.prisma.event.update({
+    const updatedEvent = await this.prisma.event.update({
       where: { id: eventId },
       data: {
         title: data.title,
@@ -166,6 +220,8 @@ export class EventsService {
         maxGuestUploadStorage: data.maxGuestUploadStorage !== undefined ? BigInt(data.maxGuestUploadStorage) : undefined,
       },
     });
+    await this.invalidateCache(photographerId, eventId);
+    return updatedEvent;
   }
 
   // Soft delete event and all its child photos/videos (Move to Trash)
@@ -192,6 +248,7 @@ export class EventsService {
       data: { isDeleted: true, deletedAt: now },
     });
 
+    await this.invalidateCache(photographerId, eventId);
     return { success: true, message: 'Event moved to trash' };
   }
 
@@ -217,6 +274,7 @@ export class EventsService {
       data: { isDeleted: false, deletedAt: null },
     });
 
+    await this.invalidateCache(photographerId, eventId);
     return { success: true, message: 'Event restored successfully' };
   }
 
@@ -253,6 +311,7 @@ export class EventsService {
     // 4. Live calculate storage directly from Cloudflare R2 bucket listing
     await this.storageService.recalculateStorage(photographerId);
 
+    await this.invalidateCache(photographerId, eventId);
     return deleteResult;
   }
 

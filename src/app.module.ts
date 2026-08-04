@@ -7,10 +7,12 @@ import { EventsModule } from './modules/events/events.module';
 import { StorageModule } from './modules/storage/storage.module';
 import { BillingModule } from './modules/billing/billing.module';
 import { BusinessCardsModule } from './modules/business-cards/business-cards.module';
+import { RedisModule } from './modules/redis/redis.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    RedisModule,
     AuthModule,
     EventsModule,
     StorageModule,

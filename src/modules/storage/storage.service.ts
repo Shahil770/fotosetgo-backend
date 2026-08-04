@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, OnModuleInit, BadRequestException, UnauthorizedException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, OnModuleInit, BadRequestException, UnauthorizedException, Logger, Inject } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
 import { Prisma } from '@prisma/client';
 import { S3Client, PutObjectCommand, GetObjectCommand, PutBucketCorsCommand, DeleteObjectCommand, DeleteObjectsCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
@@ -33,6 +33,7 @@ export class StorageService implements OnModuleInit {
   constructor(
     private prisma: PrismaService,
     private googleDriveService: GoogleDriveService,
+    @Inject('REDIS_CLIENT') private redis: any,
   ) {
     this.bucketName = process.env.R2_BUCKET_NAME || 'fotosetgo-photos';
 
@@ -72,6 +73,7 @@ export class StorageService implements OnModuleInit {
     });
 
     this.startWorkerKeepAlivePingLoop();
+    this.startUploadCompletionProcessor();
   }
 
   private startWorkerKeepAlivePingLoop(): void {
@@ -84,6 +86,38 @@ export class StorageService implements OnModuleInit {
         fetch(`${url.replace(/\/$/, '')}/health`).catch(() => { });
       }
     }, 10 * 60 * 1000);
+  }
+
+  private startUploadCompletionProcessor() {
+    setInterval(async () => {
+      try {
+        const completions: string[] = [];
+        // Process up to 5 updates per batch loop to keep DB connection overhead extremely low
+        for (let i = 0; i < 5; i++) {
+          const item = await this.redis.rpop('queue:upload-completions');
+          if (item) {
+            completions.push(item);
+          } else {
+            break;
+          }
+        }
+
+        if (completions.length === 0) return;
+
+        await Promise.allSettled(
+          completions.map(async (itemStr) => {
+            try {
+              const { photographerId, photoId } = JSON.parse(itemStr);
+              await this.processQueuedUploadCompletion(photographerId, photoId);
+            } catch (e) {
+              this.logger.error(`[UploadQueueProcessor] Failed to process queued item: ${itemStr}, error: ${e.message}`);
+            }
+          })
+        );
+      } catch (err) {
+        this.logger.error('[UploadQueueProcessor] Error in loop:', err.message);
+      }
+    }, 1000);
   }
 
 
@@ -207,17 +241,35 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Event not found or ownership mismatch');
     }
 
-    const photographer = await this.prisma.photographer.findUnique({
-      where: { id: photographerId },
-      include: {
-        subscriptions: {
-          where: { status: 'ACTIVE' },
-          orderBy: { startsAt: 'desc' },
-          take: 1,
-          include: { package: true }
+    const cacheKey = `cache:photographer:${photographerId}:sub`;
+    let photographer: any = null;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) photographer = JSON.parse(cached);
+    } catch (err) {
+      console.error('[StorageService] Redis get failed inside getUploadPresignedUrl:', err);
+    }
+
+    if (!photographer) {
+      photographer = await this.prisma.photographer.findUnique({
+        where: { id: photographerId },
+        include: {
+          subscriptions: {
+            where: { status: 'ACTIVE' },
+            orderBy: { startsAt: 'desc' },
+            take: 1,
+            include: { package: true }
+          }
+        }
+      });
+      if (photographer) {
+        try {
+          await this.redis.set(cacheKey, JSON.stringify(photographer), 'EX', 300); // 5 minutes cache TTL
+        } catch (err) {
+          console.error('[StorageService] Redis set failed inside getUploadPresignedUrl:', err);
         }
       }
-    });
+    }
 
     if (!photographer) {
       throw new NotFoundException('Photographer not found');
@@ -304,17 +356,36 @@ export class StorageService implements OnModuleInit {
     if (!event) throw new NotFoundException('Event not found or ownership mismatch');
 
     // Validate subscription once
-    const photographer = await this.prisma.photographer.findUnique({
-      where: { id: photographerId },
-      include: {
-        subscriptions: {
-          where: { status: 'ACTIVE' },
-          orderBy: { startsAt: 'desc' },
-          take: 1,
-          include: { package: true }
+    const cacheKey = `cache:photographer:${photographerId}:sub`;
+    let photographer: any = null;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) photographer = JSON.parse(cached);
+    } catch (err) {
+      console.error('[StorageService] Redis get failed inside getBatchUploadPresignedUrls:', err);
+    }
+
+    if (!photographer) {
+      photographer = await this.prisma.photographer.findUnique({
+        where: { id: photographerId },
+        include: {
+          subscriptions: {
+            where: { status: 'ACTIVE' },
+            orderBy: { startsAt: 'desc' },
+            take: 1,
+            include: { package: true }
+          }
+        }
+      });
+      if (photographer) {
+        try {
+          await this.redis.set(cacheKey, JSON.stringify(photographer), 'EX', 300); // 5 minutes cache TTL
+        } catch (err) {
+          console.error('[StorageService] Redis set failed inside getBatchUploadPresignedUrls:', err);
         }
       }
-    });
+    }
+
     if (!photographer) throw new NotFoundException('Photographer not found');
     const activeSubscription = photographer.subscriptions[0];
     if (!activeSubscription) throw new BadRequestException('No active subscription found.');
@@ -378,15 +449,25 @@ export class StorageService implements OnModuleInit {
     return { results };
   }
 
-  // Batch completeUpload: max 3 concurrent to avoid DB pool exhaustion
+  // Batch completeUpload: Push to Redis queue to process asynchronously and prevent DB choke
   async completeBatchUpload(photographerId: string, photoIds: string[]) {
     if (!photoIds || photoIds.length === 0) return { completed: 0 };
-    const CONCURRENCY = 3;
-    for (let i = 0; i < photoIds.length; i += CONCURRENCY) {
-      const chunk = photoIds.slice(i, i + CONCURRENCY);
-      await Promise.allSettled(chunk.map(photoId => this.completeUpload(photographerId, photoId)));
+    
+    try {
+      const pipeline = this.redis.pipeline();
+      for (const photoId of photoIds) {
+        pipeline.lpush('queue:upload-completions', JSON.stringify({ photographerId, photoId }));
+      }
+      await pipeline.exec();
+    } catch (err) {
+      this.logger.error('[completeBatchUpload] Failed to push to Redis queue:', err.message);
+      // Fallback: run synchronously if Redis is down
+      for (const photoId of photoIds) {
+        this.completeUpload(photographerId, photoId).catch(() => {});
+      }
     }
-    return { completed: photoIds.length };
+
+    return { completed: photoIds.length, queued: true };
   }
 
   async completeGuestUpload(photoId: string) {
@@ -620,13 +701,26 @@ export class StorageService implements OnModuleInit {
   }
 
   async completeUpload(photographerId: string, photoId: string) {
-    this.logger.log(`[completeUpload] Browser upload complete signal received for photoId: ${photoId}`);
+    this.logger.log(`[completeUpload] Queueing browser upload complete signal for photoId: ${photoId}`);
+    try {
+      await this.redis.lpush('queue:upload-completions', JSON.stringify({ photographerId, photoId }));
+    } catch (err) {
+      this.logger.error('[completeUpload] Redis queue push failed, processing synchronously:', err.message);
+      // Fallback
+      return this.processQueuedUploadCompletion(photographerId, photoId);
+    }
+    return { success: true, queued: true };
+  }
+
+  private async processQueuedUploadCompletion(photographerId: string, photoId: string) {
+    this.logger.log(`[processQueuedUploadCompletion] Processing completion database updates for photoId: ${photoId}`);
     const photo = await this.prisma.photo.findFirst({
       where: { id: photoId, photographerId },
     });
 
     if (!photo) {
-      throw new NotFoundException('Photo not found');
+      this.logger.error(`[processQueuedUploadCompletion] Photo ${photoId} not found in DB`);
+      return null;
     }
 
     await this.prisma.photographer.update({
@@ -669,10 +763,29 @@ export class StorageService implements OnModuleInit {
       data: { status: 'PROCESSING', thumbnailStatus: 'PENDING' }
     });
 
+    // Invalidate cached event queries so visitors/clients see updates instantly
+    try {
+      const event = await this.prisma.event.findUnique({
+        where: { id: photo.eventId },
+        select: { slug: true }
+      });
+      if (event?.slug) {
+        await this.redis.del(`cache:public:event:${event.slug}`);
+        await this.redis.del(`cache:public:photos:${event.slug}:none`);
+        // Also delete any passcode versions if exist
+        const keys = await this.redis.keys(`cache:public:photos:${event.slug}:*`);
+        if (keys && keys.length > 0) {
+          await this.redis.del(...keys);
+        }
+      }
+    } catch (cacheErr) {
+      this.logger.error(`[processQueuedUploadCompletion] Failed to invalidate event caches: ${cacheErr.message}`);
+    }
+
     // Fire-and-forget: return instantly to browser so upload queue is never blocked
     // Modal thumbnail engine runs in background without holding up the next upload
     this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
-      this.logger.error(`[completeUpload] Thumbnail engine trigger error for ${photoId}: ${err.message}`);
+      this.logger.error(`[processQueuedUploadCompletion] Thumbnail engine trigger error for ${photoId}: ${err.message}`);
     });
 
     if (photo.type === 'VIDEO') {
@@ -2438,6 +2551,14 @@ export class StorageService implements OnModuleInit {
   }
 
   async getPublicEventBySlug(slug: string) {
+    const cacheKey = `cache:public:event:${slug}`;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch (err) {
+      console.error('[StorageService] Redis get failed inside getPublicEventBySlug:', err);
+    }
+
     const event = await this.prisma.event.findUnique({
       where: { slug },
       include: {
@@ -2474,7 +2595,7 @@ export class StorageService implements OnModuleInit {
       hasAiFaceSearch = activeSub?.package ? activeSub.package.featureAiPhotoSearch : false;
     }
 
-    return {
+    const result = {
       id: event.id,
       title: event.title,
       slug: event.slug,
@@ -2512,9 +2633,25 @@ export class StorageService implements OnModuleInit {
         studioName: event.photographer.studioName || 'Studio'
       } : null
     };
+
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(result), 'EX', 600); // 10 minutes cache TTL
+    } catch (err) {
+      console.error('[StorageService] Redis set failed inside getPublicEventBySlug:', err);
+    }
+
+    return result;
   }
 
   async getPublicEventPhotos(slug: string, passcode?: string) {
+    const cacheKey = `cache:public:photos:${slug}:${passcode || 'none'}`;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch (err) {
+      console.error('[StorageService] Redis get failed inside getPublicEventPhotos:', err);
+    }
+
     const event = await this.prisma.event.findUnique({
       where: { slug }
     });
@@ -2534,7 +2671,15 @@ export class StorageService implements OnModuleInit {
       }
     }
 
-    return this.getPublicPhotos(event.id, event.slug);
+    const results = await this.getPublicPhotos(event.id, event.slug);
+
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(results), 'EX', 600); // 10 minutes cache TTL
+    } catch (err) {
+      console.error('[StorageService] Redis set failed inside getPublicEventPhotos:', err);
+    }
+
+    return results;
   }
 
   private async getPublicPhotos(eventId: string, slug: string) {

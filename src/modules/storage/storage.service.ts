@@ -120,6 +120,32 @@ export class StorageService implements OnModuleInit {
     }, 1000);
   }
 
+  async invalidateEventCache(eventId: string) {
+    try {
+      const event = await this.prisma.event.findUnique({
+        where: { id: eventId },
+        select: { slug: true, photographerId: true }
+      });
+      if (event) {
+        const keys = [
+          `cache:events:list:${event.photographerId}`,
+          `cache:event:detail:${eventId}`
+        ];
+        if (event.slug) {
+          keys.push(`cache:public:event:${event.slug}`);
+          // Scan and delete all passcode variants for the photos list cache
+          const matchKeys = await this.redis.keys(`cache:public:photos:${event.slug}:*`);
+          if (matchKeys && matchKeys.length > 0) {
+            keys.push(...matchKeys);
+          }
+        }
+        await this.redis.del(...keys);
+        this.logger.log(`[Cache Invalidation] Successfully cleared Redis caches for event slug: ${event.slug || eventId}`);
+      }
+    } catch (err) {
+      this.logger.error(`[Cache Invalidation] Failed to clear Redis cache for event ${eventId}:`, err.message);
+    }
+  }
 
   async onModuleInit() {
     try {
@@ -4495,6 +4521,7 @@ export class StorageService implements OnModuleInit {
       }
     }
 
+    await this.invalidateEventCache(photo.eventId);
     return { success: true };
   }
 
@@ -4581,6 +4608,15 @@ export class StorageService implements OnModuleInit {
               }).catch(() => { });
             }
             this.logger.log(`[GoWorkerBatch] Batch #${index + 1} processed ${readyItems.length}/${chunk.length} items successfully.`);
+            if (readyItems.length > 0) {
+              const samplePhoto = await this.prisma.photo.findUnique({
+                where: { id: readyItems[0].photoId },
+                select: { eventId: true }
+              });
+              if (samplePhoto) {
+                await this.invalidateEventCache(samplePhoto.eventId);
+              }
+            }
           }
         }
       } catch (err: any) {
@@ -4728,6 +4764,8 @@ export class StorageService implements OnModuleInit {
                       faceCount
                     }
                   });
+
+                  await this.invalidateEventCache(eventId);
 
                   const p = photos.find(item => item.id === photoId);
                   if (p) {

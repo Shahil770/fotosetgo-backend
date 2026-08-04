@@ -170,6 +170,26 @@ export class StorageService implements OnModuleInit {
     } catch (err) {
       console.error(`[StorageService] Failed to apply CORS rules to R2 bucket:`, err.message);
     }
+
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const defaultLogoLocalPath = path.join(process.cwd(), 'assets', 'logo', 'fotosetgo.png');
+      if (fs.existsSync(defaultLogoLocalPath)) {
+        const fileBuffer = fs.readFileSync(defaultLogoLocalPath);
+        const putCmd = new PutObjectCommand({
+          Bucket: this.bucketName,
+          Key: 'assets/logo/fotosetgo.png',
+          Body: fileBuffer,
+          ContentType: 'image/png'
+        });
+        await this.s3Client.send(putCmd);
+        console.log('[StorageService] Successfully uploaded default fotosetgo.png fallback logo to R2');
+      }
+    } catch (logoErr: any) {
+      console.error('[StorageService] Failed to upload default logo fallback to R2:', logoErr.message);
+    }
+
     await this.seedPortfolioThemes();
   }
 
@@ -2938,6 +2958,7 @@ export class StorageService implements OnModuleInit {
 
     // Check if photographer plan allows watermark feature
     let hasWatermarkFeature = false;
+    let hasCustomBranding = false;
     if (event.photographer) {
       const activeSub = await this.prisma.subscription.findFirst({
         where: { photographerId: event.photographer.id, status: 'ACTIVE' },
@@ -2945,6 +2966,7 @@ export class StorageService implements OnModuleInit {
         orderBy: { createdAt: 'desc' }
       });
       hasWatermarkFeature = activeSub?.package ? activeSub.package.featureWatermark : false;
+      hasCustomBranding = activeSub?.package ? activeSub.package.featureCustomBranding : false;
     }
 
     const shouldWatermark = event.watermarkEnabled && hasWatermarkFeature;
@@ -2954,29 +2976,80 @@ export class StorageService implements OnModuleInit {
       return { redirectUrl: directUrl };
     }
 
-    const getCommand = new GetObjectCommand({
-      Bucket: this.bucketName,
-      Key: readKey,
-    });
-
-    const s3Response = await this.s3Client.send(getCommand);
-    if (!s3Response.Body) {
-      throw new Error('S3 response body is empty');
-    }
-
-    let imageBuffer: any = Buffer.from(await s3Response.Body.transformToByteArray());
-
+    // Call Modal Dynamic Watermark Service to offload RAM processing!
     try {
-      imageBuffer = await this.applyWatermark(imageBuffer, event.photographer);
-    } catch (err) {
-      console.error('[WM] On-the-fly watermarking failed:', err);
-    }
+      const imageUrl = await this.getReadUrl(readKey);
+      const photographer = event.photographer;
+      
+      const watermarkType = hasCustomBranding ? (photographer ? photographer.watermarkType : 'NONE') : 'IMAGE';
+      const sizeSetting = hasCustomBranding ? (photographer ? photographer.watermarkSize : 'MEDIUM') : 'LARGE';
+      const position = hasCustomBranding ? (photographer ? photographer.watermarkPosition : 'CENTER') : 'CENTER';
+      const opacity = hasCustomBranding ? (photographer ? photographer.watermarkOpacity : 50) : 50;
+      const watermarkText = photographer?.watermarkText || 'PhotosetGo';
 
-    return {
-      buffer: imageBuffer,
-      contentType: 'image/jpeg',
-      filename: photo.filenameOriginal || `photo_${photo.id}.jpg`
-    };
+      let logoUrl: string | null = null;
+      if (watermarkType === 'IMAGE') {
+        const logoKey = (hasCustomBranding && photographer?.watermarkImageKey) 
+          ? photographer.watermarkImageKey 
+          : 'assets/logo/fotosetgo.png';
+        logoUrl = await this.getReadUrl(logoKey);
+      }
+
+      const modalEngineUrl = process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run';
+      
+      const response = await fetch(`${modalEngineUrl}/generate-dynamic-watermark`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageUrl,
+          watermarkType,
+          watermarkText,
+          logoUrl,
+          size: sizeSetting,
+          position,
+          opacity
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Modal returned status: ${response.status} ${response.statusText}`);
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      const imageBuffer = Buffer.from(arrayBuffer);
+
+      return {
+        buffer: imageBuffer,
+        contentType: 'image/jpeg',
+        filename: photo.filenameOriginal || `photo_${photo.id}.jpg`
+      };
+    } catch (modalErr: any) {
+      this.logger.error(`[Modal Watermark] Serverless offloading failed, falling back to local processing: ${modalErr.message}`);
+      
+      const getCommand = new GetObjectCommand({
+        Bucket: this.bucketName,
+        Key: readKey,
+      });
+
+      const s3Response = await this.s3Client.send(getCommand);
+      if (!s3Response.Body) {
+        throw new Error('S3 response body is empty');
+      }
+
+      let imageBuffer: any = Buffer.from(await s3Response.Body.transformToByteArray());
+
+      try {
+        imageBuffer = await this.applyWatermark(imageBuffer, event.photographer);
+      } catch (err) {
+        console.error('[WM] On-the-fly watermarking failed:', err);
+      }
+
+      return {
+        buffer: imageBuffer,
+        contentType: 'image/jpeg',
+        filename: photo.filenameOriginal || `photo_${photo.id}.jpg`
+      };
+    }
   }
 
   async getWatermarkImageStreamByPhotographerId(photographerId: string) {

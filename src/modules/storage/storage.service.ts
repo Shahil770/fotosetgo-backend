@@ -290,6 +290,93 @@ export class StorageService implements OnModuleInit {
     };
   }
 
+  // Batch version: generate presigned URLs for multiple files at once (1 DB round-trip for checks, then parallel URL generation)
+  async getBatchUploadPresignedUrls(
+    photographerId: string,
+    eventId: string,
+    uploadBatchId: string,
+    files: { filename: string; mimeType: string; fileSize: number }[]
+  ) {
+    if (!files || files.length === 0) return { results: [] };
+
+    // Validate event ownership once
+    const event = await this.prisma.event.findFirst({ where: { id: eventId, photographerId } });
+    if (!event) throw new NotFoundException('Event not found or ownership mismatch');
+
+    // Validate subscription once
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { id: photographerId },
+      include: {
+        subscriptions: {
+          where: { status: 'ACTIVE' },
+          orderBy: { startsAt: 'desc' },
+          take: 1,
+          include: { package: true }
+        }
+      }
+    });
+    if (!photographer) throw new NotFoundException('Photographer not found');
+    const activeSubscription = photographer.subscriptions[0];
+    if (!activeSubscription) throw new BadRequestException('No active subscription found.');
+
+    const pkgMb = activeSubscription.package?.maxEventsStorageMb ?? 5000;
+    const pkgLimitBytes = BigInt(pkgMb) * BigInt(1024 * 1024);
+    const subLimitBytes = activeSubscription.limitEventsBytes ?? activeSubscription.limitBytes ?? BigInt(0);
+    const limitBytes = pkgLimitBytes > subLimitBytes ? pkgLimitBytes : subLimitBytes;
+
+    const eventsUsedAgg = await this.prisma.photo.aggregate({
+      where: { photographerId, deletedAt: null, status: 'READY' },
+      _sum: { fileSize: true },
+    });
+    const eventsUsedBytes = eventsUsedAgg._sum.fileSize
+      ? BigInt(eventsUsedAgg._sum.fileSize.toString())
+      : BigInt(0);
+
+    const totalBatchSize = BigInt(files.reduce((sum, f) => sum + f.fileSize, 0));
+    if (eventsUsedBytes + totalBatchSize > limitBytes) {
+      throw new BadRequestException('Events storage limit exceeded. Please upgrade your plan.');
+    }
+
+    // Generate all photo DB records + presigned URLs in parallel
+    const results = await Promise.all(files.map(async (file) => {
+      const isVideo = file.mimeType.startsWith('video/') || file.filename.match(/\.(mp4|mkv|mov|webm)$/i);
+      const fileUuid = uuidv4();
+      const cleanFilename = file.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
+      const objectKey = isVideo
+        ? `${photographerId}/events/${eventId}/videos/${fileUuid}_${cleanFilename}`
+        : `${photographerId}/events/${eventId}/photos/${fileUuid}_${cleanFilename}`;
+
+      const photo = await this.prisma.photo.create({
+        data: {
+          eventId,
+          photographerId,
+          filenameOriginal: file.filename,
+          filenameStored: `${fileUuid}_${cleanFilename}`,
+          r2KeyOriginal: objectKey,
+          mimeType: file.mimeType,
+          fileSize: BigInt(file.fileSize),
+          status: 'UPLOADING',
+          type: isVideo ? 'VIDEO' : 'IMAGE',
+          uploadBatchId,
+        },
+      });
+
+      const command = new PutObjectCommand({ Bucket: this.bucketName, Key: objectKey, ContentType: file.mimeType });
+      const uploadUrl = await getSignedUrl(this.s3Client, command, { expiresIn: 600 });
+
+      return { photoId: photo.id, objectKey, uploadUrl, filename: file.filename };
+    }));
+
+    return { results };
+  }
+
+  // Batch completeUpload: fires all individual completeUploads in parallel — no serial waiting
+  async completeBatchUpload(photographerId: string, photoIds: string[]) {
+    if (!photoIds || photoIds.length === 0) return { completed: 0 };
+    await Promise.allSettled(photoIds.map(photoId => this.completeUpload(photographerId, photoId)));
+    return { completed: photoIds.length };
+  }
+
   async completeGuestUpload(photoId: string) {
     const photo = await this.prisma.photo.findUnique({
       where: { id: photoId },

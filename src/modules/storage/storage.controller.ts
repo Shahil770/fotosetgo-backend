@@ -46,6 +46,27 @@ export class StorageController {
     return this.storageService.completeUpload(user.photographer.id, body.photoId);
   }
 
+  @Post('upload-url-batch')
+  async getBatchUploadUrls(
+    @CurrentUser() user: any,
+    @Body() body: { eventId: string; uploadBatchId: string; files: { filename: string; mimeType: string; fileSize: number }[] },
+  ) {
+    return this.storageService.getBatchUploadPresignedUrls(
+      user.photographer.id,
+      body.eventId,
+      body.uploadBatchId,
+      body.files
+    );
+  }
+
+  @Post('complete-upload-batch')
+  async completeBatchUpload(
+    @CurrentUser() user: any,
+    @Body() body: { photoIds: string[] },
+  ) {
+    return this.storageService.completeBatchUpload(user.photographer.id, body.photoIds);
+  }
+
   @Post('cancel-upload')
   async cancelUpload(
     @CurrentUser() user: any,

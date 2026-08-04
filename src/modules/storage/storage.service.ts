@@ -2886,7 +2886,7 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Photo not found');
     }
 
-    const readKey = isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : (photo.r2KeyPreview || photo.r2KeyOriginal);
+    const readKey = isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : (photo.r2KeyThumb || photo.r2KeyOriginal);
 
     const getCommand = new GetObjectCommand({
       Bucket: this.bucketName,

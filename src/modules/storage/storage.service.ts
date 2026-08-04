@@ -2950,8 +2950,8 @@ export class StorageService implements OnModuleInit {
 
     const readKey = isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : photo.r2KeyOriginal;
 
-    // Direct CDN redirection for VIDEO types or Guest Uploads to avoid server RAM exhaustion
-    if (photo.type === 'VIDEO' || photo.isGuestUpload) {
+    // Direct CDN redirection for VIDEO types or pending approval files to avoid server RAM exhaustion
+    if (photo.type === 'VIDEO' || photo.status === 'PENDING_APPROVAL') {
       const directUrl = await this.getReadUrl(readKey);
       return { redirectUrl: directUrl };
     }

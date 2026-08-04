@@ -97,12 +97,15 @@ export class PublicStorageController {
     @Res() res: any
   ) {
     const isThumb = thumb === 'true';
-    const { buffer, contentType } = await this.storageService.getWatermarkedImageStream(slug, photoId, isThumb);
-    res.setHeader('Content-Type', contentType);
+    const result = await this.storageService.getWatermarkedImageStream(slug, photoId, isThumb);
+    if (result.redirectUrl) {
+      return res.redirect(result.redirectUrl);
+    }
+    res.setHeader('Content-Type', result.contentType);
     res.setHeader('Content-Disposition', 'inline; filename="preview.jpg"');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    return res.end(buffer);
+    return res.end(result.buffer);
   }
 
   @Get('watermark/:photographerId')

@@ -2886,7 +2886,25 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Photo not found');
     }
 
-    const readKey = isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : (photo.r2KeyThumb || photo.r2KeyOriginal);
+    const readKey = isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : photo.r2KeyOriginal;
+
+    // Check if photographer plan allows watermark feature
+    let hasWatermarkFeature = false;
+    if (event.photographer) {
+      const activeSub = await this.prisma.subscription.findFirst({
+        where: { photographerId: event.photographer.id, status: 'ACTIVE' },
+        include: { package: true },
+        orderBy: { createdAt: 'desc' }
+      });
+      hasWatermarkFeature = activeSub?.package ? activeSub.package.featureWatermark : false;
+    }
+
+    const shouldWatermark = event.watermarkEnabled && hasWatermarkFeature;
+
+    if (!shouldWatermark) {
+      const directUrl = await this.getReadUrl(readKey);
+      return { redirectUrl: directUrl };
+    }
 
     const getCommand = new GetObjectCommand({
       Bucket: this.bucketName,
@@ -2900,23 +2918,10 @@ export class StorageService implements OnModuleInit {
 
     let imageBuffer: any = Buffer.from(await s3Response.Body.transformToByteArray());
 
-    // Check if photographer plan allows watermark feature
-    let hasWatermarkFeature = false;
-    if (event.photographer) {
-      const activeSub = await this.prisma.subscription.findFirst({
-        where: { photographerId: event.photographer.id, status: 'ACTIVE' },
-        include: { package: true },
-        orderBy: { createdAt: 'desc' }
-      });
-      hasWatermarkFeature = activeSub?.package ? activeSub.package.featureWatermark : false;
-    }
-
-    if (event.watermarkEnabled && hasWatermarkFeature) {
-      try {
-        imageBuffer = await this.applyWatermark(imageBuffer, event.photographer);
-      } catch (err) {
-        console.error('[WM] On-the-fly watermarking failed:', err);
-      }
+    try {
+      imageBuffer = await this.applyWatermark(imageBuffer, event.photographer);
+    } catch (err) {
+      console.error('[WM] On-the-fly watermarking failed:', err);
     }
 
     return {

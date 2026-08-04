@@ -2731,11 +2731,11 @@ export class StorageService implements OnModuleInit {
         if (hideDirectStorageUrl) {
           const apiBase = process.env.PUBLIC_API_URL || 'http://localhost:5000';
           url = `${apiBase}/api/public/events/${slug}/photos/${photo.id}/view`;
-          thumbUrl = `${apiBase}/api/public/events/${slug}/photos/${photo.id}/view?thumb=true`;
         } else {
           url = await this.getReadUrl(photo.r2KeyOriginal);
-          thumbUrl = photo.r2KeyThumb ? await this.getReadUrl(photo.r2KeyThumb) : url;
         }
+        // Always serve low-res thumbnails directly from CDN for instant loading speed
+        thumbUrl = photo.r2KeyThumb ? await this.getReadUrl(photo.r2KeyThumb) : url;
 
         return {
           id: photo.id,

@@ -26,7 +26,6 @@ export class PublicStorageController {
   }
 
   @Post('events/:slug/guest-upload-url')
-  @UseGuards(FeatureGuard('featureGuestUpload'))
   async getGuestUploadUrl(
     @Param('slug') slug: string,
     @Body() body: { filename: string; mimeType: string; fileSize: number }
@@ -35,7 +34,6 @@ export class PublicStorageController {
   }
 
   @Post('events/:slug/guest-complete-upload')
-  @UseGuards(FeatureGuard('featureGuestUpload'))
   async completeGuestUpload(
     @Param('slug') slug: string,
     @Body() body: { photoId: string }
@@ -44,7 +42,6 @@ export class PublicStorageController {
   }
 
   @Post('events/:slug/guest-direct-upload')
-  @UseGuards(FeatureGuard('featureGuestUpload'))
   @UseInterceptors(FileInterceptor('file'))
   async uploadGuestPhotoDirect(
     @Param('slug') slug: string,
@@ -54,7 +51,6 @@ export class PublicStorageController {
   }
 
   @Get('events/:slug/guest-upload-status')
-  @UseGuards(FeatureGuard('featureGuestUpload'))
   async getGuestUploadStatus(@Param('slug') slug: string) {
     return this.storageService.getGuestUploadLimitsStatus(slug);
   }

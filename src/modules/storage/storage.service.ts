@@ -3024,31 +3024,8 @@ export class StorageService implements OnModuleInit {
         filename: photo.filenameOriginal || `photo_${photo.id}.jpg`
       };
     } catch (modalErr: any) {
-      this.logger.error(`[Modal Watermark] Serverless offloading failed, falling back to local processing: ${modalErr.message}`);
-      
-      const getCommand = new GetObjectCommand({
-        Bucket: this.bucketName,
-        Key: readKey,
-      });
-
-      const s3Response = await this.s3Client.send(getCommand);
-      if (!s3Response.Body) {
-        throw new Error('S3 response body is empty');
-      }
-
-      let imageBuffer: any = Buffer.from(await s3Response.Body.transformToByteArray());
-
-      try {
-        imageBuffer = await this.applyWatermark(imageBuffer, event.photographer);
-      } catch (err) {
-        console.error('[WM] On-the-fly watermarking failed:', err);
-      }
-
-      return {
-        buffer: imageBuffer,
-        contentType: 'image/jpeg',
-        filename: photo.filenameOriginal || `photo_${photo.id}.jpg`
-      };
+      this.logger.error(`[Modal Watermark] Serverless offloading failed: ${modalErr.message}`);
+      throw modalErr;
     }
   }
 

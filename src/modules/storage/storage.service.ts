@@ -2888,6 +2888,12 @@ export class StorageService implements OnModuleInit {
 
     const readKey = isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : photo.r2KeyOriginal;
 
+    // Direct CDN redirection for VIDEO types to avoid server RAM exhaustion
+    if (photo.type === 'VIDEO') {
+      const directUrl = await this.getReadUrl(readKey);
+      return { redirectUrl: directUrl };
+    }
+
     // Check if photographer plan allows watermark feature
     let hasWatermarkFeature = false;
     if (event.photographer) {

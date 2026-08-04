@@ -337,43 +337,55 @@ export class StorageService implements OnModuleInit {
       throw new BadRequestException('Events storage limit exceeded. Please upgrade your plan.');
     }
 
-    // Generate all photo DB records + presigned URLs in parallel
-    const results = await Promise.all(files.map(async (file) => {
-      const isVideo = file.mimeType.startsWith('video/') || file.filename.match(/\.(mp4|mkv|mov|webm)$/i);
-      const fileUuid = uuidv4();
-      const cleanFilename = file.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
-      const objectKey = isVideo
-        ? `${photographerId}/events/${eventId}/videos/${fileUuid}_${cleanFilename}`
-        : `${photographerId}/events/${eventId}/photos/${fileUuid}_${cleanFilename}`;
+    // Generate photo DB records + presigned URLs with concurrency limit of 5
+    // (prevents DB connection pool exhaustion when batch size is 50)
+    const CONCURRENCY = 5;
+    const results: { photoId: string; objectKey: string; uploadUrl: string; filename: string }[] = [];
 
-      const photo = await this.prisma.photo.create({
-        data: {
-          eventId,
-          photographerId,
-          filenameOriginal: file.filename,
-          filenameStored: `${fileUuid}_${cleanFilename}`,
-          r2KeyOriginal: objectKey,
-          mimeType: file.mimeType,
-          fileSize: BigInt(file.fileSize),
-          status: 'UPLOADING',
-          type: isVideo ? 'VIDEO' : 'IMAGE',
-          uploadBatchId,
-        },
-      });
+    for (let i = 0; i < files.length; i += CONCURRENCY) {
+      const chunk = files.slice(i, i + CONCURRENCY);
+      const chunkResults = await Promise.all(chunk.map(async (file) => {
+        const isVideo = file.mimeType.startsWith('video/') || file.filename.match(/\.(mp4|mkv|mov|webm)$/i);
+        const fileUuid = uuidv4();
+        const cleanFilename = file.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
+        const objectKey = isVideo
+          ? `${photographerId}/events/${eventId}/videos/${fileUuid}_${cleanFilename}`
+          : `${photographerId}/events/${eventId}/photos/${fileUuid}_${cleanFilename}`;
 
-      const command = new PutObjectCommand({ Bucket: this.bucketName, Key: objectKey, ContentType: file.mimeType });
-      const uploadUrl = await getSignedUrl(this.s3Client, command, { expiresIn: 600 });
+        const photo = await this.prisma.photo.create({
+          data: {
+            eventId,
+            photographerId,
+            filenameOriginal: file.filename,
+            filenameStored: `${fileUuid}_${cleanFilename}`,
+            r2KeyOriginal: objectKey,
+            mimeType: file.mimeType,
+            fileSize: BigInt(file.fileSize),
+            status: 'UPLOADING',
+            type: isVideo ? 'VIDEO' : 'IMAGE',
+            uploadBatchId,
+          },
+        });
 
-      return { photoId: photo.id, objectKey, uploadUrl, filename: file.filename };
-    }));
+        const command = new PutObjectCommand({ Bucket: this.bucketName, Key: objectKey, ContentType: file.mimeType });
+        const uploadUrl = await getSignedUrl(this.s3Client, command, { expiresIn: 600 });
+
+        return { photoId: photo.id, objectKey, uploadUrl, filename: file.filename };
+      }));
+      results.push(...chunkResults);
+    }
 
     return { results };
   }
 
-  // Batch completeUpload: fires all individual completeUploads in parallel — no serial waiting
+  // Batch completeUpload: max 3 concurrent to avoid DB pool exhaustion
   async completeBatchUpload(photographerId: string, photoIds: string[]) {
     if (!photoIds || photoIds.length === 0) return { completed: 0 };
-    await Promise.allSettled(photoIds.map(photoId => this.completeUpload(photographerId, photoId)));
+    const CONCURRENCY = 3;
+    for (let i = 0; i < photoIds.length; i += CONCURRENCY) {
+      const chunk = photoIds.slice(i, i + CONCURRENCY);
+      await Promise.allSettled(chunk.map(photoId => this.completeUpload(photographerId, photoId)));
+    }
     return { completed: photoIds.length };
   }
 
@@ -750,19 +762,18 @@ export class StorageService implements OnModuleInit {
   private async updateBatchProgress(uploadBatchId: string | null | undefined, isSuccess: boolean) {
     if (!uploadBatchId) return;
     try {
-      const batch = await this.prisma.uploadBatch.update({
+      // Use $executeRaw for atomic increment — avoids fetching full batch row (reduces network transfer)
+      if (isSuccess) {
+        await this.prisma.$executeRaw`UPDATE "UploadBatch" SET "processedFiles" = "processedFiles" + 1 WHERE id = ${uploadBatchId}`;
+      } else {
+        await this.prisma.$executeRaw`UPDATE "UploadBatch" SET "failedFiles" = "failedFiles" + 1 WHERE id = ${uploadBatchId}`;
+      }
+      // Check completion with lightweight count query
+      const batch = await this.prisma.uploadBatch.findUnique({
         where: { id: uploadBatchId },
-        data: {
-          processedFiles: isSuccess ? { increment: 1 } : undefined,
-          failedFiles: !isSuccess ? { increment: 1 } : undefined,
-        },
-        include: {
-          photos: true
-        }
+        select: { processedFiles: true, failedFiles: true, totalFiles: true }
       });
-
-      // If all files processed, mark batch as COMPLETED
-      if (batch.processedFiles + batch.failedFiles >= batch.totalFiles) {
+      if (batch && batch.processedFiles + batch.failedFiles >= batch.totalFiles) {
         await this.prisma.uploadBatch.update({
           where: { id: uploadBatchId },
           data: { status: 'COMPLETED' }

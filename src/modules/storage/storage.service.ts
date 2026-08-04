@@ -4076,7 +4076,13 @@ export class StorageService implements OnModuleInit {
       hasCustomBranding = activeSub?.package ? activeSub.package.featureCustomBranding : false;
     }
 
-    const watermarkType = hasCustomBranding ? (photographer ? photographer.watermarkType : 'NONE') : 'IMAGE';
+    let watermarkType = hasCustomBranding ? (photographer ? photographer.watermarkType : 'NONE') : 'IMAGE';
+    
+    // Fallback: If watermark type is set to IMAGE but no watermark image has been uploaded, fallback to TEXT to prevent clean photo theft
+    if (watermarkType === 'IMAGE' && (!photographer || !photographer.watermarkImageKey)) {
+      watermarkType = 'TEXT';
+    }
+
     const sizeSetting = hasCustomBranding ? (photographer ? photographer.watermarkSize : 'MEDIUM') : 'LARGE';
     const position = hasCustomBranding ? (photographer ? photographer.watermarkPosition : 'CENTER') : 'CENTER';
     const opacity = hasCustomBranding ? (photographer ? photographer.watermarkOpacity : 50) : 50;

@@ -129,7 +129,8 @@ export class StorageService implements OnModuleInit {
       if (event) {
         const keys = [
           `cache:events:list:${event.photographerId}`,
-          `cache:event:detail:${eventId}`
+          `cache:event:detail:${eventId}`,
+          'cache:public:events:list'
         ];
         if (event.slug) {
           keys.push(`cache:public:event:${event.slug}`);
@@ -499,7 +500,7 @@ export class StorageService implements OnModuleInit {
   // Batch completeUpload: Push to Redis queue to process asynchronously and prevent DB choke
   async completeBatchUpload(photographerId: string, photoIds: string[]) {
     if (!photoIds || photoIds.length === 0) return { completed: 0 };
-    
+
     try {
       const pipeline = this.redis.pipeline();
       for (const photoId of photoIds) {
@@ -510,7 +511,7 @@ export class StorageService implements OnModuleInit {
       this.logger.error('[completeBatchUpload] Failed to push to Redis queue:', err.message);
       // Fallback: run synchronously if Redis is down
       for (const photoId of photoIds) {
-        this.completeUpload(photographerId, photoId).catch(() => {});
+        this.completeUpload(photographerId, photoId).catch(() => { });
       }
     }
 
@@ -604,7 +605,7 @@ export class StorageService implements OnModuleInit {
           console.error('[StorageService] Face scan trigger failed on approve:', err);
         });
       }
-      
+
       await this.invalidateEventCache(photo.eventId);
     } else {
       updatedPhoto = await this.prisma.photo.update({
@@ -870,7 +871,7 @@ export class StorageService implements OnModuleInit {
             console.error('[StorageService] Video face scan loop trigger failed:', err);
           });
         }
-      }).catch(() => {});
+      }).catch(() => { });
     }
 
     this.syncToGoogleDriveInBackground(photographerId, photo).catch(err => {
@@ -1484,7 +1485,17 @@ export class StorageService implements OnModuleInit {
   }
 
   async getPublicEvents() {
-    return this.prisma.event.findMany({
+    const cacheKey = 'cache:public:events:list';
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
+        return JSON.parse(cached);
+      }
+    } catch (err: any) {
+      this.logger.error(`[Public Events Cache] Redis read failed:`, err.message);
+    }
+
+    const events = await this.prisma.event.findMany({
       where: { visibility: 'PUBLIC', status: 'PUBLISHED' },
       select: {
         id: true,
@@ -1494,6 +1505,14 @@ export class StorageService implements OnModuleInit {
         location: true,
       },
     });
+
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(events), 'EX', 300);
+    } catch (err: any) {
+      this.logger.error(`[Public Events Cache] Redis write failed:`, err.message);
+    }
+
+    return events;
   }
 
   async searchFacePublic(selfieFile: any, eventId?: string, passcode?: string) {
@@ -2980,7 +2999,7 @@ export class StorageService implements OnModuleInit {
     try {
       const imageUrl = await this.getReadUrl(readKey);
       const photographer = event.photographer;
-      
+
       const watermarkType = hasCustomBranding ? (photographer ? photographer.watermarkType : 'NONE') : 'IMAGE';
       const sizeSetting = hasCustomBranding ? (photographer ? photographer.watermarkSize : 'MEDIUM') : 'LARGE';
       const position = hasCustomBranding ? (photographer ? photographer.watermarkPosition : 'CENTER') : 'CENTER';
@@ -2989,14 +3008,14 @@ export class StorageService implements OnModuleInit {
 
       let logoUrl: string | null = null;
       if (watermarkType === 'IMAGE') {
-        const logoKey = (hasCustomBranding && photographer?.watermarkImageKey) 
-          ? photographer.watermarkImageKey 
+        const logoKey = (hasCustomBranding && photographer?.watermarkImageKey)
+          ? photographer.watermarkImageKey
           : 'assets/logo/fotosetgo.png';
         logoUrl = await this.getReadUrl(logoKey);
       }
 
       const modalEngineUrl = process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run';
-      
+
       const response = await fetch(`${modalEngineUrl}/generate-dynamic-watermark`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3037,7 +3056,8 @@ export class StorageService implements OnModuleInit {
     if (!photographer || !photographer.watermarkImageKey) {
       // Fallback to default logo
       const fs = require('fs');
-      const logoPath = 'c:\\app\\photo\\public\\assets\\images\\logo\\fotosetgo.png';
+      const path = require('path');
+      const logoPath = path.join(process.cwd(), 'assets', 'logo', 'fotosetgo.png');
       if (fs.existsSync(logoPath)) {
         return {
           buffer: fs.readFileSync(logoPath),
@@ -3047,21 +3067,8 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Watermark not found');
     }
 
-    const getCommand = new GetObjectCommand({
-      Bucket: this.bucketName,
-      Key: photographer.watermarkImageKey,
-    });
-
-    const s3Response = await this.s3Client.send(getCommand);
-    if (!s3Response.Body) {
-      throw new Error('S3 response body is empty');
-    }
-
-    const buffer = Buffer.from(await s3Response.Body.transformToByteArray());
-    return {
-      buffer,
-      contentType: 'image/png'
-    };
+    const directUrl = await this.getReadUrl(photographer.watermarkImageKey);
+    return { redirectUrl: directUrl };
   }
 
   async checkSubdomainAvailability(subdomain: string, photographerId?: string) {
@@ -3159,21 +3166,8 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Banner not found');
     }
 
-    const getCommand = new GetObjectCommand({
-      Bucket: this.bucketName,
-      Key: photographer.studioHeroBannerKey,
-    });
-
-    const s3Response = await this.s3Client.send(getCommand);
-    if (!s3Response.Body) {
-      throw new Error('S3 response body is empty');
-    }
-
-    const buffer = Buffer.from(await s3Response.Body.transformToByteArray());
-    return {
-      buffer,
-      contentType: 'image/png'
-    };
+    const directUrl = await this.getReadUrl(photographer.studioHeroBannerKey);
+    return { redirectUrl: directUrl };
   }
 
   async updateBrandingSettings(userId: string, data: any) {
@@ -4078,7 +4072,8 @@ export class StorageService implements OnModuleInit {
     if (!photographer || !photographer.studioLogoKey) {
       // Fallback to default logo
       const fs = require('fs');
-      const logoPath = 'c:\\app\\photo\\public\\assets\\images\\logo\\fotosetgo.png';
+      const path = require('path');
+      const logoPath = path.join(process.cwd(), 'assets', 'logo', 'fotosetgo.png');
       if (fs.existsSync(logoPath)) {
         return {
           buffer: fs.readFileSync(logoPath),
@@ -4088,21 +4083,8 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Logo not found');
     }
 
-    const getCommand = new GetObjectCommand({
-      Bucket: this.bucketName,
-      Key: photographer.studioLogoKey,
-    });
-
-    const s3Response = await this.s3Client.send(getCommand);
-    if (!s3Response.Body) {
-      throw new Error('S3 response body is empty');
-    }
-
-    const buffer = Buffer.from(await s3Response.Body.transformToByteArray());
-    return {
-      buffer,
-      contentType: 'image/png'
-    };
+    const directUrl = await this.getReadUrl(photographer.studioLogoKey);
+    return { redirectUrl: directUrl };
   }
 
   async updateWatermarkSettings(userId: string, data: any) {

@@ -109,10 +109,13 @@ export class PublicStorageController {
     @Param('photographerId') photographerId: string,
     @Res() res: any
   ) {
-    const { buffer, contentType } = await this.storageService.getWatermarkImageStreamByPhotographerId(photographerId);
-    res.setHeader('Content-Type', contentType);
+    const result = await this.storageService.getWatermarkImageStreamByPhotographerId(photographerId) as any;
+    if (result.redirectUrl) {
+      return res.redirect(result.redirectUrl);
+    }
+    res.setHeader('Content-Type', result.contentType);
     res.setHeader('Cache-Control', 'public, max-age=3600');
-    return res.end(buffer);
+    return res.end(result.buffer);
   }
 
   @Get('branding/logo/:photographerId')
@@ -120,10 +123,13 @@ export class PublicStorageController {
     @Param('photographerId') photographerId: string,
     @Res() res: any
   ) {
-    const { buffer, contentType } = await this.storageService.getBrandingLogoStream(photographerId);
-    res.setHeader('Content-Type', contentType);
+    const result = await this.storageService.getBrandingLogoStream(photographerId) as any;
+    if (result.redirectUrl) {
+      return res.redirect(result.redirectUrl);
+    }
+    res.setHeader('Content-Type', result.contentType);
     res.setHeader('Cache-Control', 'public, max-age=3600');
-    return res.end(buffer);
+    return res.end(result.buffer);
   }
 
   @Get('branding/banner/:photographerId')
@@ -131,10 +137,13 @@ export class PublicStorageController {
     @Param('photographerId') photographerId: string,
     @Res() res: any
   ) {
-    const { buffer, contentType } = await this.storageService.getBrandingBannerStream(photographerId);
-    res.setHeader('Content-Type', contentType);
+    const result = await this.storageService.getBrandingBannerStream(photographerId) as any;
+    if (result.redirectUrl) {
+      return res.redirect(result.redirectUrl);
+    }
+    res.setHeader('Content-Type', result.contentType);
     res.setHeader('Cache-Control', 'public, max-age=3600');
-    return res.end(buffer);
+    return res.end(result.buffer);
   }
 
   @Get('subdomain/check/:subdomain')

@@ -31,11 +31,13 @@ export class GoogleDriveController {
   ) {
     try {
       const photographerId = state;
+      const frontendUrl = process.env.FRONTEND_URL || 'https://fotosetgo.com';
       await this.googleDriveService.handleCallback(code, photographerId);
-      return res.redirect('http://localhost:3000/dashboard/storage?drive=connected');
+      return res.redirect(`${frontendUrl}/dashboard/storage?drive=connected`);
     } catch (err) {
       console.error('[GoogleDrive] Auth callback failed:', err);
-      return res.redirect('http://localhost:3000/dashboard/storage?drive=error');
+      const frontendUrl = process.env.FRONTEND_URL || 'https://fotosetgo.com';
+      return res.redirect(`${frontendUrl}/dashboard/storage?drive=error`);
     }
   }
 

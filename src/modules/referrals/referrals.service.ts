@@ -100,9 +100,10 @@ export class ReferralsService {
       refereeWelcomeCredits: (p.referralConfig?.refereeWelcomeCredits || 0) / 100,
     }));
 
+    const frontendUrl = process.env.FRONTEND_URL || 'https://fotosetgo.com';
     return {
       referralCode,
-      referralLink: `http://localhost:3000/signup?ref=${referralCode}`,
+      referralLink: `${frontendUrl}/signup?ref=${referralCode}`,
       totalInvited,
       activeReferrals: activeReferrals.length,
       activeConversions: activeReferrals.length,

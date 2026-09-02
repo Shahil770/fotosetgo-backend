@@ -1502,7 +1502,7 @@ export class StorageService implements OnModuleInit {
           });
         } else {
           const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
-          const backendAppUrl = process.env.APP_URL || 'http://localhost:5000';
+          const backendAppUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
           const webhookUrl = `${backendAppUrl}/api/public/webhook/video-face-complete`;
           const secretKey = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
 
@@ -1684,8 +1684,8 @@ export class StorageService implements OnModuleInit {
       const faceIndexUrl = await getSignedUrl(this.s3Client, origCommand, { expiresIn: 600 });
 
       // Call FastAPI Face Engine with Webhook callback support
-      const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://127.0.0.1:8000';
-      const backendAppUrl = process.env.APP_URL || 'http://localhost:5000';
+      const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
+      const backendAppUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
       const webhookUrl = `${backendAppUrl}/api/public/webhook/photo-face-complete`;
       const secretKey = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
 
@@ -1814,7 +1814,7 @@ export class StorageService implements OnModuleInit {
   }
 
   private async extractEmbeddingFromUrl(r2Key: string): Promise<number[] | null> {
-    const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://localhost:8000';
+    const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
 
     // 1. Generate a temporary presigned GET URL for the R2 key (valid for 5 mins)
     let imageUrl = '';
@@ -2113,7 +2113,7 @@ export class StorageService implements OnModuleInit {
         const hideDirectStorageUrl = isWatermarked || (event && !event.allowDownload);
 
         if (hideDirectStorageUrl) {
-          const apiBase = process.env.PUBLIC_API_URL || 'http://localhost:5000';
+          const apiBase = process.env.PUBLIC_API_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
           url = `${apiBase}/api/public/events/${event.slug}/photos/${photo.id}/view`;
           thumbUrl = `${apiBase}/api/public/events/${event.slug}/photos/${photo.id}/view?thumb=true`;
         } else {
@@ -3558,7 +3558,7 @@ export class StorageService implements OnModuleInit {
         const hideDirectStorageUrl = event && !event.allowDownload;
 
         if (hideDirectStorageUrl) {
-          const apiBase = process.env.PUBLIC_API_URL || 'http://localhost:5000';
+          const apiBase = process.env.PUBLIC_API_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
           url = `${apiBase}/api/public/events/${slug}/photos/${photo.id}/view`;
         } else {
           // Videos must always serve original file; images serve 800px preview or thumb
@@ -6108,7 +6108,7 @@ export class StorageService implements OnModuleInit {
         // 1. Process Batch of Photos in 1 SINGLE HTTP Request to Modal GPU (/faces/index-batch-photos)
         if (photos.length > 0) {
           try {
-            const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://127.0.0.1:8000';
+            const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
             const photoBatchPayload: { photoId: string; imageUrl: string }[] = [];
 
             for (const photo of photos) {
@@ -6121,7 +6121,7 @@ export class StorageService implements OnModuleInit {
             }
 
             if (photoBatchPayload.length > 0) {
-              const backendAppUrl = process.env.APP_URL || 'http://localhost:5000';
+              const backendAppUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
               const webhookUrl = `${backendAppUrl}/api/public/webhook/photo-face-complete`;
               const secretKey = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
 

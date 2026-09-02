@@ -4170,6 +4170,7 @@ export class StorageService implements OnModuleInit {
       : null;
 
     const freshVideoUrl = await this.getFreshVideoUrl(photographer.portfolioVideoUrl);
+    const freshThumbUrl = await this.getFreshVideoUrl(photographer.portfolioVideoThumbUrl);
     const freshBtsUrl = await this.getFreshVideoUrl(photographer.portfolioBtsUrl);
 
     return {
@@ -4186,6 +4187,7 @@ export class StorageService implements OnModuleInit {
       portfolioStats: photographer.portfolioStats,
       portfolioFaqs: photographer.portfolioFaqs,
       portfolioVideoUrl: freshVideoUrl,
+      portfolioVideoThumbUrl: freshThumbUrl,
       portfolioProcess: photographer.portfolioProcess,
       portfolioBtsUrl: freshBtsUrl,
       portfolioEquipment: photographer.portfolioEquipment,
@@ -4222,7 +4224,7 @@ export class StorageService implements OnModuleInit {
     }
 
     try {
-      // 1. Delete replaced old Teaser Video from R2 if new video is uploaded
+      // 1. Delete replaced old Teaser Video & Thumbnail from R2 if new video is uploaded
       if (data.portfolioVideoUrl !== undefined && photographer.portfolioVideoUrl && photographer.portfolioVideoUrl !== data.portfolioVideoUrl) {
         const oldKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioVideoUrl, photographer.id);
         if (oldKey) {
@@ -4232,6 +4234,19 @@ export class StorageService implements OnModuleInit {
             this.logger.log(`[StorageService] Deleted replaced old Teaser Video from R2: ${oldKey}`);
           } catch (err: any) {
             this.logger.error(`[StorageService] Failed to delete replaced Teaser Video: ${err.message}`);
+          }
+        }
+      }
+
+      if (data.portfolioVideoThumbUrl !== undefined && photographer.portfolioVideoThumbUrl && photographer.portfolioVideoThumbUrl !== data.portfolioVideoThumbUrl) {
+        const oldThumbKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioVideoThumbUrl, photographer.id);
+        if (oldThumbKey) {
+          try {
+            await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldThumbKey }));
+            this.urlCache.delete(oldThumbKey);
+            this.logger.log(`[StorageService] Deleted replaced old Teaser Video Thumbnail from R2: ${oldThumbKey}`);
+          } catch (err: any) {
+            this.logger.error(`[StorageService] Failed to delete replaced Teaser Video Thumbnail: ${err.message}`);
           }
         }
       }
@@ -4265,7 +4280,9 @@ export class StorageService implements OnModuleInit {
           portfolioStats: data.portfolioStats !== undefined ? (data.portfolioStats as any) : (photographer.portfolioStats as any),
           portfolioFaqs: data.portfolioFaqs !== undefined ? (data.portfolioFaqs as any) : (photographer.portfolioFaqs as any),
           portfolioVideoUrl: data.portfolioVideoUrl !== undefined ? data.portfolioVideoUrl : photographer.portfolioVideoUrl,
+          portfolioVideoThumbUrl: data.portfolioVideoThumbUrl !== undefined ? data.portfolioVideoThumbUrl : photographer.portfolioVideoThumbUrl,
           portfolioVideoSizeBytes: data.portfolioVideoSizeBytes !== undefined ? BigInt(data.portfolioVideoSizeBytes) : (data.portfolioVideoUrl === '' ? BigInt(0) : photographer.portfolioVideoSizeBytes),
+          portfolioVideoThumbSizeBytes: data.portfolioVideoThumbSizeBytes !== undefined ? BigInt(data.portfolioVideoThumbSizeBytes) : (data.portfolioVideoThumbUrl === '' ? BigInt(0) : photographer.portfolioVideoThumbSizeBytes),
           portfolioProcess: data.portfolioProcess !== undefined ? (data.portfolioProcess as any) : (photographer.portfolioProcess as any),
           portfolioBtsUrl: data.portfolioBtsUrl !== undefined ? data.portfolioBtsUrl : photographer.portfolioBtsUrl,
           portfolioBtsSizeBytes: data.portfolioBtsSizeBytes !== undefined ? BigInt(data.portfolioBtsSizeBytes) : (data.portfolioBtsUrl === '' ? BigInt(0) : photographer.portfolioBtsSizeBytes),
@@ -4280,7 +4297,7 @@ export class StorageService implements OnModuleInit {
           portfolioWhatsapp: data.portfolioWhatsapp !== undefined ? data.portfolioWhatsapp : photographer.portfolioWhatsapp,
         }
       });
-      if (data.portfolioVideoSizeBytes !== undefined || data.portfolioBtsSizeBytes !== undefined) {
+      if (data.portfolioVideoSizeBytes !== undefined || data.portfolioVideoThumbSizeBytes !== undefined || data.portfolioBtsSizeBytes !== undefined) {
         await this.recalculateStorage(photographer.id);
       }
       await this.invalidatePortfolioCache(photographer.id);
@@ -4338,11 +4355,30 @@ export class StorageService implements OnModuleInit {
       }
     }
 
+    const thumbUrlOrKey = photographer.portfolioVideoThumbUrl;
+    if (thumbUrlOrKey) {
+      const r2ThumbKey = this.extractR2KeyFromUrlOrKey(thumbUrlOrKey, photographer.id);
+      if (r2ThumbKey) {
+        try {
+          await this.s3Client.send(new DeleteObjectCommand({
+            Bucket: this.bucketName,
+            Key: r2ThumbKey,
+          }));
+          this.urlCache.delete(r2ThumbKey);
+          this.logger.log(`[StorageService] Deleted Teaser Video Thumbnail from R2: ${r2ThumbKey}`);
+        } catch (err: any) {
+          this.logger.error(`[StorageService] Failed to delete Teaser Video Thumbnail from R2: ${err.message}`);
+        }
+      }
+    }
+
     await this.prisma.photographer.update({
       where: { id: photographer.id },
       data: {
         portfolioVideoUrl: null,
+        portfolioVideoThumbUrl: null,
         portfolioVideoSizeBytes: BigInt(0),
+        portfolioVideoThumbSizeBytes: BigInt(0),
       }
     });
 
@@ -4542,7 +4578,7 @@ export class StorageService implements OnModuleInit {
     return { success: true, url, key };
   }
 
-  async getPortfolioReelVideoUploadUrl(userId: string, data: { filename: string; mimeType: string; fileSize: number }) {
+  async getPortfolioReelVideoUploadUrl(userId: string, data: { filename: string; mimeType: string; fileSize: number; thumbMimeType?: string; thumbFileSize?: number }) {
     const photographer = await this.prisma.photographer.findUnique({
       where: { userId },
       include: {
@@ -4558,13 +4594,14 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Photographer profile not found');
     }
 
+    const totalSize = BigInt(data.fileSize || 0) + BigInt(data.thumbFileSize || 0);
     const activeSub = photographer.subscriptions[0];
     const portfolioLimitBytes = activeSub
       ? (activeSub.limitPortfolioBytes ?? BigInt(0))
       : BigInt(0);
     if (portfolioLimitBytes > BigInt(0)) {
       const portfolioUsed = await this.getPortfolioStorageUsed(photographer.id);
-      if (portfolioUsed + BigInt(data.fileSize) > portfolioLimitBytes) {
+      if (portfolioUsed + totalSize > portfolioLimitBytes) {
         throw new BadRequestException(
           `Portfolio storage limit exceeded (${Math.round(Number(portfolioLimitBytes) / 1024 / 1024)} MB). Please upgrade your plan.`
         );
@@ -4573,12 +4610,13 @@ export class StorageService implements OnModuleInit {
 
     const ext = data.filename ? data.filename.split('.').pop() : 'mp4';
     const timestamp = Date.now();
-    const key = `${photographer.id}/portfolio/reels/${timestamp}.${ext}`;
+    // Video inside: {photographer.id}/portfolio/hero-video/video/{timestamp}.mp4
+    const key = `${photographer.id}/portfolio/hero-video/video/${timestamp}.${ext}`;
 
     const command = new PutObjectCommand({
       Bucket: this.bucketName,
       Key: key,
-      ContentType: data.mimeType,
+      ContentType: data.mimeType || 'video/mp4',
     });
 
     const uploadUrl = await getSignedUrl(this.s3Client, command, {
@@ -4587,7 +4625,21 @@ export class StorageService implements OnModuleInit {
     });
     const url = await this.getReadUrl(key);
 
-    return { uploadUrl, key, url };
+    // Poster thumbnail inside: {photographer.id}/portfolio/hero-video/thumb/{timestamp}_thumb.webp
+    const thumbKey = `${photographer.id}/portfolio/hero-video/thumb/${timestamp}_thumb.webp`;
+    const thumbCommand = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: thumbKey,
+      ContentType: data.thumbMimeType || 'image/webp',
+    });
+
+    const thumbUploadUrl = await getSignedUrl(this.s3Client, thumbCommand, {
+      expiresIn: 3600,
+      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+    });
+    const thumbUrl = await this.getReadUrl(thumbKey);
+
+    return { uploadUrl, key, url, thumbUploadUrl, thumbKey, thumbUrl };
   }
 
   async getPortfolioReelItemUploadUrl(userId: string, data: { filename: string; mimeType: string; fileSize: number }) {
@@ -4711,21 +4763,19 @@ export class StorageService implements OnModuleInit {
     }
 
     const photoUuid = uuidv4();
-    const originalExt = data.original.filename?.split('.').pop() || 'jpg';
-    const thumbExt = data.thumb.filename?.split('.').pop() || 'jpg';
-    const originalKey = `${photographer.id}/portfolio/showcase/${photoUuid}_original.${originalExt}`;
-    const thumbKey = `${photographer.id}/portfolio/showcase/${photoUuid}_thumb.${thumbExt}`;
+    const originalKey = `${photographer.id}/portfolio/showcase/${photoUuid}_original.jpg`;
+    const thumbKey = `${photographer.id}/portfolio/showcase/${photoUuid}_thumb.jpg`;
 
     const originalCommand = new PutObjectCommand({
       Bucket: this.bucketName,
       Key: originalKey,
-      ContentType: data.original.mimeType,
+      ContentType: 'image/jpeg',
     });
 
     const thumbCommand = new PutObjectCommand({
       Bucket: this.bucketName,
       Key: thumbKey,
-      ContentType: data.thumb.mimeType,
+      ContentType: 'image/jpeg',
     });
 
     const originalUploadUrl = await getSignedUrl(this.s3Client, originalCommand, {
@@ -5046,6 +5096,7 @@ export class StorageService implements OnModuleInit {
       : null;
 
     const freshVideoUrl = await this.getFreshVideoUrl(photographer.portfolioVideoUrl);
+    const freshThumbUrl = await this.getFreshVideoUrl(photographer.portfolioVideoThumbUrl);
     const freshBtsUrl = await this.getFreshVideoUrl(photographer.portfolioBtsUrl);
 
     const result = {
@@ -5063,6 +5114,7 @@ export class StorageService implements OnModuleInit {
       portfolioStats: photographer.portfolioStats,
       portfolioFaqs: photographer.portfolioFaqs,
       portfolioVideoUrl: freshVideoUrl,
+      portfolioVideoThumbUrl: freshThumbUrl,
       portfolioProcess: photographer.portfolioProcess,
       portfolioBtsUrl: freshBtsUrl,
       portfolioEquipment: photographer.portfolioEquipment,

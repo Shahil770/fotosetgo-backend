@@ -94,8 +94,10 @@ model Photographer {
   portfolioTestimonials  Json?          // Array of testimonials: [{ name, event, text, rating }]
   portfolioStats         Json?          // Milestones: { weddings, experience, clients, photos }
   portfolioFaqs          Json?          // Array of FAQs: [{ question, answer }]
-  portfolioVideoUrl      String?        // Video link: YouTube/Vimeo
+  portfolioVideoUrl      String?        // Video link: YouTube/Vimeo / R2
+  portfolioVideoThumbUrl String?        // Poster WebP thumbnail for Hero video
   portfolioVideoSizeBytes BigInt        @default(0)
+  portfolioVideoThumbSizeBytes BigInt   @default(0)
   portfolioProcess       Json?          // Array of process steps: [{ step, title, desc }]
   portfolioBtsUrl        String?        // BTS Video link or photo
   portfolioBtsSizeBytes  BigInt         @default(0)

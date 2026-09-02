@@ -304,7 +304,7 @@ export class StorageController {
   @Post('portfolio/reel-video/upload-url')
   async getPortfolioReelVideoUploadUrl(
     @CurrentUser() user: any,
-    @Body() body: { filename: string; mimeType: string; fileSize: number }
+    @Body() body: { filename: string; mimeType: string; fileSize: number; thumbMimeType?: string; thumbFileSize?: number }
   ) {
     return this.storageService.getPortfolioReelVideoUploadUrl(user.id, body);
   }

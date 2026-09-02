@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Patch, Delete, Body, UseGuards, Headers, Param, Query, UnauthorizedException } from '@nestjs/common';
+import { Controller, Post, Get, Patch, Delete, Body, UseGuards, Headers, Param, Query, UnauthorizedException, Inject } from '@nestjs/common';
 import { BillingService } from './billing.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -7,21 +7,11 @@ import Redis from 'ioredis';
 
 @Controller('billing')
 export class BillingController {
-  private redis: Redis;
-
   constructor(
     private billingService: BillingService,
-    private prismaService: PrismaService
-  ) {
-    this.redis = new Redis({
-      host: process.env.REDIS_HOST || '127.0.0.1',
-      port: Number(process.env.REDIS_PORT) || 6380,
-      password: process.env.REDIS_PASSWORD || undefined,
-      lazyConnect: true,
-      maxRetriesPerRequest: 1,
-    });
-    this.redis.on('error', () => { });
-  }
+    private prismaService: PrismaService,
+    @Inject('REDIS_CLIENT') private redis: Redis,
+  ) {}
 
   @Get('plans')
   async getPlans() {

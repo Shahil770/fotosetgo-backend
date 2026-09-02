@@ -263,17 +263,17 @@ export class AuthService {
    * Google OAuth 1-Click Login & Registration with automated Referral & Free Tier Setup
    */
   async googleAuth(data: { credential: string; referralCode?: string }, requestInfo?: { ipAddress?: string; userAgent?: string }) {
-    const googleClientId = process.env.GOOGLE_AUTH_CLIENT_ID || '786412055901-jn99cr4cb562c9kapr7r4iaekcbp3j16.apps.googleusercontent.com';
+    const googleClientId = process.env.GOOGLE_AUTH_CLIENT_ID || '';
+    if (!googleClientId) {
+      throw new UnauthorizedException('Google OAuth Client ID is not configured on the server');
+    }
     const client = new OAuth2Client(googleClientId);
 
     let googlePayload: any;
     try {
       const ticket = await client.verifyIdToken({
         idToken: data.credential,
-        audience: [
-          googleClientId,
-          '786412055901-jn99cr4cb562c9kapr7r4iaekcbp3j16.apps.googleusercontent.com'
-        ],
+        audience: googleClientId,
       });
       googlePayload = ticket.getPayload();
     } catch (err: any) {

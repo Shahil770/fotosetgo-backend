@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, OnModuleInit, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, OnModuleInit, Logger, Inject } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
 import * as crypto from 'crypto';
 import Redis from 'ioredis';
@@ -8,12 +8,13 @@ const Razorpay = require('razorpay');
 export class BillingService implements OnModuleInit {
   private readonly logger = new Logger(BillingService.name);
   private razorpayInstance: any;
-  private redis: Redis;
 
-  constructor(private prisma: PrismaService) {
-    this.redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
-    const keyId = process.env.RAZORPAY_KEY_ID || 'rzp_test_TVCLXCmTHul84C';
-    const keySecret = process.env.RAZORPAY_KEY_SECRET || 'WpY7B0c65Rr5P6xrBB3a9rAE';
+  constructor(
+    private prisma: PrismaService,
+    @Inject('REDIS_CLIENT') private redis: Redis,
+  ) {
+    const keyId = process.env.RAZORPAY_KEY_ID || '';
+    const keySecret = process.env.RAZORPAY_KEY_SECRET || '';
     this.razorpayInstance = new Razorpay({
       key_id: keyId,
       key_secret: keySecret,
@@ -576,7 +577,7 @@ export class BillingService implements OnModuleInit {
         orderId: rzpOrder.id,
         amount: rzpOrder.amount,
         currency: rzpOrder.currency,
-        keyId: process.env.RAZORPAY_KEY_ID || 'rzp_test_TVCLXCmTHul84C',
+        keyId: process.env.RAZORPAY_KEY_ID || '',
         planName: packName,
         creditsGivenRupees: creditsGivenPaise / 100,
         basePriceRupees: basePricePaise / 100,
@@ -716,7 +717,7 @@ export class BillingService implements OnModuleInit {
       orderId: rzpOrder.id,
       amount: rzpOrder.amount,
       currency: rzpOrder.currency,
-      keyId: process.env.RAZORPAY_KEY_ID || 'rzp_test_TVCLXCmTHul84C',
+      keyId: process.env.RAZORPAY_KEY_ID || '',
       planName: targetPackage.name,
       yearsCount: pricing.yearsCount,
       isFirstTime: pricing.isFirstTime,
@@ -878,7 +879,10 @@ export class BillingService implements OnModuleInit {
     const { orderId, paymentId, signature } = data;
 
     // Cryptographic HMAC-SHA256 signature verification
-    const secret = process.env.RAZORPAY_KEY_SECRET || 'WpY7B0c65Rr5P6xrBB3a9rAE';
+    const secret = process.env.RAZORPAY_KEY_SECRET;
+    if (!secret) {
+      throw new BadRequestException('Payment gateway configuration is missing.');
+    }
     const generatedSignature = crypto
       .createHmac('sha256', secret)
       .update(`${orderId}|${paymentId}`)
@@ -1240,7 +1244,11 @@ export class BillingService implements OnModuleInit {
    * Razorpay Webhook background handler (Fallback for when tab is closed)
    */
   async handleRazorpayWebhook(body: any, signature: string) {
-    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET || 'rzp_webhook_secret_123456';
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      this.logger.error('[RazorpayWebhook] RAZORPAY_WEBHOOK_SECRET is not configured');
+      return { status: 'unconfigured' };
+    }
     const expectedSignature = crypto
       .createHmac('sha256', webhookSecret)
       .update(JSON.stringify(body))

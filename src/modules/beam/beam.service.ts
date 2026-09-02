@@ -101,7 +101,7 @@ export class BeamService implements OnModuleInit {
     });
     const hasBeam = activeSub?.package ? activeSub.package.featureBeamLiveCamera : false;
 
-    const host = process.env.BEAM_FTP_HOST || '158.178.226.189';
+    const host = process.env.BEAM_FTP_HOST || '';
     const port = 2121;
     const username = event.ftpUsername || `evt_${event.id.slice(0, 8)}`;
     const pin = event.ftpPassword || '1234';

@@ -1504,7 +1504,7 @@ export class StorageService implements OnModuleInit {
           const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
           const backendAppUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
           const webhookUrl = `${backendAppUrl}/api/public/webhook/video-face-complete`;
-          const secretKey = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
+          const secretKey = process.env.WORKER_SECRET_KEY || '';
 
           try {
             // Call Modal GPU Video Indexing Endpoint (/faces/index-video) with Webhook URL
@@ -1512,7 +1512,7 @@ export class StorageService implements OnModuleInit {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
-                'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
+                'x-api-key': process.env.MODAL_API_KEY || ''
               },
               body: JSON.stringify({
                 videoUrl: videoSignedUrl,
@@ -1687,13 +1687,13 @@ export class StorageService implements OnModuleInit {
       const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
       const backendAppUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
       const webhookUrl = `${backendAppUrl}/api/public/webhook/photo-face-complete`;
-      const secretKey = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
+      const secretKey = process.env.WORKER_SECRET_KEY || '';
 
       const response = await fetch(`${faceEngineUrl}/faces/index-photo`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
+          'x-api-key': process.env.MODAL_API_KEY || ''
         },
         body: JSON.stringify({
           photoId,
@@ -1835,7 +1835,7 @@ export class StorageService implements OnModuleInit {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
+          'x-api-key': process.env.MODAL_API_KEY || ''
         },
         body: JSON.stringify({ imageUrl }),
         signal: AbortSignal.timeout(40000)
@@ -5403,8 +5403,8 @@ export class StorageService implements OnModuleInit {
 
   async completeThumbnailWebhook(data: { photoId: string; thumbKey: string; previewKey?: string; thumbSize?: number; previewSize?: number; secretKey: string }) {
     // Validate secret key to match environmental setup
-    const secret = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
-    if (data.secretKey !== secret) {
+    const secret = process.env.WORKER_SECRET_KEY;
+    if (!secret || data.secretKey !== secret) {
       throw new Error('Unauthorized webhook signature mismatch');
     }
 
@@ -5501,8 +5501,8 @@ export class StorageService implements OnModuleInit {
     secretKey: string;
     error?: string;
   }) {
-    const secret = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
-    if (data.secretKey !== secret) {
+    const secret = process.env.WORKER_SECRET_KEY;
+    if (!secret || data.secretKey !== secret) {
       throw new UnauthorizedException('Unauthorized webhook signature mismatch');
     }
 
@@ -5636,8 +5636,8 @@ export class StorageService implements OnModuleInit {
     secretKey: string;
     error?: string;
   }) {
-    const secret = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
-    if (data.secretKey !== secret) {
+    const secret = process.env.WORKER_SECRET_KEY;
+    if (!secret || data.secretKey !== secret) {
       throw new UnauthorizedException('Unauthorized webhook signature mismatch');
     }
 
@@ -5870,7 +5870,7 @@ export class StorageService implements OnModuleInit {
             previewKey: result.previewKey || null,
             thumbSize: result.thumbSize,
             previewSize: result.previewSize,
-            secretKey: process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123'
+            secretKey: process.env.WORKER_SECRET_KEY || ''
           }).catch(err => this.logger.error(`[Worker Trigger] Local DB update error for ${photoId}: ${err.message}`));
         } else {
           this.logger.error(`[Worker Trigger] Worker returned error for ${photoId}: ${result?.error}`);
@@ -6123,13 +6123,13 @@ export class StorageService implements OnModuleInit {
             if (photoBatchPayload.length > 0) {
               const backendAppUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
               const webhookUrl = `${backendAppUrl}/api/public/webhook/photo-face-complete`;
-              const secretKey = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
+              const secretKey = process.env.WORKER_SECRET_KEY || '';
 
               const response = await fetch(`${faceEngineUrl}/faces/index-batch-photos`, {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
-                  'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
+                  'x-api-key': process.env.MODAL_API_KEY || ''
                 },
                 body: JSON.stringify({
                   eventId,

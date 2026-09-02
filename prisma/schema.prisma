@@ -574,7 +574,9 @@ model PortfolioReel {
   photographer   Photographer @relation(fields: [photographerId], references: [id], onDelete: Cascade)
   title          String
   r2Key          String
+  r2KeyThumb     String?
   fileSize       BigInt       @default(0)
+  thumbSizeBytes BigInt       @default(0)
   category       String?      @default("Highlights")
   duration       Int?
   viewsCount     Int          @default(0)

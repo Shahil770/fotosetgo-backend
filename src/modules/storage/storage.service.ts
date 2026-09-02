@@ -2352,12 +2352,17 @@ export class StorageService implements OnModuleInit {
     // 2.5 Portfolio Reels
     const portfolioReels = await this.prisma.portfolioReel.findMany({
       where: { photographerId },
-      select: { r2Key: true }
+      select: { r2Key: true, r2KeyThumb: true }
     });
     portfolioReels.forEach(r => {
       if (r.r2Key) {
         dbKeysSet.add(r.r2Key);
         const basename = r.r2Key.split('/').pop();
+        if (basename) dbKeysSet.add(basename);
+      }
+      if (r.r2KeyThumb) {
+        dbKeysSet.add(r.r2KeyThumb);
+        const basename = r.r2KeyThumb.split('/').pop();
         if (basename) dbKeysSet.add(basename);
       }
     });
@@ -4153,12 +4158,15 @@ export class StorageService implements OnModuleInit {
     const reels = await Promise.all(
       (photographer.portfolioReels || []).map(async (r) => {
         const url = await this.getReadUrl(r.r2Key);
+        const thumbUrl = r.r2KeyThumb ? await this.getReadUrl(r.r2KeyThumb) : null;
         return {
           id: r.id,
           title: r.title,
           category: r.category || 'Highlights',
           r2Key: r.r2Key,
+          r2KeyThumb: r.r2KeyThumb,
           url,
+          thumbUrl,
           viewsCount: r.viewsCount,
           createdAt: r.createdAt
         };
@@ -4435,7 +4443,7 @@ export class StorageService implements OnModuleInit {
         }),
         this.prisma.portfolioReel.aggregate({
           where: { photographerId },
-          _sum: { fileSize: true },
+          _sum: { fileSize: true, thumbSizeBytes: true },
         }),
         this.prisma.photographer.findUnique({
           where: { id: photographerId },
@@ -4451,6 +4459,7 @@ export class StorageService implements OnModuleInit {
         BigInt(photosSum._sum.fileSize ? photosSum._sum.fileSize.toString() : '0') +
         BigInt(photosSum._sum.thumbSizeBytes ? photosSum._sum.thumbSizeBytes.toString() : '0') +
         BigInt(reelsSum._sum.fileSize ? reelsSum._sum.fileSize.toString() : '0') +
+        BigInt(reelsSum._sum.thumbSizeBytes ? reelsSum._sum.thumbSizeBytes.toString() : '0') +
         BigInt(photographer?.portfolioAboutImageSizeBytes ? photographer.portfolioAboutImageSizeBytes.toString() : '0') +
         BigInt(photographer?.portfolioVideoSizeBytes ? photographer.portfolioVideoSizeBytes.toString() : '0') +
         BigInt(photographer?.portfolioBtsSizeBytes ? photographer.portfolioBtsSizeBytes.toString() : '0');
@@ -4480,11 +4489,20 @@ export class StorageService implements OnModuleInit {
 
     // Delete from R2 cloud storage
     try {
-      await this.s3Client.send(new DeleteObjectCommand({
-        Bucket: this.bucketName,
-        Key: reel.r2Key,
-      }));
-      this.urlCache.delete(reel.r2Key);
+      if (reel.r2Key) {
+        await this.s3Client.send(new DeleteObjectCommand({
+          Bucket: this.bucketName,
+          Key: reel.r2Key,
+        }));
+        this.urlCache.delete(reel.r2Key);
+      }
+      if (reel.r2KeyThumb) {
+        await this.s3Client.send(new DeleteObjectCommand({
+          Bucket: this.bucketName,
+          Key: reel.r2KeyThumb,
+        }));
+        this.urlCache.delete(reel.r2KeyThumb);
+      }
     } catch (err) {
       console.error('[StorageService] Delete reel R2 file error:', err);
     }
@@ -4642,7 +4660,16 @@ export class StorageService implements OnModuleInit {
     return { uploadUrl, key, url, thumbUploadUrl, thumbKey, thumbUrl };
   }
 
-  async getPortfolioReelItemUploadUrl(userId: string, data: { filename: string; mimeType: string; fileSize: number }) {
+  async getPortfolioReelItemUploadUrl(
+    userId: string,
+    data: {
+      video?: { filename: string; mimeType: string; fileSize: number };
+      thumb?: { filename?: string; mimeType?: string; fileSize?: number };
+      filename?: string;
+      mimeType?: string;
+      fileSize?: number;
+    }
+  ) {
     const photographer = await this.prisma.photographer.findUnique({
       where: { userId },
       include: {
@@ -4658,39 +4685,81 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Photographer profile not found');
     }
 
+    const videoData = data.video || {
+      filename: data.filename || 'reel.mp4',
+      mimeType: data.mimeType || 'video/mp4',
+      fileSize: data.fileSize || 0
+    };
+    const thumbData = data.thumb;
+
+    const totalRequested = BigInt(videoData.fileSize) + BigInt(thumbData?.fileSize || 0);
     const activeSub = photographer.subscriptions[0];
     const portfolioLimitBytes = activeSub
       ? (activeSub.limitPortfolioBytes ?? BigInt(0))
       : BigInt(0);
     if (portfolioLimitBytes > BigInt(0)) {
       const portfolioUsed = await this.getPortfolioStorageUsed(photographer.id);
-      if (portfolioUsed + BigInt(data.fileSize) > portfolioLimitBytes) {
+      if (portfolioUsed + totalRequested > portfolioLimitBytes) {
         throw new BadRequestException(
           `Portfolio storage limit exceeded (${Math.round(Number(portfolioLimitBytes) / 1024 / 1024)} MB). Please upgrade your plan.`
         );
       }
     }
 
-    const ext = data.filename ? data.filename.split('.').pop() : 'mp4';
     const reelUuid = uuidv4();
-    const key = `${photographer.id}/portfolio/reels/${reelUuid}.${ext}`;
+    const videoKey = `${photographer.id}/portfolio/reels/videos/${reelUuid}.mp4`;
+    const thumbKey = `${photographer.id}/portfolio/reels/thumbs/${reelUuid}_thumb.jpg`;
 
-    const command = new PutObjectCommand({
+    const videoCommand = new PutObjectCommand({
       Bucket: this.bucketName,
-      Key: key,
-      ContentType: data.mimeType,
+      Key: videoKey,
+      ContentType: 'video/mp4',
     });
 
-    const uploadUrl = await getSignedUrl(this.s3Client, command, {
+    const videoUploadUrl = await getSignedUrl(this.s3Client, videoCommand, {
       expiresIn: 3600,
       unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
     });
-    const url = await this.getReadUrl(key);
 
-    return { uploadUrl, key, url };
+    let thumbUploadUrl: string | undefined;
+    if (thumbData) {
+      const thumbCommand = new PutObjectCommand({
+        Bucket: this.bucketName,
+        Key: thumbKey,
+        ContentType: 'image/jpeg',
+      });
+      thumbUploadUrl = await getSignedUrl(this.s3Client, thumbCommand, {
+        expiresIn: 3600,
+        unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+      });
+    }
+
+    return {
+      video: {
+        uploadUrl: videoUploadUrl,
+        key: videoKey,
+      },
+      thumb: {
+        uploadUrl: thumbUploadUrl,
+        key: thumbKey,
+      },
+      uploadUrl: videoUploadUrl,
+      key: videoKey,
+      thumbKey: thumbUploadUrl ? thumbKey : undefined,
+    };
   }
 
-  async completePortfolioReelItemUpload(userId: string, data: { key: string; title?: string; category?: string; fileSize?: number }) {
+  async completePortfolioReelItemUpload(
+    userId: string,
+    data: {
+      key: string;
+      thumbKey?: string;
+      title?: string;
+      category?: string;
+      fileSize?: number;
+      thumbSizeBytes?: number;
+    }
+  ) {
     const photographer = await this.prisma.photographer.findUnique({
       where: { userId }
     });
@@ -4705,13 +4774,16 @@ export class StorageService implements OnModuleInit {
         title: data.title || 'Untitled Reel',
         category: data.category || 'Highlights',
         r2Key: data.key,
+        r2KeyThumb: data.thumbKey || null,
         fileSize: data.fileSize ? BigInt(data.fileSize) : BigInt(0),
+        thumbSizeBytes: data.thumbSizeBytes ? BigInt(data.thumbSizeBytes) : BigInt(0),
       }
     });
 
     await this.recalculateStorage(photographer.id);
     await this.invalidatePortfolioCache(photographer.id);
     const url = await this.getReadUrl(data.key);
+    const thumbUrl = data.thumbKey ? await this.getReadUrl(data.thumbKey) : null;
     return {
       success: true,
       reel: {
@@ -4719,7 +4791,9 @@ export class StorageService implements OnModuleInit {
         title: reel.title,
         category: reel.category,
         r2Key: reel.r2Key,
+        r2KeyThumb: reel.r2KeyThumb,
         url,
+        thumbUrl,
         viewsCount: reel.viewsCount,
         createdAt: reel.createdAt
       }
@@ -5079,12 +5153,15 @@ export class StorageService implements OnModuleInit {
     const reels = await Promise.all(
       (photographer.portfolioReels || []).map(async (r) => {
         const url = await this.getReadUrl(r.r2Key);
+        const thumbUrl = r.r2KeyThumb ? await this.getReadUrl(r.r2KeyThumb) : null;
         return {
           id: r.id,
           title: r.title,
           category: r.category || 'Highlights',
           r2Key: r.r2Key,
+          r2KeyThumb: r.r2KeyThumb,
           url,
+          thumbUrl,
           viewsCount: r.viewsCount,
           createdAt: r.createdAt
         };

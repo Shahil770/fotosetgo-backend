@@ -322,7 +322,13 @@ export class StorageController {
   @Post('portfolio/reels/upload-url')
   async getPortfolioReelItemUploadUrl(
     @CurrentUser() user: any,
-    @Body() body: { filename: string; mimeType: string; fileSize: number }
+    @Body() body: {
+      video?: { filename: string; mimeType: string; fileSize: number };
+      thumb?: { filename?: string; mimeType?: string; fileSize?: number };
+      filename?: string;
+      mimeType?: string;
+      fileSize?: number;
+    }
   ) {
     return this.storageService.getPortfolioReelItemUploadUrl(user.id, body);
   }
@@ -330,7 +336,14 @@ export class StorageController {
   @Post('portfolio/reels/complete')
   async completePortfolioReelItemUpload(
     @CurrentUser() user: any,
-    @Body() body: { key: string; title?: string; category?: string; fileSize?: number }
+    @Body() body: {
+      key: string;
+      thumbKey?: string;
+      title?: string;
+      category?: string;
+      fileSize?: number;
+      thumbSizeBytes?: number;
+    }
   ) {
     return this.storageService.completePortfolioReelItemUpload(user.id, body);
   }

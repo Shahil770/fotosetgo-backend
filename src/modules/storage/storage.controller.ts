@@ -8,7 +8,7 @@ import { FeatureGuard } from '../../common/guards/feature.guard';
 @UseGuards(JwtAuthGuard)
 @Controller('storage')
 export class StorageController {
-  constructor(private storageService: StorageService) {}
+  constructor(private storageService: StorageService) { }
 
   @Get('breakdown')
   async getStorageBreakdown(@CurrentUser() user: any) {
@@ -41,30 +41,32 @@ export class StorageController {
   @Post('complete-upload')
   async completeUpload(
     @CurrentUser() user: any,
-    @Body() body: { photoId: string },
+    @Body() body: { photoId: string; thumbSizeBytes?: number; previewSizeBytes?: number; duration?: number },
   ) {
-    return this.storageService.completeUpload(user.photographer.id, body.photoId);
+    return this.storageService.completeUpload(user.photographer.id, body.photoId, body.thumbSizeBytes, body.previewSizeBytes, body.duration);
   }
 
   @Post('upload-url-batch')
   async getBatchUploadUrls(
     @CurrentUser() user: any,
-    @Body() body: { eventId: string; uploadBatchId: string; files: { filename: string; mimeType: string; fileSize: number }[] },
+    @Body() body: { eventId: string; uploadBatchId: string; files: { filename: string; mimeType: string; fileSize: number }[]; totalBatchBytes?: number },
   ) {
     return this.storageService.getBatchUploadPresignedUrls(
       user.photographer.id,
       body.eventId,
       body.uploadBatchId,
-      body.files
+      body.files,
+      body.totalBatchBytes,
     );
   }
 
   @Post('complete-upload-batch')
   async completeBatchUpload(
     @CurrentUser() user: any,
-    @Body() body: { photoIds: string[] },
+    @Body() body: { photoIds?: string[]; items?: { photoId: string; thumbSizeBytes?: number; previewSizeBytes?: number; duration?: number }[] },
   ) {
-    return this.storageService.completeBatchUpload(user.photographer.id, body.photoIds);
+    const list = body.items && body.items.length > 0 ? body.items : (body.photoIds || []);
+    return this.storageService.completeBatchUpload(user.photographer.id, list);
   }
 
   @Post('cancel-upload')
@@ -74,6 +76,14 @@ export class StorageController {
   ) {
     // Remove orphaned UPLOADING DB entry when R2 upload failed completely
     return this.storageService.cancelUpload(user.photographer.id, body.photoId);
+  }
+
+  @Post('batch/cancel')
+  async cancelBatchUpload(
+    @CurrentUser() user: any,
+    @Body() body: { uploadBatchId: string },
+  ) {
+    return this.storageService.cancelBatchUpload(user.photographer.id, body.uploadBatchId);
   }
 
   @Post('clear-waste')
@@ -112,13 +122,11 @@ export class StorageController {
 
   @Post('search-face')
   @UseGuards(FeatureGuard('featureAiPhotoSearch'))
-  @UseInterceptors(FileInterceptor('selfie'))
   async searchFace(
     @CurrentUser() user: any,
-    @UploadedFile() selfie: any,
-    @Body() body: { eventId?: string },
+    @Body() body: { r2Key: string; eventId?: string },
   ) {
-    return this.storageService.searchFace(user.photographer.id, selfie, body.eventId);
+    return this.storageService.searchFace(user.photographer?.id || user.id, body.r2Key, body.eventId);
   }
 
   @Delete('photo/:id')
@@ -264,16 +272,6 @@ export class StorageController {
     return this.storageService.uploadBrandingLogo(user.id, file);
   }
 
-  @Post('branding/banner')
-  @UseGuards(FeatureGuard('featureCustomBranding'))
-  @UseInterceptors(FileInterceptor('banner'))
-  async uploadBrandingBanner(
-    @CurrentUser() user: any,
-    @UploadedFile() file: any,
-  ) {
-    return this.storageService.uploadBrandingBanner(user.id, file);
-  }
-
   @Get('portfolio')
   async getPortfolioSettings(@CurrentUser() user: any) {
     return this.storageService.getPortfolioSettings(user.id);
@@ -287,41 +285,81 @@ export class StorageController {
     return this.storageService.updatePortfolioSettings(user.id, body);
   }
 
-  @Post('portfolio/about-image')
-  @UseInterceptors(FileInterceptor('aboutImage'))
-  async uploadPortfolioAboutImage(
+  @Post('portfolio/about-image/upload-url')
+  async getPortfolioAboutImageUploadUrl(
     @CurrentUser() user: any,
-    @UploadedFile() file: any
+    @Body() body: { mimeType: string; fileSize: number }
   ) {
-    return this.storageService.uploadPortfolioAboutImage(user.id, file);
+    return this.storageService.getPortfolioAboutImageUploadUrl(user.id, body);
   }
 
-  @Post('portfolio/hero-image')
-  @UseInterceptors(FileInterceptor('heroImage'))
-  async uploadPortfolioHeroImage(
+  @Post('portfolio/about-image/complete')
+  async completePortfolioAboutImageUpload(
     @CurrentUser() user: any,
-    @UploadedFile() file: any
+    @Body() body: { key: string; fileSize?: number }
   ) {
-    return this.storageService.uploadPortfolioHeroImage(user.id, file);
+    return this.storageService.completePortfolioAboutImageUpload(user.id, body.key, body.fileSize);
   }
 
-  @Post('portfolio/reel-video')
-  @UseInterceptors(FileInterceptor('reelVideo'))
-  async uploadPortfolioReelVideo(
+  @Post('portfolio/reel-video/upload-url')
+  async getPortfolioReelVideoUploadUrl(
     @CurrentUser() user: any,
-    @UploadedFile() file: any
+    @Body() body: { filename: string; mimeType: string; fileSize: number }
   ) {
-    return this.storageService.uploadPortfolioReelVideo(user.id, file);
+    return this.storageService.getPortfolioReelVideoUploadUrl(user.id, body);
   }
 
-  @Post('portfolio/photos')
-  @UseInterceptors(FileInterceptor('photo'))
-  async uploadPortfolioPhoto(
+  @Delete('portfolio/hero-video')
+  async deletePortfolioHeroVideo(@CurrentUser() user: any) {
+    return this.storageService.deletePortfolioHeroVideo(user.id);
+  }
+
+  @Delete('portfolio/bts-video')
+  async deletePortfolioBtsVideo(@CurrentUser() user: any) {
+    return this.storageService.deletePortfolioBtsVideo(user.id);
+  }
+
+  @Post('portfolio/reels/upload-url')
+  async getPortfolioReelItemUploadUrl(
     @CurrentUser() user: any,
-    @UploadedFile() file: any,
-    @Body() body: { category?: string }
+    @Body() body: { filename: string; mimeType: string; fileSize: number }
   ) {
-    return this.storageService.uploadPortfolioPhoto(user.id, file, body.category);
+    return this.storageService.getPortfolioReelItemUploadUrl(user.id, body);
+  }
+
+  @Post('portfolio/reels/complete')
+  async completePortfolioReelItemUpload(
+    @CurrentUser() user: any,
+    @Body() body: { key: string; title?: string; category?: string; fileSize?: number }
+  ) {
+    return this.storageService.completePortfolioReelItemUpload(user.id, body);
+  }
+
+  @Delete('portfolio/reels/:id')
+  async deletePortfolioReelItem(
+    @CurrentUser() user: any,
+    @Param('id') id: string
+  ) {
+    return this.storageService.deletePortfolioReelItem(user.id, id);
+  }
+
+  @Post('portfolio/photos/upload-url')
+  async getPortfolioPhotoUploadUrl(
+    @CurrentUser() user: any,
+    @Body() body: {
+      original: { filename: string; mimeType: string; fileSize: number };
+      thumb: { filename: string; mimeType: string; fileSize: number };
+    }
+  ) {
+    return this.storageService.getPortfolioPhotoUploadUrl(user.id, body);
+  }
+
+  @Post('portfolio/photos/complete')
+  async completePortfolioPhotoUpload(
+    @CurrentUser() user: any,
+    @Body() body: { originalKey: string; thumbKey: string; category?: string; fileSize?: number; thumbSizeBytes?: number }
+  ) {
+    return this.storageService.completePortfolioPhotoUpload(user.id, body);
   }
 
   @Delete('portfolio/photos/:id')

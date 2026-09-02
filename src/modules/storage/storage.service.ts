@@ -1,25 +1,16 @@
-import { Injectable, NotFoundException, OnModuleInit, BadRequestException, UnauthorizedException, Logger, Inject } from '@nestjs/common';
+import { Injectable, NotFoundException, OnModuleInit, BadRequestException, UnauthorizedException, ForbiddenException, HttpException, HttpStatus, Logger, Inject } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
 import { Prisma } from '@prisma/client';
-import { S3Client, PutObjectCommand, GetObjectCommand, PutBucketCorsCommand, DeleteObjectCommand, DeleteObjectsCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, PutBucketCorsCommand, DeleteObjectCommand, DeleteObjectsCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { v4 as uuidv4 } from 'uuid';
-import sharp from 'sharp';
 import { GoogleDriveService } from './google-drive.service';
-import { exec } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { promisify } from 'util';
 
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import * as http from 'http';
 import * as https from 'https';
-
-import ffmpegPath from 'ffmpeg-static';
-import * as ffprobe from 'ffprobe-static';
-
-const execPromise = promisify(exec);
-const ffprobePath = ffprobe.path;
 
 @Injectable()
 export class StorageService implements OnModuleInit {
@@ -28,6 +19,7 @@ export class StorageService implements OnModuleInit {
   private bucketName: string;
   private readonly urlCache = new Map<string, { url: string; expiresAt: number }>();
   private readonly activeEventScans = new Set<string>();
+  private readonly activeVideoProcessings = new Set<string>();
   private workerDispatchCounter = 0;
 
   constructor(
@@ -64,6 +56,8 @@ export class StorageService implements OnModuleInit {
         secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '',
       },
       forcePathStyle: true,
+      requestChecksumCalculation: 'WHEN_REQUIRED' as any,
+      responseChecksumValidation: 'WHEN_REQUIRED' as any,
       requestHandler: new NodeHttpHandler({
         httpAgent,
         httpsAgent,
@@ -72,52 +66,58 @@ export class StorageService implements OnModuleInit {
       }),
     });
 
-    this.startWorkerKeepAlivePingLoop();
     this.startUploadCompletionProcessor();
+    this.startDatabaseSyncProcessor();
   }
 
-  private startWorkerKeepAlivePingLoop(): void {
-    // Every 10 minutes, ping all configured Go Workers so they stay 100% awake 24/7 on Render
-    setInterval(() => {
-      const rawUrls = process.env.THUMBNAIL_WORKER_URLS || process.env.THUMBNAIL_WORKER_URL || '';
-      if (!rawUrls) return;
-      const workerUrls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
-      for (const url of workerUrls) {
-        fetch(`${url.replace(/\/$/, '')}/health`).catch(() => { });
-      }
-    }, 10 * 60 * 1000);
+  private async scanKeys(pattern: string): Promise<string[]> {
+    let cursor = '0';
+    const keys: string[] = [];
+    try {
+      do {
+        const [nextCursor, matchedKeys] = await this.redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+        cursor = nextCursor;
+        if (matchedKeys && matchedKeys.length > 0) {
+          keys.push(...matchedKeys);
+        }
+      } while (cursor !== '0');
+    } catch (err: any) {
+      this.logger.error(`[scanKeys] Redis SCAN error for pattern ${pattern}: ${err.message}`);
+    }
+    return keys;
   }
 
   private startUploadCompletionProcessor() {
     setInterval(async () => {
       try {
-        const completions: string[] = [];
-        // Process up to 5 updates per batch loop to keep DB connection overhead extremely low
-        for (let i = 0; i < 5; i++) {
-          const item = await this.redis.rpop('queue:upload-completions');
-          if (item) {
-            completions.push(item);
-          } else {
-            break;
-          }
+        // High-throughput pipelined pop: pop up to 100 items every 500ms (Throughput: 200 photos/sec = 12,000 photos/min)
+        const pipeline = this.redis.pipeline();
+        for (let i = 0; i < 100; i++) {
+          pipeline.rpop('queue:upload-completions');
         }
+        const results = await pipeline.exec();
+        if (!results || results.length === 0) return;
+
+        const completions = results
+          .map(([err, item]) => (!err && item ? (item as string) : null))
+          .filter(Boolean) as string[];
 
         if (completions.length === 0) return;
 
         await Promise.allSettled(
           completions.map(async (itemStr) => {
             try {
-              const { photographerId, photoId } = JSON.parse(itemStr);
-              await this.processQueuedUploadCompletion(photographerId, photoId);
-            } catch (e) {
+              const { photographerId, photoId, isGuest, thumbSizeBytes, previewSizeBytes, duration } = JSON.parse(itemStr);
+              await this.processQueuedUploadCompletion(photographerId, photoId, !!isGuest, thumbSizeBytes, previewSizeBytes, duration);
+            } catch (e: any) {
               this.logger.error(`[UploadQueueProcessor] Failed to process queued item: ${itemStr}, error: ${e.message}`);
             }
           })
         );
-      } catch (err) {
+      } catch (err: any) {
         this.logger.error('[UploadQueueProcessor] Error in loop:', err.message);
       }
-    }, 1000);
+    }, 500);
   }
 
   async invalidateEventCache(eventId: string) {
@@ -135,8 +135,8 @@ export class StorageService implements OnModuleInit {
         if (event.slug) {
           keys.push(`cache:public:event:${event.slug}`);
           keys.push(`cache:public:event:limits:${event.slug}`);
-          // Scan and delete all passcode variants for the photos list cache
-          const matchKeys = await this.redis.keys(`cache:public:photos:${event.slug}:*`);
+          // Non-blocking incremental scan for passcode variants
+          const matchKeys = await this.scanKeys(`cache:public:photos:${event.slug}:*`);
           if (matchKeys && matchKeys.length > 0) {
             keys.push(...matchKeys);
           }
@@ -144,7 +144,7 @@ export class StorageService implements OnModuleInit {
         await this.redis.del(...keys);
         this.logger.log(`[Cache Invalidation] Successfully cleared Redis caches for event slug: ${event.slug || eventId}`);
       }
-    } catch (err) {
+    } catch (err: any) {
       this.logger.error(`[Cache Invalidation] Failed to clear Redis cache for event ${eventId}:`, err.message);
     }
   }
@@ -328,15 +328,15 @@ export class StorageService implements OnModuleInit {
       throw new BadRequestException('No active subscription found. Please subscribe to a plan to start uploading.');
     }
 
-    // Dynamic dual limit resolution: take the maximum of package limit vs subscription stored limit
-    const pkgMb = activeSubscription.package?.maxEventsStorageMb ?? 5000;
-    const pkgLimitBytes = BigInt(pkgMb) * BigInt(1024 * 1024);
-    const subLimitBytes = activeSubscription.limitEventsBytes ?? activeSubscription.limitBytes ?? BigInt(0);
-    const limitBytes = pkgLimitBytes > subLimitBytes ? pkgLimitBytes : subLimitBytes;
+    // Package table is the single source of truth for events limit
+    const pkgMb = activeSubscription.package?.maxEventsStorageMb;
+    const limitBytes = (pkgMb !== undefined && pkgMb !== null)
+      ? BigInt(pkgMb) * BigInt(1024 * 1024)
+      : (activeSubscription.limitEventsBytes ?? activeSubscription.limitBytes ?? BigInt(5000 * 1024 * 1024));
 
-    // Calculate events-only used bytes (exclude portfolio/branding files)
+    // Calculate events-only used bytes including trash & in-flight uploads (exclude portfolio/branding files)
     const eventsUsedAgg = await this.prisma.photo.aggregate({
-      where: { photographerId, deletedAt: null, status: 'READY' },
+      where: { photographerId, status: { in: ['READY', 'UPLOADING'] } },
       _sum: { fileSize: true },
     });
     const eventsUsedBytes = eventsUsedAgg._sum.fileSize
@@ -344,18 +344,21 @@ export class StorageService implements OnModuleInit {
       : BigInt(0);
 
     if (eventsUsedBytes + BigInt(data.fileSize) > limitBytes) {
-      throw new BadRequestException('Events storage limit exceeded. Please upgrade your plan.');
+      throw new BadRequestException('Events storage limit exceeded. Please empty your trash or upgrade your plan.');
     }
 
     const isVideo = data.mimeType.startsWith('video/') || data.filename.match(/\.(mp4|mkv|mov|webm)$/i);
     const fileUuid = uuidv4();
     const cleanFilename = data.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const baseName = cleanFilename.replace(/\.[^/.]+$/, '');
 
     // Set dynamic R2 Path under unified photographer folder
     const objectKey = isVideo
       ? `${photographerId}/events/${eventId}/videos/${fileUuid}_${cleanFilename}`
       : `${photographerId}/events/${eventId}/photos/${fileUuid}_${cleanFilename}`;
 
+    const thumbKey = `${photographerId}/events/${eventId}/thumbs/${fileUuid}_${baseName}.jpg`;
+    const previewKey = isVideo ? null : `${photographerId}/events/${eventId}/previews/${fileUuid}_${baseName}.jpg`;
 
     // Create a mock photo entry in database
     const photo = await this.prisma.photo.create({
@@ -365,6 +368,8 @@ export class StorageService implements OnModuleInit {
         filenameOriginal: data.filename,
         filenameStored: `${fileUuid}_${cleanFilename}`,
         r2KeyOriginal: objectKey,
+        r2KeyThumb: thumbKey,
+        r2KeyPreview: previewKey,
         mimeType: data.mimeType,
         fileSize: BigInt(data.fileSize),
         status: 'UPLOADING',
@@ -380,13 +385,41 @@ export class StorageService implements OnModuleInit {
       ContentType: data.mimeType,
     });
 
-    // Expires in 5 minutes (300 seconds)
-    const uploadUrl = await getSignedUrl(this.s3Client, command, { expiresIn: 300 });
+    // Expires in 1 hour (3600 seconds) - zero timeout risk for heavy queues
+    const uploadUrl = await getSignedUrl(this.s3Client, command, {
+      expiresIn: 3600,
+      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+    });
+
+    let uploadUrlThumb: string | null = null;
+    let uploadUrlPreview: string | null = null;
+
+    if (thumbKey) {
+      const thumbCmd = new PutObjectCommand({
+        Bucket: this.bucketName,
+        Key: thumbKey,
+        ContentType: 'image/jpeg',
+      });
+      uploadUrlThumb = await getSignedUrl(this.s3Client, thumbCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+    }
+
+    if (!isVideo && previewKey) {
+      const previewCmd = new PutObjectCommand({
+        Bucket: this.bucketName,
+        Key: previewKey,
+        ContentType: 'image/jpeg',
+      });
+      uploadUrlPreview = await getSignedUrl(this.s3Client, previewCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+    }
 
     return {
       photoId: photo.id,
       objectKey,
       uploadUrl,
+      uploadUrlThumb,
+      uploadUrlPreview,
+      r2KeyThumb: thumbKey,
+      r2KeyPreview: previewKey,
     };
   }
 
@@ -395,7 +428,8 @@ export class StorageService implements OnModuleInit {
     photographerId: string,
     eventId: string,
     uploadBatchId: string,
-    files: { filename: string; mimeType: string; fileSize: number }[]
+    files: { filename: string; mimeType: string; fileSize: number }[],
+    totalBatchBytes?: number,
   ) {
     if (!files || files.length === 0) return { results: [] };
 
@@ -438,87 +472,132 @@ export class StorageService implements OnModuleInit {
     const activeSubscription = photographer.subscriptions[0];
     if (!activeSubscription) throw new BadRequestException('No active subscription found.');
 
-    const pkgMb = activeSubscription.package?.maxEventsStorageMb ?? 5000;
-    const pkgLimitBytes = BigInt(pkgMb) * BigInt(1024 * 1024);
-    const subLimitBytes = activeSubscription.limitEventsBytes ?? activeSubscription.limitBytes ?? BigInt(0);
-    const limitBytes = pkgLimitBytes > subLimitBytes ? pkgLimitBytes : subLimitBytes;
+    const pkgMb = activeSubscription.package?.maxEventsStorageMb;
+    const limitBytes = (pkgMb !== undefined && pkgMb !== null)
+      ? BigInt(pkgMb) * BigInt(1024 * 1024)
+      : (activeSubscription.limitEventsBytes ?? activeSubscription.limitBytes ?? BigInt(5000 * 1024 * 1024));
 
     const eventsUsedAgg = await this.prisma.photo.aggregate({
-      where: { photographerId, deletedAt: null, status: 'READY' },
+      where: { photographerId, status: { in: ['READY', 'UPLOADING'] } },
       _sum: { fileSize: true },
     });
     const eventsUsedBytes = eventsUsedAgg._sum.fileSize
       ? BigInt(eventsUsedAgg._sum.fileSize.toString())
       : BigInt(0);
 
-    const totalBatchSize = BigInt(files.reduce((sum, f) => sum + f.fileSize, 0));
-    if (eventsUsedBytes + totalBatchSize > limitBytes) {
-      throw new BadRequestException('Events storage limit exceeded. Please upgrade your plan.');
+    const incomingBatchBytes = (totalBatchBytes !== undefined && totalBatchBytes > 0)
+      ? BigInt(totalBatchBytes)
+      : BigInt(files.reduce((sum, f) => sum + f.fileSize, 0));
+
+    if (eventsUsedBytes + incomingBatchBytes > limitBytes) {
+      throw new BadRequestException('Events storage limit exceeded. Please empty your trash or upgrade your plan.');
     }
 
-    // Generate photo DB records + presigned URLs with concurrency limit of 5
-    // (prevents DB connection pool exhaustion when batch size is 50)
-    const CONCURRENCY = 5;
-    const results: { photoId: string; objectKey: string; uploadUrl: string; filename: string }[] = [];
+    const processedFiles = files.map(file => {
+      const isVideo = file.mimeType.startsWith('video/') || file.filename.match(/\.(mp4|mkv|mov|webm)$/i);
+      const fileUuid = uuidv4();
+      const cleanFilename = file.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
+      const baseName = cleanFilename.replace(/\.[^/.]+$/, '');
+      const objectKey = isVideo
+        ? `${photographerId}/events/${eventId}/videos/${fileUuid}_${cleanFilename}`
+        : `${photographerId}/events/${eventId}/photos/${fileUuid}_${cleanFilename}`;
+      const thumbKey = `${photographerId}/events/${eventId}/thumbs/${fileUuid}_${baseName}.jpg`;
+      const previewKey = isVideo ? null : `${photographerId}/events/${eventId}/previews/${fileUuid}_${baseName}.jpg`;
 
-    for (let i = 0; i < files.length; i += CONCURRENCY) {
-      const chunk = files.slice(i, i + CONCURRENCY);
-      const chunkResults = await Promise.all(chunk.map(async (file) => {
-        const isVideo = file.mimeType.startsWith('video/') || file.filename.match(/\.(mp4|mkv|mov|webm)$/i);
-        const fileUuid = uuidv4();
-        const cleanFilename = file.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
-        const objectKey = isVideo
-          ? `${photographerId}/events/${eventId}/videos/${fileUuid}_${cleanFilename}`
-          : `${photographerId}/events/${eventId}/photos/${fileUuid}_${cleanFilename}`;
+      return {
+        ...file,
+        isVideo,
+        objectKey,
+        thumbKey,
+        previewKey,
+        filenameStored: `${fileUuid}_${cleanFilename}`
+      };
+    });
 
-        const photo = await this.prisma.photo.create({
-          data: {
-            eventId,
-            photographerId,
-            filenameOriginal: file.filename,
-            filenameStored: `${fileUuid}_${cleanFilename}`,
-            r2KeyOriginal: objectKey,
-            mimeType: file.mimeType,
-            fileSize: BigInt(file.fileSize),
-            status: 'UPLOADING',
-            type: isVideo ? 'VIDEO' : 'IMAGE',
-            uploadBatchId,
-          },
-        });
+    const createdPhotos = await this.prisma.photo.createManyAndReturn({
+      data: processedFiles.map(f => ({
+        eventId,
+        photographerId,
+        filenameOriginal: f.filename,
+        filenameStored: f.filenameStored,
+        r2KeyOriginal: f.objectKey,
+        r2KeyThumb: f.thumbKey,
+        r2KeyPreview: f.previewKey,
+        mimeType: f.mimeType,
+        fileSize: BigInt(f.fileSize),
+        status: 'UPLOADING',
+        type: f.isVideo ? 'VIDEO' : 'IMAGE',
+        uploadBatchId,
+      }))
+    });
 
-        const command = new PutObjectCommand({ Bucket: this.bucketName, Key: objectKey, ContentType: file.mimeType });
-        const uploadUrl = await getSignedUrl(this.s3Client, command, { expiresIn: 600 });
+    const results = await Promise.all(createdPhotos.map(async (photo, index) => {
+      const command = new PutObjectCommand({ Bucket: this.bucketName, Key: photo.r2KeyOriginal!, ContentType: photo.mimeType! });
+      const uploadUrl = await getSignedUrl(this.s3Client, command, {
+        expiresIn: 3600,
+        unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+      });
 
-        return { photoId: photo.id, objectKey, uploadUrl, filename: file.filename };
-      }));
-      results.push(...chunkResults);
-    }
+      let uploadUrlThumb: string | null = null;
+      let uploadUrlPreview: string | null = null;
+
+      if (photo.r2KeyThumb) {
+        const thumbCmd = new PutObjectCommand({ Bucket: this.bucketName, Key: photo.r2KeyThumb, ContentType: 'image/jpeg' });
+        uploadUrlThumb = await getSignedUrl(this.s3Client, thumbCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+      }
+
+      if (photo.type === 'IMAGE' && photo.r2KeyPreview) {
+        const previewCmd = new PutObjectCommand({ Bucket: this.bucketName, Key: photo.r2KeyPreview, ContentType: 'image/jpeg' });
+        uploadUrlPreview = await getSignedUrl(this.s3Client, previewCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+      }
+
+      return {
+        photoId: photo.id,
+        objectKey: photo.r2KeyOriginal!,
+        uploadUrl,
+        uploadUrlThumb,
+        uploadUrlPreview,
+        r2KeyThumb: photo.r2KeyThumb,
+        r2KeyPreview: photo.r2KeyPreview,
+        filename: photo.filenameOriginal!
+      };
+    }));
 
     return { results };
   }
 
   // Batch completeUpload: Push to Redis queue to process asynchronously and prevent DB choke
-  async completeBatchUpload(photographerId: string, photoIds: string[]) {
-    if (!photoIds || photoIds.length === 0) return { completed: 0 };
+  async completeBatchUpload(
+    photographerId: string,
+    itemsOrIds: (string | { photoId: string; thumbSizeBytes?: number; previewSizeBytes?: number; duration?: number })[]
+  ) {
+    if (!itemsOrIds || itemsOrIds.length === 0) return { completed: 0 };
 
     try {
       const pipeline = this.redis.pipeline();
-      for (const photoId of photoIds) {
-        pipeline.lpush('queue:upload-completions', JSON.stringify({ photographerId, photoId }));
+      for (const item of itemsOrIds) {
+        const payload = typeof item === 'string'
+          ? { photographerId, photoId: item }
+          : { photographerId, photoId: item.photoId, thumbSizeBytes: item.thumbSizeBytes, previewSizeBytes: item.previewSizeBytes, duration: item.duration };
+        pipeline.lpush('queue:upload-completions', JSON.stringify(payload));
       }
       await pipeline.exec();
-    } catch (err) {
+    } catch (err: any) {
       this.logger.error('[completeBatchUpload] Failed to push to Redis queue:', err.message);
       // Fallback: run synchronously if Redis is down
-      for (const photoId of photoIds) {
-        this.completeUpload(photographerId, photoId).catch(() => { });
+      for (const item of itemsOrIds) {
+        const photoId = typeof item === 'string' ? item : item.photoId;
+        const thumbSize = typeof item === 'string' ? undefined : item.thumbSizeBytes;
+        const previewSize = typeof item === 'string' ? undefined : item.previewSizeBytes;
+        const duration = typeof item === 'string' ? undefined : item.duration;
+        this.completeUpload(photographerId, photoId, thumbSize, previewSize, duration).catch(() => { });
       }
     }
 
-    return { completed: photoIds.length, queued: true };
+    return { completed: itemsOrIds.length, queued: true };
   }
 
-  async completeGuestUpload(photoId: string) {
+  async completeGuestUpload(photoId: string, thumbSizeBytes?: number, previewSizeBytes?: number, duration?: number) {
     const photo = await this.prisma.photo.findUnique({
       where: { id: photoId },
       include: { event: true }
@@ -528,50 +607,24 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Photo not found');
     }
 
-    // Verify photographer storage usage increment
-    await this.prisma.photographer.update({
-      where: { id: photo.photographerId },
-      data: {
-        totalStorageUsedBytes: {
-          increment: photo.fileSize
-        }
-      }
-    });
-
-    const activeSub = await this.prisma.subscription.findFirst({
-      where: { photographerId: photo.photographerId, status: 'ACTIVE' },
-      orderBy: { startsAt: 'desc' }
-    });
-
-    if (activeSub) {
-      await this.prisma.subscription.update({
-        where: { id: activeSub.id },
-        data: {
-          usedBytes: {
-            increment: photo.fileSize
-          }
-        }
-      });
+    if (photo.event?.slug) {
+      try {
+        await this.redis.del(`cache:public:event:limits:${photo.event.slug}`);
+      } catch { }
     }
 
-    // Maintain PENDING_APPROVAL status until photographer approves
-    const updatedPhoto = await this.prisma.photo.update({
-      where: { id: photoId },
-      data: { status: 'PENDING_APPROVAL', thumbnailStatus: 'PENDING' }
-    });
-
-    // Generate thumbnail immediately in background so it can be previewed in admin panel!
-    if (photo.type === 'VIDEO') {
-      this.runBackgroundVideoProcessing(photo.photographerId, photoId, photo.eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
-        console.error('[StorageService] Background video processing failed:', err);
-      });
-    } else {
-      this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
-        this.logger.error(`[completeGuestUpload] Worker trigger error for ${photoId}: ${err.message}`);
-      });
+    // Queue completion to Redis so concurrent guest uploads do not block DB pool with synchronous updates
+    try {
+      await this.redis.lpush(
+        'queue:upload-completions',
+        JSON.stringify({ photographerId: photo.photographerId, photoId, isGuest: true, thumbSizeBytes, previewSizeBytes, duration })
+      );
+    } catch (redisErr: any) {
+      this.logger.error(`[completeGuestUpload] Redis queue push failed, processing synchronously: ${redisErr.message}`);
+      await this.processQueuedUploadCompletion(photo.photographerId, photoId, true, thumbSizeBytes, previewSizeBytes, duration);
     }
 
-    return updatedPhoto;
+    return { success: true, photoId, status: 'QUEUED' };
   }
 
   async getEventPendingPhotos(photographerId: string, eventId: string) {
@@ -597,10 +650,20 @@ export class StorageService implements OnModuleInit {
     if (hasThumbnail) {
       updatedPhoto = await this.prisma.photo.update({
         where: { id: photoId },
-        data: { status: 'READY' }
+        data: {
+          status: 'READY',
+          thumbnailStatus: 'READY',
+          faceScanStatus: 'PENDING'
+        }
       });
 
-      if (photo.event.faceScanningEnabled) {
+      if (photo.type === 'VIDEO') {
+        if (photo.event.videoScanningEnabled) {
+          this.runBackgroundVideoProcessing(photographerId, photoId, photo.eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
+            console.error('[StorageService] Video face scan trigger failed on approve:', err);
+          });
+        }
+      } else if (photo.event.faceScanningEnabled) {
         this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
           console.error('[StorageService] Face scan trigger failed on approve:', err);
         });
@@ -636,15 +699,20 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Pending guest photo not found');
     }
 
-    // 1. Revert photographer storage usage footprint
+    const thumbSize = photo.thumbSizeBytes || BigInt(0);
+    const previewSize = photo.previewSizeBytes || BigInt(0);
+    const originalSize = photo.fileSize || BigInt(0);
+    const totalBytes = originalSize + thumbSize + previewSize;
+
+    // 1. Revert photographer storage usage footprint (Original + Thumb + Preview)
     await this.prisma.photographer.update({
       where: { id: photographerId },
       data: {
         totalStorageUsedBytes: {
-          decrement: photo.fileSize
+          decrement: totalBytes
         }
       }
-    });
+    }).catch(() => { });
 
     const activeSub = await this.prisma.subscription.findFirst({
       where: { photographerId, status: 'ACTIVE' },
@@ -656,26 +724,56 @@ export class StorageService implements OnModuleInit {
         where: { id: activeSub.id },
         data: {
           usedBytes: {
-            decrement: photo.fileSize
+            decrement: totalBytes
           }
         }
+      }).catch(() => { });
+
+      await this.redis.hincrby("agg:subscription:storage", activeSub.id, (-totalBytes).toString()).catch(() => { });
+    }
+
+    await this.redis.hincrby("agg:photographer:storage", photographerId, (-totalBytes).toString()).catch(() => { });
+
+    // 2. Collect all R2 keys (Original, Thumb, Preview) to delete from R2 bucket
+    const keysToDelete: string[] = [];
+    if (photo.r2KeyOriginal) keysToDelete.push(photo.r2KeyOriginal);
+    if (photo.r2KeyThumb) keysToDelete.push(photo.r2KeyThumb);
+    if (photo.r2KeyPreview) keysToDelete.push(photo.r2KeyPreview);
+
+    // Fallback computed preview/thumb keys if they were created by worker
+    if (photo.r2KeyOriginal) {
+      const computedThumb = photo.r2KeyOriginal.replace('/photos/', '/thumbs/').replace('/videos/', '/thumbs/').replace(/\.[^/.]+$/, '.jpg');
+      const computedPreview = photo.r2KeyOriginal.replace('/photos/', '/previews/').replace('/videos/', '/previews/').replace(/\.[^/.]+$/, '.jpg');
+      if (!keysToDelete.includes(computedThumb)) keysToDelete.push(computedThumb);
+      if (!keysToDelete.includes(computedPreview)) keysToDelete.push(computedPreview);
+    }
+
+    // 3. Delete photo record from DB immediately so UI responds in milliseconds
+    await this.prisma.photo.delete({ where: { id: photoId } }).catch(async (err: any) => {
+      this.logger.warn(`[rejectGuestPhoto] Delete failed, trying update: ${err.message}`);
+      await this.prisma.photo.update({
+        where: { id: photoId },
+        data: { isDeleted: true }
+      }).catch(() => { });
+    });
+
+    // 4. Delete R2 objects in background without blocking response
+    if (keysToDelete.length > 0) {
+      this.s3Client.send(new DeleteObjectsCommand({
+        Bucket: this.bucketName,
+        Delete: {
+          Objects: keysToDelete.map(k => ({ Key: k })),
+          Quiet: true,
+        }
+      })).catch((err: any) => {
+        this.logger.error(`[rejectGuestPhoto] Background R2 DeleteObjects error: ${err.message}`);
       });
     }
 
-    // 2. Delete from R2 bucket
-    if (photo.r2KeyOriginal) {
-      try {
-        await this.s3Client.send(new DeleteObjectCommand({
-          Bucket: this.bucketName,
-          Key: photo.r2KeyOriginal,
-        }));
-      } catch (err: any) {
-        this.logger.error(`[rejectGuestPhoto] Failed to delete R2 file: ${err.message}`);
-      }
-    }
-
-    // 3. Delete DB record
-    await this.prisma.photo.delete({ where: { id: photoId } });
+    await this.recalculateStorage(photographerId).catch(() => { });
+    await this.invalidateStorageBreakdownCache(photographerId).catch(() => { });
+    await this.invalidateEventPhotosCache(photographerId, photo.eventId).catch(() => { });
+    await this.invalidateEventCache(photo.eventId).catch(() => { });
 
     return { success: true };
   }
@@ -689,7 +787,8 @@ export class StorageService implements OnModuleInit {
             subscriptions: {
               where: { status: 'ACTIVE' },
               orderBy: { startsAt: 'desc' },
-              take: 1
+              take: 1,
+              include: { package: true }
             }
           }
         }
@@ -706,11 +805,24 @@ export class StorageService implements OnModuleInit {
 
     // 1. Verify Photographer level storage limit
     const photographer = event.photographer;
+    if (!photographer) {
+      throw new BadRequestException('Event photographer not found');
+    }
     const activeSubscription = photographer.subscriptions[0];
-    const limitBytes = activeSubscription?.limitEventsBytes ?? activeSubscription?.limitBytes ?? BigInt(5000 * 1024 * 1024);
-    const totalStorageUsedBytes = photographer.totalStorageUsedBytes || BigInt(0);
+    const pkgMb = activeSubscription?.package?.maxEventsStorageMb;
+    const limitBytes = (pkgMb !== undefined && pkgMb !== null)
+      ? BigInt(pkgMb) * BigInt(1024 * 1024)
+      : (activeSubscription?.limitEventsBytes ?? activeSubscription?.limitBytes ?? BigInt(5000 * 1024 * 1024));
 
-    if (totalStorageUsedBytes + BigInt(data.fileSize) > limitBytes) {
+    const eventsUsedAgg = await this.prisma.photo.aggregate({
+      where: { photographerId: photographer.id, status: { in: ['READY', 'UPLOADING', 'PENDING_APPROVAL'] } },
+      _sum: { fileSize: true },
+    });
+    const eventsUsedBytes = eventsUsedAgg._sum.fileSize
+      ? BigInt(eventsUsedAgg._sum.fileSize.toString())
+      : BigInt(0);
+
+    if (eventsUsedBytes + BigInt(data.fileSize) > limitBytes) {
       throw new BadRequestException('Photographer storage space is full. Cannot accept guest uploads.');
     }
 
@@ -739,11 +851,15 @@ export class StorageService implements OnModuleInit {
     const isVideo = data.mimeType.startsWith('video/') || data.filename.match(/\.(mp4|mkv|mov|webm)$/i);
     const fileUuid = uuidv4();
     const cleanFilename = data.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const baseName = cleanFilename.replace(/\.[^/.]+$/, '');
 
     // Set R2 Path
     const objectKey = isVideo
       ? `${photographer.id}/events/${event.id}/videos/${fileUuid}_${cleanFilename}`
       : `${photographer.id}/events/${event.id}/photos/${fileUuid}_${cleanFilename}`;
+
+    const thumbKey = `${photographer.id}/events/${event.id}/thumbs/${fileUuid}_${baseName}.jpg`;
+    const previewKey = isVideo ? null : `${photographer.id}/events/${event.id}/previews/${fileUuid}_${baseName}.jpg`;
 
     // Create Photo entry with PENDING_APPROVAL status
     const photo = await this.prisma.photo.create({
@@ -753,6 +869,8 @@ export class StorageService implements OnModuleInit {
         filenameOriginal: data.filename,
         filenameStored: `${fileUuid}_${cleanFilename}`,
         r2KeyOriginal: objectKey,
+        r2KeyThumb: thumbKey,
+        r2KeyPreview: previewKey,
         mimeType: data.mimeType,
         fileSize: BigInt(data.fileSize),
         status: 'PENDING_APPROVAL',
@@ -768,117 +886,350 @@ export class StorageService implements OnModuleInit {
       ContentType: data.mimeType,
     });
 
-    const uploadUrl = await getSignedUrl(this.s3Client, command, { expiresIn: 300 });
+    const uploadUrl = await getSignedUrl(this.s3Client, command, {
+      expiresIn: 3600,
+      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+    });
+
+    let uploadUrlThumb: string | null = null;
+    let uploadUrlPreview: string | null = null;
+
+    if (thumbKey) {
+      const thumbCmd = new PutObjectCommand({ Bucket: this.bucketName, Key: thumbKey, ContentType: 'image/jpeg' });
+      uploadUrlThumb = await getSignedUrl(this.s3Client, thumbCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+    }
+
+    if (!isVideo && previewKey) {
+      const previewCmd = new PutObjectCommand({ Bucket: this.bucketName, Key: previewKey, ContentType: 'image/jpeg' });
+      uploadUrlPreview = await getSignedUrl(this.s3Client, previewCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+    }
 
     return {
       photoId: photo.id,
       uploadUrl,
+      uploadUrlThumb,
+      uploadUrlPreview,
+      r2KeyThumb: thumbKey,
+      r2KeyPreview: previewKey,
     };
   }
 
-  async completeUpload(photographerId: string, photoId: string) {
+  async completeUpload(photographerId: string, photoId: string, thumbSizeBytes?: number, previewSizeBytes?: number, duration?: number) {
     this.logger.log(`[completeUpload] Queueing browser upload complete signal for photoId: ${photoId}`);
     try {
-      await this.redis.lpush('queue:upload-completions', JSON.stringify({ photographerId, photoId }));
-    } catch (err) {
+      await this.redis.lpush('queue:upload-completions', JSON.stringify({ photographerId, photoId, thumbSizeBytes, previewSizeBytes, duration }));
+    } catch (err: any) {
       this.logger.error('[completeUpload] Redis queue push failed, processing synchronously:', err.message);
       // Fallback
-      return this.processQueuedUploadCompletion(photographerId, photoId);
+      return this.processQueuedUploadCompletion(photographerId, photoId, false, thumbSizeBytes, previewSizeBytes, duration);
     }
     return { success: true, queued: true };
   }
 
-  private async processQueuedUploadCompletion(photographerId: string, photoId: string) {
-    this.logger.log(`[processQueuedUploadCompletion] Processing completion database updates for photoId: ${photoId}`);
+  private async processQueuedUploadCompletion(
+    photographerId: string,
+    photoId: string,
+    isGuest: boolean = false,
+    thumbSizeBytes?: number,
+    previewSizeBytes?: number,
+    duration?: number
+  ) {
+    this.logger.log(`[processQueuedUploadCompletion] Processing completion database updates for photoId: ${photoId} (isGuest: ${isGuest})`);
     const photo = await this.prisma.photo.findFirst({
       where: { id: photoId, photographerId },
     });
 
     if (!photo) {
       this.logger.error(`[processQueuedUploadCompletion] Photo ${photoId} not found in DB`);
-      return null;
+      return;
     }
 
-    await this.prisma.photographer.update({
-      where: { id: photographerId },
-      data: {
-        totalStorageUsedBytes: {
-          increment: photo.fileSize
-        }
+    const thumbSizeBigInt = thumbSizeBytes ? BigInt(thumbSizeBytes) : (photo.thumbSizeBytes || BigInt(0));
+    const previewSizeBigInt = previewSizeBytes ? BigInt(previewSizeBytes) : (photo.previewSizeBytes || BigInt(0));
+    const totalFileBytes = photo.fileSize + thumbSizeBigInt + previewSizeBigInt;
+
+    let redisSyncSuccess = false;
+    try {
+      // 1. Try to increment photographer storage in Redis
+      await this.redis.hincrby("agg:photographer:storage", photographerId, totalFileBytes.toString());
+
+      // 2. Try to increment subscription usage in Redis
+      const activeSub = await this.prisma.subscription.findFirst({
+        where: { photographerId, status: 'ACTIVE' },
+        orderBy: { startsAt: 'desc' }
+      });
+
+      if (activeSub) {
+        await this.redis.hincrby("agg:subscription:storage", activeSub.id, totalFileBytes.toString());
       }
-    });
 
-    const activeSub = await this.prisma.subscription.findFirst({
-      where: { photographerId, status: 'ACTIVE' },
-      orderBy: { startsAt: 'desc' }
-    });
+      // 3. Try to increment batch uploaded counter in Redis
+      if (photo.uploadBatchId) {
+        await this.redis.hincrby("agg:uploadBatch:uploaded", photo.uploadBatchId, "1");
+      }
 
-    if (activeSub) {
-      await this.prisma.subscription.update({
-        where: { id: activeSub.id },
+      redisSyncSuccess = true;
+    } catch (redisErr: any) {
+      this.logger.error(`[processQueuedUploadCompletion] Redis counter increment failed, falling back to direct SQL updates: ${redisErr.message}`);
+    }
+
+    if (!redisSyncSuccess) {
+      // Fallback: If Redis is down, update database directly (synchronously)
+      await this.prisma.photographer.update({
+        where: { id: photographerId },
         data: {
-          usedBytes: {
-            increment: photo.fileSize
+          totalStorageUsedBytes: {
+            increment: totalFileBytes
           }
         }
       });
+
+      const activeSub = await this.prisma.subscription.findFirst({
+        where: { photographerId, status: 'ACTIVE' },
+        orderBy: { startsAt: 'desc' }
+      });
+
+      if (activeSub) {
+        await this.prisma.subscription.update({
+          where: { id: activeSub.id },
+          data: {
+            usedBytes: {
+              increment: totalFileBytes
+            }
+          }
+        });
+      }
+
+      if (photo.uploadBatchId) {
+        await this.prisma.uploadBatch.update({
+          where: { id: photo.uploadBatchId },
+          data: {
+            uploadedFiles: { increment: 1 }
+          }
+        }).catch(err => console.error('[StorageService] Direct fallback update batch upload counter failed:', err));
+      }
     }
 
-    // Increment uploadedFiles in the active UploadBatch if exists
-    if (photo.uploadBatchId) {
-      await this.prisma.uploadBatch.update({
-        where: { id: photo.uploadBatchId },
-        data: {
-          uploadedFiles: { increment: 1 }
-        }
-      }).catch(err => console.error('[StorageService] Failed to update batch upload counter:', err));
-    }
+    const isClientThumbReady = !!photo.r2KeyThumb;
 
     const updatedPhoto = await this.prisma.photo.update({
       where: { id: photoId },
-      data: { status: 'PROCESSING', thumbnailStatus: 'PENDING' }
-    });
-
-    // Invalidate cached event queries so visitors/clients see updates instantly
-    try {
-      const event = await this.prisma.event.findUnique({
-        where: { id: photo.eventId },
-        select: { slug: true }
-      });
-      if (event?.slug) {
-        await this.redis.del(`cache:public:event:${event.slug}`);
-        await this.redis.del(`cache:public:photos:${event.slug}:none`);
-        // Also delete any passcode versions if exist
-        const keys = await this.redis.keys(`cache:public:photos:${event.slug}:*`);
-        if (keys && keys.length > 0) {
-          await this.redis.del(...keys);
-        }
+      data: {
+        status: isGuest ? 'PENDING_APPROVAL' : (isClientThumbReady ? 'READY' : 'PROCESSING'),
+        thumbnailStatus: isClientThumbReady ? 'READY' : 'PENDING',
+        thumbSizeBytes: thumbSizeBigInt > BigInt(0) ? thumbSizeBigInt : undefined,
+        previewSizeBytes: previewSizeBigInt > BigInt(0) ? previewSizeBigInt : undefined,
+        duration: duration && duration > 0 ? duration : (photo.duration || undefined),
       }
-    } catch (cacheErr) {
-      this.logger.error(`[processQueuedUploadCompletion] Failed to invalidate event caches: ${cacheErr.message}`);
-    }
-
-    // Fire-and-forget: return instantly to browser so upload queue is never blocked
-    // Modal thumbnail engine runs in background without holding up the next upload
-    this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
-      this.logger.error(`[processQueuedUploadCompletion] Thumbnail engine trigger error for ${photoId}: ${err.message}`);
     });
 
+    // Invalidate cached event queries so visitors, clients, and dashboard see updates instantly
+    await this.invalidateEventCache(photo.eventId);
+
+    // Fire-and-forget:
     if (photo.type === 'VIDEO') {
-      this.prisma.event.findUnique({ where: { id: photo.eventId } }).then(event => {
-        if (event && event.videoScanningEnabled) {
-          this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
-            console.error('[StorageService] Video face scan loop trigger failed:', err);
-          });
-        }
-      }).catch(() => { });
+      this.runBackgroundVideoProcessing(photographerId, photoId, photo.eventId, photo.r2KeyOriginal, photo.uploadBatchId).catch(err => {
+        console.error('[StorageService] Background video processing failed:', err);
+      });
+    } else if (!isClientThumbReady) {
+      // FTP / Camera Beam upload where thumb was not uploaded client-side
+      this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
+        this.logger.error(`[processQueuedUploadCompletion] Thumbnail engine trigger error for ${photoId}: ${err.message}`);
+      });
+    } else {
+      // Client-side thumbnail already ready!
+      // If AI Face Scanning is active on event, trigger face recognition directly!
+      if (!isGuest) {
+        this.prisma.event.findUnique({ where: { id: photo.eventId } }).then(event => {
+          if (event && event.faceScanningEnabled) {
+            this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
+              console.error('[StorageService] Background face scan trigger failed:', err);
+            });
+          }
+        }).catch(() => { });
+      }
     }
 
-    this.syncToGoogleDriveInBackground(photographerId, photo).catch(err => {
-      console.error('[StorageService] Background Google Drive sync trigger failed:', err);
-    });
+    if (!isGuest) {
+      if (photo.type === 'VIDEO') {
+        this.prisma.event.findUnique({ where: { id: photo.eventId } }).then(event => {
+          if (event && event.videoScanningEnabled) {
+            this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
+              console.error('[StorageService] Video face scan loop trigger failed:', err);
+            });
+          }
+        }).catch(() => { });
+      }
+
+      this.syncToGoogleDriveInBackground(photographerId, photo).catch(err => {
+        console.error('[StorageService] Background Google Drive sync trigger failed:', err);
+      });
+    }
+
+    await this.invalidateStorageBreakdownCache(photographerId);
 
     return updatedPhoto;
+  }
+
+  private startDatabaseSyncProcessor() {
+    this.logger.log('[StorageService] Starting background database metrics sync processor (every 10 seconds)');
+    // Run every 10 seconds to sync aggregated Redis counters to PostgreSQL
+    setInterval(async () => {
+      try {
+        await this.syncAggregatedPhotographerStorage();
+        await this.syncAggregatedSubscriptionStorage();
+        await this.syncAggregatedUploadBatches();
+      } catch (err) {
+        this.logger.error(`[DatabaseSyncProcessor] Error in loop: ${err.message}`);
+      }
+    }, 10000);
+  }
+
+  private async syncAggregatedPhotographerStorage() {
+    const key = 'agg:photographer:storage';
+    const tempKey = `${key}:processing:${uuidv4()}`;
+
+    try {
+      const exists = await this.redis.exists(key);
+      if (!exists || exists === 0) return;
+      await this.redis.rename(key, tempKey);
+    } catch (renameErr) {
+      return;
+    }
+
+    try {
+      const data = await this.redis.hgetall(tempKey);
+      if (!data || Object.keys(data).length === 0) return;
+
+      const photographerIds = Object.keys(data);
+      this.logger.log(`[DatabaseSyncProcessor] Syncing storage totals to PG database for ${photographerIds.length} photographers`);
+
+      await Promise.all(
+        photographerIds.map(async (photographerId) => {
+          const incrementBytes = BigInt(data[photographerId]);
+          if (incrementBytes <= BigInt(0)) return;
+
+          try {
+            await this.prisma.photographer.update({
+              where: { id: photographerId },
+              data: {
+                totalStorageUsedBytes: {
+                  increment: incrementBytes
+                }
+              }
+            });
+          } catch (dbErr) {
+            this.logger.error(`[DatabaseSyncProcessor] Failed to update photographer storage ${photographerId} in DB: ${dbErr.message}`);
+            // Restore only the failed photographer's bytes count back to Redis
+            await this.redis.hincrby(key, photographerId, data[photographerId]).catch(restoreErr =>
+              this.logger.error(`[DatabaseSyncProcessor] Failed to restore photographer storage ${photographerId} back to Redis: ${restoreErr.message}`)
+            );
+          }
+        })
+      );
+    } catch (err) {
+      this.logger.error(`[DatabaseSyncProcessor] Photographer storage sync batch process failed: ${err.message}`);
+    } finally {
+      await this.redis.del(tempKey).catch(() => { });
+    }
+  }
+
+  private async syncAggregatedSubscriptionStorage() {
+    const key = 'agg:subscription:storage';
+    const tempKey = `${key}:processing:${uuidv4()}`;
+
+    try {
+      const exists = await this.redis.exists(key);
+      if (!exists || exists === 0) return;
+      await this.redis.rename(key, tempKey);
+    } catch (renameErr) {
+      return;
+    }
+
+    try {
+      const data = await this.redis.hgetall(tempKey);
+      if (!data || Object.keys(data).length === 0) return;
+
+      const subIds = Object.keys(data);
+      this.logger.log(`[DatabaseSyncProcessor] Syncing storage usedBytes to PG database for ${subIds.length} subscriptions`);
+
+      await Promise.all(
+        subIds.map(async (subId) => {
+          const incrementBytes = BigInt(data[subId]);
+          if (incrementBytes <= BigInt(0)) return;
+
+          try {
+            await this.prisma.subscription.update({
+              where: { id: subId },
+              data: {
+                usedBytes: {
+                  increment: incrementBytes
+                }
+              }
+            });
+          } catch (dbErr) {
+            this.logger.error(`[DatabaseSyncProcessor] Failed to update subscription ${subId} in DB: ${dbErr.message}`);
+            await this.redis.hincrby(key, subId, data[subId]).catch(restoreErr =>
+              this.logger.error(`[DatabaseSyncProcessor] Failed to restore subscription ${subId} back to Redis: ${restoreErr.message}`)
+            );
+          }
+        })
+      );
+    } catch (err) {
+      this.logger.error(`[DatabaseSyncProcessor] Subscription storage sync batch process failed: ${err.message}`);
+    } finally {
+      await this.redis.del(tempKey).catch(() => { });
+    }
+  }
+
+  private async syncAggregatedUploadBatches() {
+    const key = 'agg:uploadBatch:uploaded';
+    const tempKey = `${key}:processing:${uuidv4()}`;
+
+    try {
+      const exists = await this.redis.exists(key);
+      if (!exists || exists === 0) return;
+      await this.redis.rename(key, tempKey);
+    } catch (renameErr) {
+      return;
+    }
+
+    try {
+      const data = await this.redis.hgetall(tempKey);
+      if (!data || Object.keys(data).length === 0) return;
+
+      const batchIds = Object.keys(data);
+      this.logger.log(`[DatabaseSyncProcessor] Syncing uploaded files count to PG database for ${batchIds.length} upload batches`);
+
+      await Promise.all(
+        batchIds.map(async (batchId) => {
+          const incrementCount = Number(data[batchId]);
+          if (incrementCount <= 0) return;
+
+          try {
+            await this.prisma.uploadBatch.update({
+              where: { id: batchId },
+              data: {
+                uploadedFiles: {
+                  increment: incrementCount
+                }
+              }
+            });
+          } catch (dbErr: any) {
+            this.logger.error(`[DatabaseSyncProcessor] Failed to update upload batch ${batchId} in DB: ${dbErr.message}`);
+            if (!dbErr.message?.includes('No record was found') && !dbErr.message?.includes('Record to update not found')) {
+              await this.redis.hincrby(key, batchId, data[batchId]).catch(restoreErr =>
+                this.logger.error(`[DatabaseSyncProcessor] Failed to restore upload batch ${batchId} back to Redis: ${restoreErr.message}`)
+              );
+            }
+          }
+        })
+      );
+    } catch (err) {
+      this.logger.error(`[DatabaseSyncProcessor] UploadBatch count sync batch process failed: ${err.message}`);
+    } finally {
+      await this.redis.del(tempKey).catch(() => { });
+    }
   }
 
   async cancelUpload(photographerId: string, photoId: string) {
@@ -909,6 +1260,66 @@ export class StorageService implements OnModuleInit {
     await this.prisma.photo.delete({ where: { id: photoId } });
     this.logger.log(`[cancelUpload] Removed orphaned UPLOADING entry for photo ${photoId}`);
     return { cancelled: true };
+  }
+
+  async cancelBatchUpload(photographerId: string, uploadBatchId: string) {
+    if (!uploadBatchId) return { cancelled: false };
+
+    // Atomically remove all photos in this batch that never completed upload
+    const deleteResult = await this.prisma.photo.deleteMany({
+      where: {
+        uploadBatchId,
+        photographerId,
+        status: 'UPLOADING',
+      },
+    });
+
+    await this.prisma.uploadBatch.update({
+      where: { id: uploadBatchId },
+      data: { status: 'CANCELLED' },
+    }).catch(() => { });
+
+    // Invalidate storage cache so quota is freed immediately
+    try {
+      await this.redis.del(`cache:photographer:${photographerId}:storage-breakdown`);
+    } catch (e) { }
+
+    this.logger.log(`[cancelBatchUpload] Purged ${deleteResult.count} orphaned UPLOADING photos for batch ${uploadBatchId}`);
+    return { cancelled: true, purgedCount: deleteResult.count };
+  }
+
+  async checkObjectExistsInR2(r2Key: string): Promise<{ exists: boolean; size?: number }> {
+    try {
+      const cmd = new HeadObjectCommand({
+        Bucket: this.bucketName,
+        Key: r2Key,
+      });
+      const res = await this.s3Client.send(cmd);
+      return { exists: true, size: res.ContentLength || 0 };
+    } catch (err: any) {
+      if (err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404) {
+        return { exists: false };
+      }
+      this.logger.warn(`[checkObjectExistsInR2] HeadObject check for ${r2Key} returned: ${err.message}`);
+      return { exists: false };
+    }
+  }
+
+  async deleteOrphanPhotoRecord(photoId: string, r2KeyOriginal?: string): Promise<void> {
+    if (r2KeyOriginal) {
+      try {
+        const deleteCmd = new DeleteObjectCommand({
+          Bucket: this.bucketName,
+          Key: r2KeyOriginal,
+        });
+        await this.s3Client.send(deleteCmd);
+      } catch (r2Err: any) {
+        // Ignore not found errors on deletion
+      }
+    }
+    await this.prisma.photo.delete({
+      where: { id: photoId }
+    }).catch(() => { });
   }
 
   private async syncToGoogleDriveInBackground(photographerId: string, photo: any) {
@@ -973,13 +1384,19 @@ export class StorageService implements OnModuleInit {
     }
   }
 
-  private async runBackgroundVideoProcessing(
+  async runBackgroundVideoProcessing(
     photographerId: string,
     photoId: string,
     eventId: string,
     r2KeyOriginal: string,
     uploadBatchId?: string | null
   ) {
+    if (this.activeVideoProcessings.has(photoId)) {
+      this.logger.log(`[VideoProcessing] Background video processing is already running for video ${photoId}. Skipping.`);
+      return;
+    }
+    this.activeVideoProcessings.add(photoId);
+
     // Check if video photo has been trashed/deleted in the meantime
     const currentVideo = await this.prisma.photo.findUnique({
       where: { id: photoId }
@@ -990,7 +1407,7 @@ export class StorageService implements OnModuleInit {
       return;
     }
 
-    let duration = 0;
+    let duration = currentVideo.duration || 0;
     // Fallback computed thumb key (used if Modal doesn't return actual key)
     const computedThumbKey = r2KeyOriginal.includes('/videos/')
       ? r2KeyOriginal.replace('/videos/', '/thumbs/').replace(/\.[^/.]+$/, '.jpg')
@@ -1004,24 +1421,39 @@ export class StorageService implements OnModuleInit {
       const getCmd = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
       const videoSignedUrl = await getSignedUrl(this.s3Client, getCmd, { expiresIn: 3600 });
 
-      // 2. Call CPU Thumbnail Engine first to get actual thumbnail key
-      try {
-        const thumbnailEngineUrl = process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run';
-        const thumbRes = await fetch(`${thumbnailEngineUrl}/generate-thumbnail`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: [{ photoId, objectKey: r2KeyOriginal }] })
-        });
-        if (thumbRes.ok) {
-          const thumbData: any = await thumbRes.json();
-          const thumbResult = (thumbData?.results || []).find((r: any) => r.photoId === photoId && r.success);
-          if (thumbResult?.thumbKey) {
-            actualThumbKey = thumbResult.thumbKey;
-            this.logger.log(`[VideoProcessing] Got actual thumbKey from Modal for video ${photoId}: ${actualThumbKey}`);
+      // 2. Check if client-side actually generated and uploaded a valid thumbnail
+      const hasValidClientThumb = currentVideo.thumbSizeBytes && Number(currentVideo.thumbSizeBytes) > 0;
+      if (hasValidClientThumb && currentVideo.r2KeyThumb) {
+        actualThumbKey = currentVideo.r2KeyThumb;
+        this.logger.log(`[VideoProcessing] Using verified client thumb for video ${photoId}: ${actualThumbKey}`);
+      }
+
+      let videoThumbSize = 0;
+      if (!actualThumbKey) {
+        try {
+          const thumbnailEngineUrl = process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run';
+          const thumbRes = await fetch(`${thumbnailEngineUrl}/generate-thumbnail`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ items: [{ photoId, objectKey: r2KeyOriginal }] }),
+            signal: AbortSignal.timeout(30000)
+          });
+          if (thumbRes.ok) {
+            const thumbData: any = await thumbRes.json();
+            const thumbResult = (thumbData?.results || []).find((r: any) => r.photoId === photoId && r.success);
+            if (thumbResult?.thumbKey) {
+              actualThumbKey = thumbResult.thumbKey;
+              videoThumbSize = thumbResult.thumbSize || 0;
+              this.logger.log(`[VideoProcessing] Got actual thumbKey from Modal for video ${photoId}: ${actualThumbKey} (size: ${videoThumbSize} bytes)`);
+            }
+            if (thumbResult?.duration && thumbResult.duration > 0 && duration === 0) {
+              duration = Math.round(thumbResult.duration);
+              this.logger.log(`[VideoProcessing] Extracted duration via Modal cloud for video ${photoId}: ${duration} seconds`);
+            }
           }
+        } catch (thumbErr: any) {
+          this.logger.error(`[VideoProcessing] CPU thumbnail engine failed for video ${photoId}: ${thumbErr.message}`);
         }
-      } catch (thumbErr: any) {
-        this.logger.error(`[VideoProcessing] CPU thumbnail engine failed for video ${photoId}: ${thumbErr.message}`);
       }
 
       const finalThumbKey = actualThumbKey || computedThumbKey;
@@ -1034,74 +1466,85 @@ export class StorageService implements OnModuleInit {
         where: { id: eventId },
       });
 
-      let faceCount = 0;
-      let hasFaces = false;
-
-      if (photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled) {
-        const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
-
-        try {
-          // Call Modal GPU Video Indexing Endpoint (/faces/index-video)
-          const response = await fetch(`${faceEngineUrl}/faces/index-video`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
-            },
-            body: JSON.stringify({ videoUrl: videoSignedUrl }),
-          });
-
-          if (response.ok) {
-            const result = await response.json();
-            if (result.faces && result.faces.length > 0) {
-              hasFaces = true;
-              faceCount = result.faces.length;
-
-              const faceData = result.faces.map((f: any) => ({
-                photoId,
-                eventId,
-                photographerId,
-                faceIndex: f.faceIndex,
-                bboxX: f.bbox.x,
-                bboxY: f.bbox.y,
-                bboxW: f.bbox.w,
-                bboxH: f.bbox.h,
-                confidence: f.confidence,
-                embedding: f.embedding,
-                timestamp: f.timestamp || 0,
-              }));
-
-              const values = faceData.map((f: any) => {
-                const vectorStr = `[${f.embedding.join(',')}]`;
-                return `('${uuidv4()}', '${f.photoId}', '${f.eventId}', '${f.photographerId}', ${f.faceIndex}, ${f.bboxX}, ${f.bboxY}, ${f.bboxW}, ${f.bboxH}, ${f.confidence}, '${vectorStr}'::vector, NULL, ${f.timestamp})`;
-              }).join(',');
-
-              await this.prisma.$executeRawUnsafe(`
-                INSERT INTO face_embeddings ("id", "photoId", "eventId", "photographerId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding", "clusterId", "timestamp")
-                VALUES ${values}
-              `);
-            }
-          }
-        } catch (videoScanErr) {
-          this.logger.error(`[StorageService] Modal video face scan failed for video ${photoId}:`, videoScanErr);
-        }
-      }
-
-      // Update DB with ACTUAL thumbKey from Modal (not assumed path)
+      // Update DB with thumbnail first so preview is immediately ready
       const isPendingApproval = currentVideo.status === 'PENDING_APPROVAL';
       await this.prisma.photo.update({
         where: { id: photoId },
         data: {
           status: isPendingApproval ? 'PENDING_APPROVAL' : 'READY',
           thumbnailStatus: 'READY',
-          faceScanStatus: (photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled) ? 'READY' : 'PENDING',
-          hasFaces,
-          faceCount,
           r2KeyThumb: finalThumbKey,
+          thumbSizeBytes: BigInt(videoThumbSize || 0),
           thumbnailUrl: `https://pub-d4d6b7ea94e00e300402.r2.dev/${finalThumbKey}`,
-          duration,
+          duration: duration > 0 ? duration : undefined,
         },
       });
+
+      if (videoThumbSize > 0) {
+        await this.redis.hincrby("agg:photographer:storage", photographerId, videoThumbSize.toString()).catch(() => { });
+      }
+
+      await this.invalidateStorageBreakdownCache(photographerId);
+
+      // Estimate cost BEFORE calling Modal using duration probed on cloud
+      const estimatedMinutes = Math.ceil(duration / 60) || 1;
+      const estimatedCost = estimatedMinutes * 50; // 50 paise per minute
+      const currentBalance = photographer?.creditBalance || 0;
+      const canAffordScan = currentBalance >= estimatedCost;
+
+      if (!isPendingApproval && photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled) {
+        if (!canAffordScan) {
+          // NOT enough credits for estimated duration — skip Modal call entirely to prevent free compute
+          this.logger.warn(`[VideoProcessing] Photographer ${photographerId} has insufficient credits (${currentBalance} paise) for estimated video cost (${estimatedCost} paise, ~${estimatedMinutes} min). Skipping Modal call entirely.`);
+          await this.prisma.photo.update({
+            where: { id: photoId },
+            data: { faceScanStatus: 'SKIPPED' }
+          });
+        } else {
+          const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
+          const backendAppUrl = process.env.APP_URL || 'http://localhost:5000';
+          const webhookUrl = `${backendAppUrl}/api/public/webhook/video-face-complete`;
+          const secretKey = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
+
+          try {
+            // Call Modal GPU Video Indexing Endpoint (/faces/index-video) with Webhook URL
+            const response = await fetch(`${faceEngineUrl}/faces/index-video`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
+              },
+              body: JSON.stringify({
+                videoUrl: videoSignedUrl,
+                photoId,
+                eventId,
+                photographerId,
+                webhookUrl,
+                secretKey
+              }),
+              signal: AbortSignal.timeout(60000)
+            });
+
+            if (response.ok) {
+              const result = await response.json();
+              if (result && result.faces) {
+                await this.completeVideoFaceWebhook({
+                  photoId,
+                  duration: result.duration || duration,
+                  faces: result.faces,
+                  secretKey
+                });
+              } else if (result && result.status === 'QUEUED') {
+                this.logger.log(`[VideoProcessing] Video ${photoId} dispatched to Modal background worker. Result will arrive via Webhook.`);
+              }
+            }
+          } catch (videoScanErr: any) {
+            this.logger.error(`[StorageService] Modal video face scan dispatch for video ${photoId}: ${videoScanErr.message}`);
+          }
+        }
+      }
+
+      await this.invalidateEventCache(eventId);
 
       // Auto-backup to Google Drive if enabled (non-blocking)
       this.triggerAutoBackupIfEnabled(photographerId, photoId).catch(err =>
@@ -1117,6 +1560,63 @@ export class StorageService implements OnModuleInit {
       }).catch(() => { });
 
       await this.updateBatchProgress(uploadBatchId, false);
+    } finally {
+      this.activeVideoProcessings.delete(photoId);
+    }
+  }
+
+  async processIngestedPhoto(photographerId: string, photoId: string, eventId: string, r2KeyOriginal: string) {
+    try {
+      const thumbnailEngineUrl = process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run';
+      const thumbRes = await fetch(`${thumbnailEngineUrl}/generate-thumbnail`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: [{ photoId, objectKey: r2KeyOriginal }] }),
+        signal: AbortSignal.timeout(30000)
+      });
+
+      if (thumbRes.ok) {
+        const thumbData: any = await thumbRes.json();
+        const res = (thumbData?.results || []).find((r: any) => r.photoId === photoId && r.success);
+        if (res && res.thumbKey) {
+          const thumbSizeBytes = BigInt(res.thumbSize || 0);
+          const previewSizeBytes = BigInt(res.previewSize || 0);
+          const extraBytes = thumbSizeBytes + previewSizeBytes;
+
+          await this.prisma.photo.update({
+            where: { id: photoId },
+            data: {
+              r2KeyThumb: res.thumbKey,
+              r2KeyPreview: res.previewKey || null,
+              thumbSizeBytes,
+              previewSizeBytes,
+              thumbnailStatus: 'READY',
+              status: 'READY'
+            }
+          });
+
+          // Add generated derivatives size to storage
+          if (extraBytes > BigInt(0)) {
+            await this.redis.hincrby("agg:photographer:storage", photographerId, extraBytes.toString()).catch(() => { });
+          }
+          await this.invalidateStorageBreakdownCache(photographerId);
+          await this.invalidateEventPhotosCache(photographerId, eventId);
+
+          // Check if event face scanning is enabled, trigger indexing
+          const event = await this.prisma.event.findUnique({
+            where: { id: eventId },
+            select: { faceScanningEnabled: true }
+          });
+          if (event?.faceScanningEnabled) {
+            this.triggerFaceScanForEvent(photographerId, eventId).catch(err => {
+              this.logger.error(`[ProcessIngestedPhoto] Face scan trigger failed for event ${eventId}:`, err);
+            });
+          }
+          this.logger.log(`[ProcessIngestedPhoto] Photo ${photoId} thumbnail & preview generated successfully! (Thumb: ${res.thumbSize}B, Preview: ${res.previewSize}B)`);
+        }
+      }
+    } catch (err: any) {
+      this.logger.error(`[ProcessIngestedPhoto] Failed to generate thumbnail/preview for photo ${photoId}: ${err.message}`);
     }
   }
 
@@ -1150,37 +1650,12 @@ export class StorageService implements OnModuleInit {
 
     try {
       const event = await this.prisma.event.findUnique({ where: { id: eventId } });
-      let imageBuffer: Buffer | null = null;
 
-      try {
-        // If thumbnail is missing, generate it from original
-        if (!thumbKey) {
-          const getCommand = new GetObjectCommand({
-            Bucket: this.bucketName,
-            Key: r2KeyOriginal,
-          });
-          const s3Response = await this.s3Client.send(getCommand);
-          if (!s3Response.Body) {
-            throw new Error('S3 response body is empty');
-          }
-          imageBuffer = Buffer.from(await s3Response.Body.transformToByteArray());
-
-          // Generate 300px display thumbnail
-          const thumbBuffer = await sharp(imageBuffer)
-            .resize(300)
-            .jpeg({ quality: 80 })
-            .toBuffer();
-
-          thumbKey = `${photographerId}/events/${eventId}/thumbs/${photoId}.jpg`;
-          await this.s3Client.send(new PutObjectCommand({
-            Bucket: this.bucketName,
-            Key: thumbKey,
-            Body: thumbBuffer,
-            ContentType: 'image/jpeg',
-          }));
-        }
-      } catch (thumbErr) {
-        console.error(`[StorageService] Post-upload thumbnail generation failed for photo ${photoId}:`, thumbErr);
+      // If thumbnail is missing from photo record, dispatch to Modal CPU Thumbnail Engine asynchronously
+      if (!thumbKey) {
+        this.triggerCloudflareWorker(photoId, r2KeyOriginal).catch(err =>
+          this.logger.error(`[FaceIndexing] Modal thumbnail engine trigger error for photo ${photoId}: ${err.message}`)
+        );
       }
 
       if (!event?.faceScanningEnabled) {
@@ -1203,145 +1678,76 @@ export class StorageService implements OnModuleInit {
         return;
       }
 
-      // Use the Original photo URL for maximum clarity AI Face Indexing
-      const origCommand = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
+      // Use Preview URL (JPEG) if present for 100% reliable format compatibility and fast loading, fallback to Original
+      const scanKey = currentPhoto.r2KeyPreview || r2KeyOriginal;
+      const origCommand = new GetObjectCommand({ Bucket: this.bucketName, Key: scanKey });
       const faceIndexUrl = await getSignedUrl(this.s3Client, origCommand, { expiresIn: 600 });
 
-      // Call FastAPI Face Engine with thumbnail URL
+      // Call FastAPI Face Engine with Webhook callback support
       const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://127.0.0.1:8000';
+      const backendAppUrl = process.env.APP_URL || 'http://localhost:5000';
+      const webhookUrl = `${backendAppUrl}/api/public/webhook/photo-face-complete`;
+      const secretKey = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
+
       const response = await fetch(`${faceEngineUrl}/faces/index-photo`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
         },
-        body: JSON.stringify({ imageUrl: faceIndexUrl }),
+        body: JSON.stringify({
+          photoId,
+          eventId,
+          photographerId,
+          imageUrl: faceIndexUrl,
+          webhookUrl,
+          secretKey
+        }),
+        signal: AbortSignal.timeout(40000)
       });
 
       if (response.ok) {
         const result = await response.json();
-        faceCount = result.faceCount || 0;
-        hasFaces = faceCount > 0;
-
-        // Delete any existing face embeddings for this photo first to prevent duplicates
-        await this.prisma.faceEmbedding.deleteMany({
-          where: { photoId }
-        });
-
-        if (result.faces && result.faces.length > 0) {
-          // Fetch existing face embeddings with assigned clusterIds to implement auto-learning feedback
-          interface RawExistingFace {
-            clusterId: string;
-            embeddingStr: string;
-          }
-          const existingFaces = await this.prisma.$queryRaw<RawExistingFace[]>`
-            SELECT "clusterId", "embedding"::text as "embeddingStr"
-            FROM face_embeddings
-            WHERE "eventId" = ${eventId} AND "clusterId" IS NOT NULL
-          `;
-
-          const faceData = result.faces.map((f: any) => {
-            const newEmb = f.embedding;
-            let assignedClusterId: string | null = null;
-
-            if (Array.isArray(newEmb) && existingFaces.length > 0) {
-              let maxSimilarity = -1;
-              let bestClusterId: string | null = null;
-
-              for (const ext of existingFaces) {
-                let extEmb: any = ext.embeddingStr;
-                if (typeof extEmb === 'string') {
-                  try { extEmb = JSON.parse(extEmb); } catch { continue; }
-                }
-                const extEmbArray = extEmb as number[];
-                const newEmbArray = newEmb as number[];
-                if (!Array.isArray(extEmbArray) || extEmbArray.length !== newEmbArray.length) continue;
-
-                // Compute Dot Product (Cosine Similarity since vectors are normalized)
-                let dotProduct = 0;
-                for (let i = 0; i < newEmbArray.length; i++) {
-                  dotProduct += newEmbArray[i] * extEmbArray[i];
-                }
-
-                // Threshold 0.45 (Strict match for auto-inheritance of clusterId)
-                if (dotProduct > 0.45 && dotProduct > maxSimilarity) {
-                  maxSimilarity = dotProduct;
-                  bestClusterId = ext.clusterId;
-                }
-              }
-
-              if (bestClusterId) {
-                assignedClusterId = bestClusterId;
-              }
-            }
-
-            return {
-              photoId,
-              eventId,
-              photographerId,
-              faceIndex: f.faceIndex,
-              bboxX: f.bbox.x,
-              bboxY: f.bbox.y,
-              bboxW: f.bbox.w,
-              bboxH: f.bbox.h,
-              confidence: f.confidence,
-              embedding: f.embedding,
-              clusterId: assignedClusterId,
-            };
+        if (result && result.faces) {
+          await this.completePhotoFaceWebhook({
+            eventId,
+            photographerId,
+            photoId,
+            faces: result.faces,
+            secretKey
           });
-
-          // Generate raw insert SQL for face embeddings to support Unsupported vector(512) type
-          const values = faceData.map(f => {
-            const vectorStr = `[${f.embedding.join(',')}]`;
-            const clusterIdVal = f.clusterId ? `'${f.clusterId}'` : 'NULL';
-            return `('${uuidv4()}', '${f.photoId}', '${f.eventId}', '${f.photographerId}', ${f.faceIndex}, ${f.bboxX}, ${f.bboxY}, ${f.bboxW}, ${f.bboxH}, ${f.confidence}, '${vectorStr}'::vector, ${clusterIdVal})`;
-          }).join(',');
-
-          await this.prisma.$executeRawUnsafe(`
-            INSERT INTO face_embeddings ("id", "photoId", "eventId", "photographerId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding", "clusterId")
-            VALUES ${values}
-          `);
+        } else if (result && result.status === 'QUEUED') {
+          this.logger.log(`[PhotoFaceIndexing] Photo ${photoId} queued in Modal worker. Result will arrive via Webhook.`);
         }
-
+      } else {
+        const errText = await response.text();
+        this.logger.error(`FastAPI returned non-200 status for photo ${photoId}: ${response.status} - ${errText}`);
         await this.prisma.photo.update({
           where: { id: photoId },
           data: {
             status: 'READY',
-            faceScanStatus: 'READY',
-            hasFaces,
-            faceCount,
-            r2KeyThumb: thumbKey,
-          },
-        });
-
-        // Auto-backup to Google Drive if enabled (non-blocking)
-        this.triggerAutoBackupIfEnabled(photographerId, photoId).catch(err =>
-          console.error('[AutoBackup] Photo trigger failed:', err)
-        );
-
-        await this.updateBatchProgress(uploadBatchId, true);
-      } else {
-        const errText = await response.text();
-        console.error(`FastAPI returned non-200 status for photo ${photoId}: ${response.status} - ${errText}`);
-        await this.prisma.photo.update({
-          where: { id: photoId },
-          data: {
-            status: 'FAILED',
+            faceScanStatus: 'SKIPPED',
             r2KeyThumb: thumbKey,
           }
         });
-
-        await this.updateBatchProgress(uploadBatchId, false);
       }
-    } catch (err) {
-      console.error('[StorageService] FastAPI background face recognition failed:', err);
+
+      // Auto-backup to Google Drive if enabled (non-blocking)
+      this.triggerAutoBackupIfEnabled(photographerId, photoId).catch(err =>
+        console.error('[AutoBackup] Photo trigger failed:', err)
+      );
+
+      await this.updateBatchProgress(uploadBatchId, true);
+    } catch (err: any) {
+      this.logger.error(`[StorageService] FastAPI background face recognition error for ${photoId}: ${err.message}`);
       await this.prisma.photo.update({
         where: { id: photoId },
         data: {
-          status: 'FAILED',
+          status: 'READY',
+          faceScanStatus: 'SKIPPED',
           r2KeyThumb: thumbKey,
         }
-      }).catch(e => console.error('Failed to set FAILED status:', e));
+      }).catch(e => console.error('Failed to update status:', e));
 
       await this.updateBatchProgress(uploadBatchId, false);
     } finally {
@@ -1350,11 +1756,25 @@ export class StorageService implements OnModuleInit {
   }
 
   async getReadUrl(key: string): Promise<string> {
-    const cached = this.urlCache.get(key);
     const now = Date.now();
+    const cached = this.urlCache.get(key);
     if (cached && cached.expiresAt > now + 300000) { // 5 minutes buffer
+      // Refresh recency for LRU ordering
+      this.urlCache.delete(key);
+      this.urlCache.set(key, cached);
       return cached.url;
     }
+
+    // True Bounded LRU Cache: strictly cap memory at 5,000 entries by evicting least recently used items
+    while (this.urlCache.size >= 5000) {
+      const oldestKey = this.urlCache.keys().next().value;
+      if (oldestKey) {
+        this.urlCache.delete(oldestKey);
+      } else {
+        break;
+      }
+    }
+
     const getCommand = new GetObjectCommand({
       Bucket: this.bucketName,
       Key: key,
@@ -1364,52 +1784,98 @@ export class StorageService implements OnModuleInit {
     return url;
   }
 
-  private async extractEmbedding(selfieFile: any): Promise<number[] | null> {
+  async getDownloadUrl(key: string, filename?: string): Promise<string> {
+    const safeFilename = (filename || 'photo.jpg').replace(/["\r\n]/g, '_');
+    const getCommand = new GetObjectCommand({
+      Bucket: this.bucketName,
+      Key: key,
+      ResponseContentDisposition: `attachment; filename="${safeFilename}"`,
+    });
+    return await getSignedUrl(this.s3Client, getCommand, { expiresIn: 3600 }); // 1 hour direct signed download link
+  }
+
+  async getSelfieUploadUrl(filename: string, mimeType: string) {
+    const fileUuid = uuidv4();
+    const cleanFilename = filename.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const objectKey = `temp-selfies/${fileUuid}_${cleanFilename}`;
+
+    const command = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: objectKey,
+      ContentType: mimeType,
+    });
+
+    const uploadUrl = await getSignedUrl(this.s3Client, command, { expiresIn: 300 });
+
+    return {
+      objectKey,
+      uploadUrl,
+    };
+  }
+
+  private async extractEmbeddingFromUrl(r2Key: string): Promise<number[] | null> {
     const faceEngineUrl = process.env.FACE_ENGINE_URL || 'http://localhost:8000';
-    let resizedSelfieBuffer = selfieFile.buffer;
+
+    // 1. Generate a temporary presigned GET URL for the R2 key (valid for 5 mins)
+    let imageUrl = '';
     try {
-      resizedSelfieBuffer = await sharp(selfieFile.buffer)
-        .resize(600)
-        .jpeg({ quality: 85 })
-        .toBuffer();
-    } catch (resizeErr) {
-      console.error('Failed to resize selfie image before face extraction:', resizeErr);
+      const getCommand = new GetObjectCommand({
+        Bucket: this.bucketName,
+        Key: r2Key,
+      });
+      imageUrl = await getSignedUrl(this.s3Client, getCommand, { expiresIn: 300 });
+    } catch (s3Err: any) {
+      this.logger.error(`Failed to generate presigned GET URL for face search: ${s3Err.message}`);
+      return null;
     }
 
-    const formData = new FormData();
-    const blob = new Blob([resizedSelfieBuffer], { type: selfieFile.mimetype || 'image/jpeg' });
-    formData.append('selfie', blob, selfieFile.originalname || 'selfie.jpg');
-
+    // 2. Call Modal API
     try {
-      const response = await fetch(`${faceEngineUrl}/faces/extract`, {
+      const response = await fetch(`${faceEngineUrl.replace(/\/$/, '')}/faces/extract-url`, {
         method: 'POST',
         headers: {
+          'Content-Type': 'application/json',
           'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
         },
-        body: formData,
+        body: JSON.stringify({ imageUrl }),
+        signal: AbortSignal.timeout(40000)
       });
 
       if (!response.ok) {
         const errBody = await response.text();
-        console.error(`[StorageService] FastAPI extract failed: status=${response.status}, body=${errBody}`);
+        this.logger.error(`[StorageService] FastAPI extract-url failed: status=${response.status}, body=${errBody}`);
         return null;
       }
 
       const result = await response.json();
+
+      // 3. Delete the temp selfie from R2 bucket in the background
+      this.s3Client.send(new DeleteObjectCommand({
+        Bucket: this.bucketName,
+        Key: r2Key,
+      })).catch((delErr) => {
+        this.logger.error(`Failed to delete temp selfie ${r2Key} from R2: ${delErr.message}`);
+      });
+
       if (result.faceCount > 0 && result.embedding) {
         return result.embedding;
       }
       return null;
-    } catch (err) {
-      console.error('[StorageService] FastAPI background face extraction failed:', err);
+    } catch (err: any) {
+      this.logger.error('[StorageService] FastAPI background face extraction from URL failed:', err.message);
+      // Clean up the file anyway
+      this.s3Client.send(new DeleteObjectCommand({
+        Bucket: this.bucketName,
+        Key: r2Key,
+      })).catch(() => { });
       return null;
     }
   }
 
-  async searchFace(photographerId: string, selfieFile: any, eventId?: string) {
-    if (!selfieFile) return [];
+  async searchFace(photographerId: string, r2Key: string, eventId?: string) {
+    if (!r2Key) return [];
 
-    const queryEmbedding = await this.extractEmbedding(selfieFile);
+    const queryEmbedding = await this.extractEmbeddingFromUrl(r2Key);
     if (!queryEmbedding || queryEmbedding.length === 0) {
       return [];
     }
@@ -1515,8 +1981,32 @@ export class StorageService implements OnModuleInit {
     return events;
   }
 
-  async searchFacePublic(selfieFile: any, eventId?: string, passcode?: string) {
-    if (!selfieFile) return [];
+  async checkFaceSearchRateLimit(ip: string): Promise<void> {
+    const key = `ratelimit:face-search:${ip}`;
+    try {
+      const attempts = await this.redis.incr(key);
+      if (attempts === 1) {
+        await this.redis.expire(key, 60); // 1 minute sliding window
+      }
+      if (attempts > 10) {
+        throw new HttpException(
+          'Too many face search requests from this IP. Please wait 1 minute before searching again.',
+          HttpStatus.TOO_MANY_REQUESTS
+        );
+      }
+    } catch (err: any) {
+      if (err instanceof HttpException) throw err;
+      // Fail-open if Redis encounters unexpected error
+    }
+  }
+
+  async searchFacePublic(r2Key: string, eventId?: string, passcode?: string, clientIp?: string) {
+    if (!r2Key) return [];
+
+    // Enforce 10 searches/min rate limit per client IP to protect Modal GPU costs
+    if (clientIp) {
+      await this.checkFaceSearchRateLimit(clientIp);
+    }
 
     let eventIdsFilter: string[] = [];
 
@@ -1556,7 +2046,7 @@ export class StorageService implements OnModuleInit {
       return [];
     }
 
-    const queryEmbedding = await this.extractEmbedding(selfieFile);
+    const queryEmbedding = await this.extractEmbeddingFromUrl(r2Key);
     if (!queryEmbedding || queryEmbedding.length === 0) {
       return [];
     }
@@ -1590,15 +2080,32 @@ export class StorageService implements OnModuleInit {
         status: 'READY',
         isDeleted: false,
       },
-      include: {
-        event: { include: { photographer: true } },
+      select: {
+        id: true,
+        eventId: true,
+        filenameOriginal: true,
+        r2KeyOriginal: true,
+        r2KeyThumb: true,
+        r2KeyPreview: true,
+        fileSize: true,
+        hasFaces: true,
+        type: true,
+        duration: true,
+        event: {
+          select: {
+            id: true,
+            slug: true,
+            allowDownload: true,
+            watermarkEnabled: true,
+          }
+        }
       },
     });
 
     return Promise.all(
       matchedPhotos.map(async (photo) => {
         const event = photo.event;
-        const isWatermarked = event.watermarkEnabled;
+        const isWatermarked = event?.watermarkEnabled;
 
         let url = '';
         let thumbUrl = '';
@@ -1610,7 +2117,12 @@ export class StorageService implements OnModuleInit {
           url = `${apiBase}/api/public/events/${event.slug}/photos/${photo.id}/view`;
           thumbUrl = `${apiBase}/api/public/events/${event.slug}/photos/${photo.id}/view?thumb=true`;
         } else {
-          url = await this.getReadUrl(photo.r2KeyOriginal);
+          if (photo.type === 'VIDEO') {
+            url = await this.getReadUrl(photo.r2KeyOriginal);
+          } else {
+            const fullKey = photo.r2KeyPreview || photo.r2KeyThumb || photo.r2KeyOriginal;
+            url = await this.getReadUrl(fullKey);
+          }
           thumbUrl = photo.r2KeyThumb ? await this.getReadUrl(photo.r2KeyThumb) : url;
         }
 
@@ -1620,7 +2132,7 @@ export class StorageService implements OnModuleInit {
           url,
           thumbUrl,
           tags: photo.hasFaces ? ['face'] : ['general'],
-          allowDownload: photo.event.allowDownload,
+          allowDownload: event ? event.allowDownload : true,
           eventId: photo.eventId,
           type: photo.type || 'IMAGE',
           duration: photo.duration || 0,
@@ -1662,13 +2174,18 @@ export class StorageService implements OnModuleInit {
           await this.s3Client.send(thumbCommand);
         }
 
-        // 3. Delete generated face-scan preview from R2 if it exists
-        const facePreviewKey = `${photographerId}/events/${photo.eventId}/previews/${photoId}.jpg`;
-        const previewCommand = new DeleteObjectCommand({
+        // 3. Delete generated HD preview from R2 if it exists
+        const previewKey = photo.r2KeyPreview || (photo.r2KeyOriginal ? photo.r2KeyOriginal.replace('/photos/', '/previews/').replace('/Photos/', '/previews/') : null);
+        if (previewKey) {
+          await this.s3Client.send(new DeleteObjectCommand({
+            Bucket: this.bucketName,
+            Key: previewKey
+          })).catch(() => { });
+        }
+        await this.s3Client.send(new DeleteObjectCommand({
           Bucket: this.bucketName,
-          Key: facePreviewKey
-        });
-        await this.s3Client.send(previewCommand).catch(() => { });
+          Key: `${photographerId}/events/${photo.eventId}/previews/${photoId}.jpg`
+        })).catch(() => { });
       }
     } catch (err) {
       console.error('Failed to delete photo or thumbnail from R2:', err);
@@ -1681,29 +2198,26 @@ export class StorageService implements OnModuleInit {
 
     // Recalculate actual storage immediately to prevent size discrepancy
     await this.recalculateStorage(photographerId);
+    await this.invalidateEventPhotosCache(photographerId, photo.eventId);
 
     return deleteResult;
   }
 
 
   async getGuestUploadLimitsStatus(slug: string) {
-    const cacheKey = `cache:public:event:limits:${slug}`;
-    try {
-      const cached = await this.redis.get(cacheKey);
-      if (cached) {
-        return JSON.parse(cached);
-      }
-    } catch (err) {
-      this.logger.error(`[Limits Cache] Redis read failed:`, err.message);
-    }
-
     const event = await this.prisma.event.findUnique({
       where: { slug },
-      select: {
-        id: true,
-        allowGuestUploads: true,
-        maxGuestUploadFiles: true,
-        maxGuestUploadStorage: true
+      include: {
+        photographer: {
+          include: {
+            subscriptions: {
+              where: { status: 'ACTIVE' },
+              orderBy: { startsAt: 'desc' },
+              take: 1,
+              include: { package: true }
+            }
+          }
+        }
       }
     });
 
@@ -1711,31 +2225,43 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Event not found');
     }
 
+    const photographer = event.photographer;
+    const activeSub = photographer?.subscriptions?.[0];
+    const pkgMb = activeSub?.package?.maxEventsStorageMb;
+    const limitBytes = (pkgMb !== undefined && pkgMb !== null)
+      ? BigInt(pkgMb) * BigInt(1024 * 1024)
+      : (activeSub?.limitEventsBytes ?? activeSub?.limitBytes ?? BigInt(5000 * 1024 * 1024));
+
+    const eventsUsedAgg = await this.prisma.photo.aggregate({
+      where: { photographerId: photographer.id, status: { in: ['READY', 'UPLOADING', 'PENDING_APPROVAL'] }, isDeleted: false },
+      _sum: { fileSize: true },
+    });
+    const eventsUsedBytes = eventsUsedAgg._sum.fileSize
+      ? BigInt(eventsUsedAgg._sum.fileSize.toString())
+      : BigInt(0);
+
+    const remainingPhotographerBytes = limitBytes > eventsUsedBytes ? limitBytes - eventsUsedBytes : BigInt(0);
+
     const guestPhotosStats = await this.prisma.photo.aggregate({
-      where: { eventId: event.id, isGuestUpload: true },
+      where: { eventId: event.id, isGuestUpload: true, isDeleted: false },
       _count: { id: true },
       _sum: { fileSize: true }
     });
 
     const maxFiles = event.maxGuestUploadFiles || 0;
-    const maxStorage = event.maxGuestUploadStorage ? event.maxGuestUploadStorage.toString() : '0';
+    const eventGuestMaxStorage = event.maxGuestUploadStorage || BigInt(0);
+    const effectiveMaxStorage = eventGuestMaxStorage < remainingPhotographerBytes ? eventGuestMaxStorage : remainingPhotographerBytes;
 
-    const result = {
+    return {
       allowGuestUploads: event.allowGuestUploads,
       maxGuestUploadFiles: maxFiles,
-      maxGuestUploadStorage: maxStorage,
+      maxGuestUploadStorage: effectiveMaxStorage.toString(),
+      remainingPhotographerBytes: remainingPhotographerBytes.toString(),
       currentGuestCount: guestPhotosStats._count.id || 0,
       currentGuestSize: guestPhotosStats._sum.fileSize ? guestPhotosStats._sum.fileSize.toString() : '0'
     };
-
-    try {
-      await this.redis.set(cacheKey, JSON.stringify(result), 'EX', 600); // 10 minutes cache TTL
-    } catch (err) {
-      this.logger.error(`[Limits Cache] Redis write failed:`, err.message);
-    }
-
-    return result;
   }
+
   async calculateStorageFromR2(userIdOrPhotographerId: string): Promise<bigint> {
     const photographer = await this.prisma.photographer.findFirst({
       where: {
@@ -1823,6 +2349,19 @@ export class StorageService implements OnModuleInit {
       }
     });
 
+    // 2.5 Portfolio Reels
+    const portfolioReels = await this.prisma.portfolioReel.findMany({
+      where: { photographerId },
+      select: { r2Key: true }
+    });
+    portfolioReels.forEach(r => {
+      if (r.r2Key) {
+        dbKeysSet.add(r.r2Key);
+        const basename = r.r2Key.split('/').pop();
+        if (basename) dbKeysSet.add(basename);
+      }
+    });
+
     // 3. Photographer Settings (Branding, Watermarks, Hero, About, Reels, Business Cards)
     const photographer = await this.prisma.photographer.findUnique({
       where: { id: photographerId },
@@ -1849,20 +2388,9 @@ export class StorageService implements OnModuleInit {
 
       addKey(photographer.watermarkImageKey, 'branding');
       addKey(photographer.studioLogoKey, 'branding');
-      addKey(photographer.studioHeroBannerKey, 'branding');
-      addKey(photographer.portfolioHeroImageKey, 'portfolio');
       addKey(photographer.portfolioAboutImageKey, 'portfolio');
       addKey(photographer.portfolioVideoUrl, 'portfolio');
       addKey(photographer.portfolioBtsUrl, 'portfolio');
-
-      if (photographer.portfolioReels && Array.isArray(photographer.portfolioReels)) {
-        (photographer.portfolioReels as any[]).forEach(reel => {
-          if (reel.r2Key) addKey(reel.r2Key, 'portfolio');
-          if (reel.key) addKey(reel.key, 'portfolio');
-          if (reel.url) addKey(reel.url, 'portfolio');
-          if (reel.videoUrl) addKey(reel.videoUrl, 'portfolio');
-        });
-      }
 
       if (photographer.businessCard) {
         const bc = photographer.businessCard as any;
@@ -1891,77 +2419,47 @@ export class StorageService implements OnModuleInit {
     }
 
     const photographerId = photographer.id;
-    let eventsBytes = BigInt(0);
-    let portfolioBytes = BigInt(0);
-    let brandingBytes = BigInt(0);
-    let wasteBytes = BigInt(0);
-    let wastePhotosSize = BigInt(0);
-    let wasteVideosSize = BigInt(0);
-    let wastePhotosCount = 0;
-    let wasteVideosCount = 0;
 
-    // Retrieve full set of active database keys across events, portfolio, branding, and digital cards
-    const dbKeysSet = await this.getAllPhotographerActiveDbKeys(photographerId);
-
-    // Scan all objects under photographer prefix directly from R2 to classify them
-    let isTruncated = true;
-    let continuationToken: string | undefined = undefined;
-    while (isTruncated) {
-      try {
-        const command = new ListObjectsV2Command({
-          Bucket: this.bucketName,
-          Prefix: `${photographerId}/`,
-          ContinuationToken: continuationToken,
-        });
-        const response: any = await this.s3Client.send(command);
-        if (response.Contents) {
-          for (const item of response.Contents) {
-            const key = item.Key || '';
-            const size = BigInt(item.Size || 0);
-
-            if (key.includes('/temp_frames/')) continue; // Skip temporary scanning frames
-
-            const basename = key.split('/').pop() || '';
-            const isLinked = dbKeysSet.has(key) || dbKeysSet.has(basename);
-
-            if (isLinked) {
-              if (key.includes('/portfolio/')) {
-                portfolioBytes += size;
-              } else if (key.includes('/branding/') || key.includes('/business-cards/')) {
-                brandingBytes += size;
-              } else {
-                eventsBytes += size;
-              }
-            } else {
-              // File exists in R2 but is NOT linked in DB (Orphaned / Waste across Events, Portfolio & Branding)
-              wasteBytes += size;
-              const isVideo = key.match(/\.(mp4|mkv|mov|webm|avi)$/i);
-              if (isVideo) {
-                wasteVideosSize += size;
-                wasteVideosCount++;
-              } else {
-                wastePhotosSize += size;
-                wastePhotosCount++;
-              }
-            }
-          }
-        }
-        isTruncated = response.IsTruncated || false;
-        continuationToken = response.NextContinuationToken;
-      } catch (err) {
-        isTruncated = false;
+    const cacheKey = `cache:photographer:${photographerId}:storage-breakdown`;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
+        return JSON.parse(cached);
       }
+    } catch (err: any) {
+      this.logger.error(`[StorageBreakdown Cache] Redis read failed: ${err.message}`);
     }
 
-    // Get Trash Bytes from DB
-    const trashSum = await this.prisma.photo.aggregate({
-      where: { photographerId, isDeleted: true },
-      _sum: { fileSize: true },
-    });
-    const trashBytes = trashSum._sum.fileSize ? BigInt(trashSum._sum.fileSize.toString()) : BigInt(0);
+    // Instant PostgreSQL aggregation queries (1000x faster than live R2 network scanning)
+    const [livePhotosSum, trashSum] = await Promise.all([
+      this.prisma.photo.aggregate({
+        where: { photographerId, isDeleted: false },
+        _sum: { fileSize: true, thumbSizeBytes: true, previewSizeBytes: true },
+      }),
+      this.prisma.photo.aggregate({
+        where: { photographerId, isDeleted: true },
+        _sum: { fileSize: true, thumbSizeBytes: true, previewSizeBytes: true },
+      }),
+    ]);
 
-    const liveEventsBytes = eventsBytes > trashBytes ? eventsBytes - trashBytes : eventsBytes;
-    const totalBytes = eventsBytes + portfolioBytes + brandingBytes;
+    const liveEventsBytes =
+      BigInt(livePhotosSum._sum.fileSize ? livePhotosSum._sum.fileSize.toString() : '0') +
+      BigInt(livePhotosSum._sum.thumbSizeBytes ? livePhotosSum._sum.thumbSizeBytes.toString() : '0') +
+      BigInt(livePhotosSum._sum.previewSizeBytes ? livePhotosSum._sum.previewSizeBytes.toString() : '0');
+
+    const trashBytes =
+      BigInt(trashSum._sum.fileSize ? trashSum._sum.fileSize.toString() : '0') +
+      BigInt(trashSum._sum.thumbSizeBytes ? trashSum._sum.thumbSizeBytes.toString() : '0') +
+      BigInt(trashSum._sum.previewSizeBytes ? trashSum._sum.previewSizeBytes.toString() : '0');
+
+    const portfolioUsed = await this.getPortfolioStorageUsed(photographerId);
+    const portfolioBytes = BigInt(portfolioUsed || 0);
+
+    let brandingBytes = BigInt(0);
+    if (photographer.studioLogoKey) brandingBytes += BigInt(200 * 1024);
+    if (photographer.watermarkImageKey) brandingBytes += BigInt(200 * 1024);
+
+    const totalBytes = liveEventsBytes + trashBytes + portfolioBytes + brandingBytes;
 
     // Sync valid live bytes to DB asynchronously to update sidebar widget
     this.prisma.photographer.update({
@@ -1985,16 +2483,16 @@ export class StorageService implements OnModuleInit {
     const limitEventsBytes = maxEventsStorageMb * 1024 * 1024;
     const limitPortfolioBytes = isPortfolioEnabled ? maxPortfolioStorageMb * 1024 * 1024 : 0;
 
-    return {
+    const result = {
       eventsBytes: Number(liveEventsBytes),
       portfolioBytes: Number(portfolioBytes),
       brandingBytes: Number(brandingBytes),
       trashBytes: Number(trashBytes),
-      wasteBytes: Number(wasteBytes),
-      wastePhotosSize: Number(wastePhotosSize),
-      wasteVideosSize: Number(wasteVideosSize),
-      wastePhotosCount,
-      wasteVideosCount,
+      wasteBytes: 0,
+      wastePhotosSize: 0,
+      wasteVideosSize: 0,
+      wastePhotosCount: 0,
+      wasteVideosCount: 0,
       totalBytes: Number(totalBytes),
       limitEventsBytes,
       limitPortfolioBytes,
@@ -2004,8 +2502,39 @@ export class StorageService implements OnModuleInit {
       featureCustomBranding,
       isPortfolioEnabled,
     };
+
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(result), 'EX', 1800); // 30 mins TTL
+    } catch (err: any) {
+      this.logger.error(`[StorageBreakdown Cache] Redis write failed: ${err.message}`);
+    }
+
+    return result;
   }
 
+
+  async invalidateStorageBreakdownCache(photographerId: string) {
+    try {
+      await this.redis.del(`cache:photographer:${photographerId}:storage-breakdown`);
+      this.logger.log(`[StorageBreakdown Cache] Cleared storage breakdown cache for photographer: ${photographerId}`);
+    } catch (err: any) {
+      this.logger.error(`[StorageBreakdown Cache] Invalidation failed: ${err.message}`);
+    }
+  }
+
+  async invalidateEventPhotosCache(photographerId: string, eventIds: string | string[]) {
+    try {
+      const idList = (Array.isArray(eventIds) ? eventIds : [eventIds]).filter(Boolean);
+      const keys = [`cache:events:list:${photographerId}`];
+      for (const eid of idList) {
+        keys.push(`cache:event:detail:${eid}`);
+      }
+      await this.redis.del(...keys);
+      this.logger.log(`[Cache Invalidate] Cleared event photo caches for event(s): ${idList.join(', ')}`);
+    } catch (err: any) {
+      this.logger.error(`[Cache Invalidate] Failed: ${err.message}`);
+    }
+  }
 
   // Soft delete a single photo or video (Move to Trash)
   async softDeletePhoto(photographerId: string, photoId: string) {
@@ -2022,15 +2551,27 @@ export class StorageService implements OnModuleInit {
       data: { isDeleted: true, deletedAt: new Date() },
     });
 
+    await this.invalidateStorageBreakdownCache(photographerId);
+    await this.invalidateEventPhotosCache(photographerId, photo.eventId);
+
     return { success: true, message: 'Item moved to trash' };
   }
 
   // Soft delete multiple photos or videos (Batch Move to Trash)
   async batchSoftDeletePhotos(photographerId: string, photoIds: string[]) {
+    const photos = await this.prisma.photo.findMany({
+      where: { id: { in: photoIds }, photographerId },
+      select: { eventId: true }
+    });
+    const eventIds = Array.from(new Set(photos.map(p => p.eventId)));
+
     await this.prisma.photo.updateMany({
       where: { id: { in: photoIds }, photographerId },
       data: { isDeleted: true, deletedAt: new Date() },
     });
+
+    await this.invalidateStorageBreakdownCache(photographerId);
+    await this.invalidateEventPhotosCache(photographerId, eventIds);
 
     return { success: true, count: photoIds.length };
   }
@@ -2115,6 +2656,9 @@ export class StorageService implements OnModuleInit {
       },
     });
 
+    await this.invalidateStorageBreakdownCache(photographerId);
+    await this.invalidateEventPhotosCache(photographerId, [photo.eventId, finalEventId]);
+
     return { success: true, message: 'Item restored successfully' };
   }
 
@@ -2189,8 +2733,9 @@ export class StorageService implements OnModuleInit {
 
   // Helper to recalculate actual live storage usage directly from Cloudflare R2 bucket to prevent drift
   async recalculateStorage(photographerId: string): Promise<bigint> {
+    await this.invalidateStorageBreakdownCache(photographerId);
     const breakdown = await this.getStorageBreakdown(photographerId);
-    const actualBytes = BigInt(breakdown.eventsBytes + breakdown.portfolioBytes + breakdown.brandingBytes);
+    const actualBytes = BigInt(breakdown.eventsBytes + breakdown.trashBytes + breakdown.portfolioBytes + breakdown.brandingBytes);
 
     // Update photographer record in database
     await this.prisma.photographer.update({
@@ -2224,11 +2769,51 @@ export class StorageService implements OnModuleInit {
 
     if (photos.length === 0) return { deleted: 0 };
 
-    // Collect all R2 keys to delete
+    // Collect candidate R2 keys for deletion
+    const candidateOriginalKeys = new Set<string>();
+    const candidateThumbKeys = new Set<string>();
+    const candidatePreviewKeys = new Set<string>();
+
+    for (const photo of photos) {
+      if (photo.r2KeyOriginal) candidateOriginalKeys.add(photo.r2KeyOriginal);
+      if (photo.r2KeyThumb) candidateThumbKeys.add(photo.r2KeyThumb);
+      if (photo.r2KeyPreview) candidatePreviewKeys.add(photo.r2KeyPreview);
+    }
+
+    // Find all other photo records in the DB that are NOT being deleted
+    // to check if any of these candidate keys are still referenced in another event
+    const remainingPhotos = await this.prisma.photo.findMany({
+      where: {
+        id: { notIn: photoIds },
+        OR: [
+          { r2KeyOriginal: { in: Array.from(candidateOriginalKeys) } },
+          { r2KeyThumb: { in: Array.from(candidateThumbKeys) } },
+          { r2KeyPreview: { in: Array.from(candidatePreviewKeys) } }
+        ]
+      },
+      select: { r2KeyOriginal: true, r2KeyThumb: true, r2KeyPreview: true }
+    });
+
+    const activeReferencedKeys = new Set<string>();
+    for (const rp of remainingPhotos) {
+      if (rp.r2KeyOriginal) activeReferencedKeys.add(rp.r2KeyOriginal);
+      if (rp.r2KeyThumb) activeReferencedKeys.add(rp.r2KeyThumb);
+      if (rp.r2KeyPreview) activeReferencedKeys.add(rp.r2KeyPreview);
+    }
+
+    // Only delete physical files from R2 if no other photo record references them!
     const keysToDelete: string[] = [];
     for (const photo of photos) {
-      if (photo.r2KeyOriginal) keysToDelete.push(photo.r2KeyOriginal);
-      if (photo.r2KeyThumb) keysToDelete.push(photo.r2KeyThumb);
+      if (photo.r2KeyOriginal && !activeReferencedKeys.has(photo.r2KeyOriginal)) {
+        keysToDelete.push(photo.r2KeyOriginal);
+        keysToDelete.push(photo.r2KeyOriginal.replace('/photos/', '/previews/').replace('/Photos/', '/previews/'));
+      }
+      if (photo.r2KeyThumb && !activeReferencedKeys.has(photo.r2KeyThumb)) {
+        keysToDelete.push(photo.r2KeyThumb);
+      }
+      if (photo.r2KeyPreview && !activeReferencedKeys.has(photo.r2KeyPreview)) {
+        keysToDelete.push(photo.r2KeyPreview);
+      }
       keysToDelete.push(`${photographerId}/events/${photo.eventId}/previews/${photo.id}.jpg`);
     }
 
@@ -2260,6 +2845,10 @@ export class StorageService implements OnModuleInit {
     this.recalculateStorage(photographerId).catch(err =>
       console.error('[batchDeletePhotos] Recalculate storage error:', err)
     );
+
+    await this.invalidateStorageBreakdownCache(photographerId);
+    const eventIds = Array.from(new Set(photos.map(p => p.eventId)));
+    await this.invalidateEventPhotosCache(photographerId, eventIds);
 
     return { deleted: result.count };
   }
@@ -2309,6 +2898,11 @@ export class StorageService implements OnModuleInit {
       where: { photoId: { in: validPhotoIds }, photographerId },
       data: faceEmbedData
     });
+
+    await this.invalidateStorageBreakdownCache(photographerId);
+    const restoreEventIds = Array.from(new Set(photos.map(p => p.eventId)));
+    if (targetEventId) restoreEventIds.push(targetEventId);
+    await this.invalidateEventPhotosCache(photographerId, restoreEventIds);
 
     return { restored: result.count };
   }
@@ -2377,6 +2971,8 @@ export class StorageService implements OnModuleInit {
     // Recalculate storage size
     await this.recalculateStorage(photographerId);
 
+    await this.invalidateStorageBreakdownCache(photographerId);
+
     return { clearedCount: deletedCount };
   }
 
@@ -2389,6 +2985,12 @@ export class StorageService implements OnModuleInit {
     if (!event) {
       throw new NotFoundException('Target event not found');
     }
+
+    const photos = await this.prisma.photo.findMany({
+      where: { id: { in: photoIds }, photographerId },
+      select: { eventId: true }
+    });
+    const sourceEventIds = Array.from(new Set(photos.map(p => p.eventId)));
 
     const updatePhotosResult = await this.prisma.photo.updateMany({
       where: {
@@ -2411,6 +3013,13 @@ export class StorageService implements OnModuleInit {
       }
     });
 
+    await this.invalidateStorageBreakdownCache(photographerId);
+    await this.invalidateEventCache(targetEventId);
+    for (const srcId of sourceEventIds) {
+      await this.invalidateEventCache(srcId);
+    }
+    await this.invalidateEventPhotosCache(photographerId, [targetEventId, ...sourceEventIds]);
+
     return updatePhotosResult;
   }
 
@@ -2429,23 +3038,46 @@ export class StorageService implements OnModuleInit {
       }
     });
 
+    if (photosToCopy.length === 0) {
+      return { success: true, count: 0 };
+    }
+
     const newPhotosData: any[] = [];
+    const photoIdMap = new Map<string, string>(); // oldPhotoId -> newPhotoId
     let sizeAccumulator = BigInt(0);
 
     for (const p of photosToCopy) {
+      const newPhotoId = uuidv4();
+      photoIdMap.set(p.id, newPhotoId);
+
+      const thumbSize = p.thumbSizeBytes || BigInt(0);
+      const previewSize = p.previewSizeBytes || BigInt(0);
+      const originalSize = p.fileSize || BigInt(0);
+
       newPhotosData.push({
+        id: newPhotoId,
         eventId: targetEventId,
         photographerId,
         filenameOriginal: p.filenameOriginal,
         filenameStored: p.filenameStored,
         r2KeyOriginal: p.r2KeyOriginal,
+        r2KeyPreview: p.r2KeyPreview,
+        r2KeyThumb: p.r2KeyThumb,
         mimeType: p.mimeType,
-        fileSize: p.fileSize,
+        fileSize: originalSize,
+        thumbSizeBytes: thumbSize,
+        previewSizeBytes: previewSize,
         status: p.status,
+        thumbnailStatus: p.thumbnailStatus || 'READY',
+        faceScanStatus: p.faceScanStatus || 'READY',
+        type: p.type || 'IMAGE',
+        duration: p.duration || 0,
         hasFaces: p.hasFaces,
         faceCount: p.faceCount
       });
-      sizeAccumulator += p.fileSize;
+
+      // Total storage for this photo = Original + Thumb + Preview
+      sizeAccumulator += (originalSize + thumbSize + previewSize);
     }
 
     const photographer = await this.prisma.photographer.findUnique({
@@ -2475,6 +3107,48 @@ export class StorageService implements OnModuleInit {
       data: newPhotosData
     });
 
+    // Duplicate Face Embeddings for all newly copied photos so AI Face Search works immediately
+    try {
+      interface RawCopiedEmbedding {
+        photoId: string;
+        faceIndex: number;
+        bboxX: number;
+        bboxY: number;
+        bboxW: number;
+        bboxH: number;
+        confidence: number;
+        embeddingStr: string;
+        timestamp: number | null;
+      }
+      const oldPhotoIds = photosToCopy.map(p => p.id);
+      const oldEmbeddings = await this.prisma.$queryRaw<RawCopiedEmbedding[]>`
+        SELECT "photoId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding"::text as "embeddingStr", "timestamp"
+        FROM face_embeddings
+        WHERE "photoId" IN (${Prisma.join(oldPhotoIds)})
+      `.catch(() => [] as RawCopiedEmbedding[]);
+
+      if (oldEmbeddings && oldEmbeddings.length > 0) {
+        const values = oldEmbeddings
+          .filter((e: RawCopiedEmbedding) => photoIdMap.has(e.photoId))
+          .map(e => {
+            const newPhotoId = photoIdMap.get(e.photoId)!;
+            const newId = uuidv4();
+            const tsVal = e.timestamp !== null && e.timestamp !== undefined ? e.timestamp : 0;
+            return `('${newId}', '${newPhotoId}', '${targetEventId}', '${photographerId}', ${e.faceIndex}, ${e.bboxX}, ${e.bboxY}, ${e.bboxW}, ${e.bboxH}, ${e.confidence}, '${e.embeddingStr}'::vector, NULL, ${tsVal})`;
+          })
+          .join(',');
+
+        if (values.length > 0) {
+          await this.prisma.$executeRawUnsafe(`
+            INSERT INTO face_embeddings ("id", "photoId", "eventId", "photographerId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding", "clusterId", "timestamp")
+            VALUES ${values}
+          `);
+        }
+      }
+    } catch (embErr: any) {
+      this.logger.error(`[batchCopy] Failed to duplicate face embeddings for copied photos: ${embErr.message}`);
+    }
+
     await this.prisma.photographer.update({
       where: { id: photographerId },
       data: {
@@ -2499,6 +3173,11 @@ export class StorageService implements OnModuleInit {
         }
       });
     }
+
+    // Invalidate Storage Breakdown Cache so real-time storage updates instantly!
+    await this.invalidateStorageBreakdownCache(photographerId);
+    await this.invalidateEventCache(targetEventId);
+    await this.invalidateEventPhotosCache(photographerId, targetEventId);
 
     return { success: true, count: newPhotosData.length };
   }
@@ -2690,6 +3369,8 @@ export class StorageService implements OnModuleInit {
     let hasGuestUpload = false;
     let hasClientSelection = false;
     let hasAiFaceSearch = false;
+    let hasWatermark = false;
+    let hasBulkDownload = false;
     if (event.photographer) {
       const activeSub = await this.prisma.subscription.findFirst({
         where: { photographerId: event.photographer.id, status: 'ACTIVE' },
@@ -2700,24 +3381,28 @@ export class StorageService implements OnModuleInit {
       hasGuestUpload = activeSub?.package ? activeSub.package.featureGuestUpload : false;
       hasClientSelection = activeSub?.package ? activeSub.package.featureClientSelection : false;
       hasAiFaceSearch = activeSub?.package ? activeSub.package.featureAiPhotoSearch : false;
+      hasWatermark = activeSub?.package ? activeSub.package.featureWatermark : false;
+      hasBulkDownload = activeSub?.package ? activeSub.package.featureBulkDownload : false;
     }
+
+    const watermarkEnabled = hasWatermark ? event.watermarkEnabled : false;
 
     const result = {
       id: event.id,
       title: event.title,
       slug: event.slug,
-      eventType: event.eventType,
-      description: event.description,
       eventDate: event.eventDate,
       location: event.location,
       allowDownload: event.allowDownload,
-      allowFavorites: hasClientSelection ? event.allowFavorites : false,
-      faceSearchEnabled: hasAiFaceSearch ? event.faceSearchEnabled : false,
+      allowBulkDownload: hasBulkDownload,
+      allowFavorites: hasClientSelection ? Boolean(event.allowFavorites) : false,
+      faceSearchEnabled: hasAiFaceSearch ? Boolean(event.faceSearchEnabled) : false,
+      watermarkEnabled,
       maxFavorites: event.maxFavorites,
       requiresPasscode,
       themeKey: event.themeKey,
       applyThemeToClientGallery: event.applyThemeToClientGallery,
-      allowGuestUploads: hasGuestUpload ? event.allowGuestUploads : false,
+      allowGuestUploads: hasGuestUpload ? Boolean(event.allowGuestUploads) : false,
       maxGuestUploadFiles: event.maxGuestUploadFiles || 0,
       maxGuestUploadStorage: event.maxGuestUploadStorage ? event.maxGuestUploadStorage.toString() : '0',
       photosCount: event._count.photos,
@@ -2726,18 +3411,22 @@ export class StorageService implements OnModuleInit {
         id: event.photographer.id,
         studioLogoKey: hasBranding ? event.photographer.studioLogoKey : null,
         studioSubdomain: hasBranding ? event.photographer.studioSubdomain : null,
-        primaryColor: hasBranding ? event.photographer.primaryColor : '#eab308',
-        secondaryColor: hasBranding ? event.photographer.secondaryColor : '#12131a',
         instagramUrl: hasBranding ? event.photographer.instagramUrl : null,
         facebookUrl: hasBranding ? event.photographer.facebookUrl : null,
         whatsappPhone: hasBranding ? event.photographer.whatsappPhone : null,
-        studioHeroBannerKey: hasBranding ? event.photographer.studioHeroBannerKey : null,
-        studioFontFamily: hasBranding ? event.photographer.studioFontFamily : null,
         seoTitle: hasBranding ? event.photographer.seoTitle : null,
         seoDescription: hasBranding ? event.photographer.seoDescription : null,
         hidePoweredBy: hasBranding ? event.photographer.hidePoweredBy : false,
         customFooterText: hasBranding ? event.photographer.customFooterText : null,
-        studioName: event.photographer.studioName || 'Studio'
+        studioName: event.photographer.studioName || 'Studio',
+        watermarkType: watermarkEnabled ? event.photographer.watermarkType : 'NONE',
+        watermarkText: watermarkEnabled ? event.photographer.watermarkText : 'PhotosetGo',
+        watermarkPosition: watermarkEnabled ? event.photographer.watermarkPosition : 'CENTER',
+        watermarkOpacity: watermarkEnabled ? event.photographer.watermarkOpacity : 50,
+        watermarkSize: watermarkEnabled ? event.photographer.watermarkSize : 'MEDIUM',
+        watermarkImageUrl: (watermarkEnabled && event.photographer.watermarkImageKey)
+          ? await this.getReadUrl(event.photographer.watermarkImageKey)
+          : null,
       } : null
     };
 
@@ -2750,8 +3439,24 @@ export class StorageService implements OnModuleInit {
     return result;
   }
 
-  async getPublicEventPhotos(slug: string, passcode?: string) {
-    const cacheKey = `cache:public:photos:${slug}:${passcode || 'none'}`;
+  async getPublicEventPhotos(slug: string, passcode?: string, limit?: number, cursor?: string, clientIp?: string) {
+    const ip = clientIp || '127.0.0.1';
+    const lockKey = `lock:passcode:${slug}:${ip}`;
+    const failKey = `fail:passcode:${slug}:${ip}`;
+
+    // 1. Check if IP is currently locked out from this event due to brute-force attempts
+    try {
+      const isLocked = await this.redis.get(lockKey);
+      if (isLocked) {
+        const ttl = await this.redis.ttl(lockKey);
+        const mins = Math.max(1, Math.ceil((ttl > 0 ? ttl : 300) / 60));
+        throw new ForbiddenException(`Too many failed attempts. Access is locked. Please try again after ${mins} minute${mins === 1 ? '' : 's'}.`);
+      }
+    } catch (err: any) {
+      if (err instanceof ForbiddenException) throw err;
+    }
+
+    const cacheKey = `cache:public:photos:${slug}:${passcode || 'none'}:${limit || 'all'}:${cursor || 'start'}`;
     try {
       const cached = await this.redis.get(cacheKey);
       if (cached) return JSON.parse(cached);
@@ -2774,11 +3479,29 @@ export class StorageService implements OnModuleInit {
     const requiresPasscode = event.visibility === 'PRIVATE' || (event.passcode && event.passcode !== '');
     if (requiresPasscode) {
       if (!passcode || passcode !== event.passcode) {
+        // Increment failed attempts counter in Redis with 5-min sliding expiration
+        try {
+          const fails = await this.redis.incr(failKey);
+          if (fails === 1) {
+            await this.redis.expire(failKey, 300); // 5 minutes window
+          }
+          const remaining = Math.max(0, 5 - fails);
+          if (fails >= 5) {
+            await this.redis.set(lockKey, '1', 'EX', 300); // Lockout IP for 5 minutes
+            throw new ForbiddenException('Too many incorrect passcode attempts. Your access has been locked for 5 minutes. Please try again later.');
+          }
+          throw new UnauthorizedException(`Invalid passcode. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`);
+        } catch (err: any) {
+          if (err instanceof ForbiddenException || err instanceof UnauthorizedException) throw err;
+        }
         throw new UnauthorizedException('Invalid event passcode');
+      } else {
+        // Correct passcode supplied: clear any failed counter
+        this.redis.del(failKey).catch(() => { });
       }
     }
 
-    const results = await this.getPublicPhotos(event.id, event.slug);
+    const results = await this.getPublicPhotos(event.id, event.slug, limit, cursor, event);
 
     try {
       await this.redis.set(cacheKey, JSON.stringify(results), 'EX', 600); // 10 minutes cache TTL
@@ -2789,31 +3512,62 @@ export class StorageService implements OnModuleInit {
     return results;
   }
 
-  private async getPublicPhotos(eventId: string, slug: string) {
-    const event = await this.prisma.event.findUnique({
+  async getPublicPhotos(eventId: string, slug: string, limit?: number, cursor?: string, existingEvent?: any) {
+    const event = existingEvent || await this.prisma.event.findUnique({
       where: { id: eventId },
-      include: { photographer: true }
+      select: {
+        id: true,
+        slug: true,
+        allowDownload: true,
+        watermarkEnabled: true,
+      }
     });
 
-    const photos = await this.prisma.photo.findMany({
+    const queryArgs: any = {
       where: { eventId, status: 'READY', isDeleted: false },
-      orderBy: { createdAt: 'desc' }
-    });
+      orderBy: [
+        { createdAt: 'desc' },
+        { id: 'desc' }
+      ],
+      select: {
+        id: true,
+        filenameOriginal: true,
+        r2KeyOriginal: true,
+        r2KeyPreview: true,
+        r2KeyThumb: true,
+        type: true,
+        duration: true,
+      }
+    };
 
-    const isWatermarked = event && event.watermarkEnabled;
+    if (limit && limit > 0) {
+      queryArgs.take = Number(limit);
+    }
+    if (cursor) {
+      queryArgs.cursor = { id: cursor };
+      queryArgs.skip = 1;
+    }
+
+    const photos = await this.prisma.photo.findMany(queryArgs);
 
     return Promise.all(
       photos.map(async (photo) => {
         let url = '';
         let thumbUrl = '';
 
-        const hideDirectStorageUrl = isWatermarked || (event && !event.allowDownload);
+        const hideDirectStorageUrl = event && !event.allowDownload;
 
         if (hideDirectStorageUrl) {
           const apiBase = process.env.PUBLIC_API_URL || 'http://localhost:5000';
           url = `${apiBase}/api/public/events/${slug}/photos/${photo.id}/view`;
         } else {
-          url = await this.getReadUrl(photo.r2KeyOriginal);
+          // Videos must always serve original file; images serve 800px preview or thumb
+          if (photo.type === 'VIDEO') {
+            url = await this.getReadUrl(photo.r2KeyOriginal);
+          } else {
+            const fullKey = photo.r2KeyPreview || photo.r2KeyThumb || photo.r2KeyOriginal;
+            url = await this.getReadUrl(fullKey);
+          }
         }
         // Always serve low-res thumbnails directly from CDN for instant loading speed
         thumbUrl = photo.r2KeyThumb ? await this.getReadUrl(photo.r2KeyThumb) : url;
@@ -2830,19 +3584,64 @@ export class StorageService implements OnModuleInit {
     );
   }
 
-  async saveClientFavorites(
+  private favoritesSyncTimers = new Map<string, NodeJS.Timeout>();
+
+  scheduleFavoritesDbSync(eventId: string) {
+    if (this.favoritesSyncTimers.has(eventId)) {
+      clearTimeout(this.favoritesSyncTimers.get(eventId)!);
+    }
+
+    const timer = setTimeout(async () => {
+      this.favoritesSyncTimers.delete(eventId);
+      await this.flushFavoritesToDb(eventId);
+    }, 3000); // 3-second debounce batch flush
+
+    this.favoritesSyncTimers.set(eventId, timer);
+  }
+
+  async flushFavoritesToDb(eventId: string) {
+    try {
+      const setKey = `event:favorites:${eventId}`;
+      const members = await this.redis.smembers(setKey);
+      const photoIds = members.filter(id => id && id !== '__INIT__');
+
+      if (photoIds.length > 0) {
+        const data = photoIds.map(photoId => ({
+          eventId,
+          photoId,
+          clientSessionId: 'SHARED_SELECTION'
+        }));
+
+        await this.prisma.$transaction([
+          this.prisma.favoritePhoto.deleteMany({ where: { eventId } }),
+          this.prisma.favoritePhoto.createMany({ data })
+        ]);
+      } else {
+        await this.prisma.favoritePhoto.deleteMany({ where: { eventId } });
+      }
+
+      await this.redis.srem('event:favorites:dirty_events', eventId);
+    } catch (err: any) {
+      this.logger.error(`[FavoritesSync] Error persisting favorites for event ${eventId}: ${err.message}`);
+    }
+  }
+
+  async toggleClientFavorite(
     slug: string,
-    clientSessionId: string,
-    clientName: string,
-    clientPhone: string | undefined,
-    photoIds: string[]
-  ) {
+    photoId: string,
+    action?: 'ADD' | 'REMOVE' | 'TOGGLE'
+  ): Promise<{ selected: boolean; count: number; selectedIds: string[]; maxFavorites?: number }> {
     const event = await this.prisma.event.findUnique({
-      where: { slug }
+      where: { slug },
+      select: { id: true, photographerId: true, allowFavorites: true, maxFavorites: true }
     });
 
     if (!event) {
       throw new NotFoundException('Event not found');
+    }
+
+    if (!event.allowFavorites) {
+      throw new BadRequestException('Favorites selection is not enabled for this event.');
     }
 
     const activeSub = await this.prisma.subscription.findFirst({
@@ -2855,32 +3654,64 @@ export class StorageService implements OnModuleInit {
       throw new BadRequestException('Client photo selection feature is disabled on this plan.');
     }
 
-    // Delete ALL existing favorites for this entire event (Universal overwrite)
-    await this.prisma.favoritePhoto.deleteMany({
-      where: {
-        eventId: event.id
-      }
-    });
+    const setKey = `event:favorites:${event.id}`;
 
-    if (photoIds.length > 0) {
-      // Bulk insert under a single global identifier
-      const data = photoIds.map(photoId => ({
-        eventId: event.id,
-        photoId,
-        clientSessionId: 'GLOBAL_SESSION',
-        clientName: clientName || 'Event Guest',
-        clientPhone: 'GLOBAL_PHONE'
-      }));
-
-      await this.prisma.favoritePhoto.createMany({
-        data
+    // Ensure Redis set is populated from DB on first access
+    const exists = await this.redis.exists(setKey);
+    if (!exists) {
+      const dbFavs = await this.prisma.favoritePhoto.findMany({
+        where: { eventId: event.id },
+        select: { photoId: true }
       });
+      if (dbFavs.length > 0) {
+        const ids = dbFavs.map(f => f.photoId);
+        await this.redis.sadd(setKey, ...ids);
+      } else {
+        await this.redis.sadd(setKey, '__INIT__');
+      }
+      await this.redis.expire(setKey, 86400 * 7);
     }
 
-    return { success: true, count: photoIds.length };
+    const isMember = await this.redis.sismember(setKey, photoId);
+    let isSelected: boolean;
+
+    if (action === 'ADD' || (action !== 'REMOVE' && !isMember)) {
+      // Check maximum limit if photographer set one
+      if (event.maxFavorites && event.maxFavorites > 0) {
+        let currentCount = await this.redis.scard(setKey);
+        const hasMarker = await this.redis.sismember(setKey, '__INIT__');
+        if (hasMarker) currentCount -= 1;
+
+        if (currentCount >= event.maxFavorites) {
+          throw new BadRequestException(`Selection limit reached. Maximum ${event.maxFavorites} photos allowed.`);
+        }
+      }
+
+      await this.redis.sadd(setKey, photoId);
+      isSelected = true;
+    } else {
+      await this.redis.srem(setKey, photoId);
+      isSelected = false;
+    }
+
+    await this.redis.sadd('event:favorites:dirty_events', event.id);
+    this.scheduleFavoritesDbSync(event.id);
+
+    const allMembers = await this.redis.smembers(setKey);
+    const selectedIds = allMembers.filter(id => id && id !== '__INIT__');
+
+    return {
+      selected: isSelected,
+      count: selectedIds.length,
+      selectedIds,
+      maxFavorites: event.maxFavorites
+    };
   }
 
-  async getClientFavorites(slug: string, clientSessionId: string, clientPhone?: string): Promise<string[]> {
+  async saveClientFavorites(
+    slug: string,
+    photoIds: string[]
+  ) {
     const event = await this.prisma.event.findUnique({
       where: { slug }
     });
@@ -2889,12 +3720,63 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Event not found');
     }
 
+    const setKey = `event:favorites:${event.id}`;
+    await this.redis.del(setKey);
+    if (photoIds.length > 0) {
+      await this.redis.sadd(setKey, ...photoIds);
+    } else {
+      await this.redis.sadd(setKey, '__INIT__');
+    }
+    await this.redis.expire(setKey, 86400 * 7);
+
+    this.scheduleFavoritesDbSync(event.id);
+    return { success: true, count: photoIds.length };
+  }
+
+  async getClientFavorites(slug: string): Promise<string[]> {
+    const event = await this.prisma.event.findUnique({
+      where: { slug },
+      select: { id: true }
+    });
+
+    if (!event) {
+      throw new NotFoundException('Event not found');
+    }
+
+    const setKey = `event:favorites:${event.id}`;
+    const exists = await this.redis.exists(setKey);
+    if (exists) {
+      const members = await this.redis.smembers(setKey);
+      return members.filter(id => id && id !== '__INIT__');
+    }
+
     const favorites = await this.prisma.favoritePhoto.findMany({
       where: { eventId: event.id },
       select: { photoId: true }
     });
 
-    return favorites.map(f => f.photoId);
+    const results = Array.from(new Set(favorites.map(f => f.photoId)));
+    if (results.length > 0) {
+      await this.redis.sadd(setKey, ...results);
+    } else {
+      await this.redis.sadd(setKey, '__INIT__');
+    }
+    await this.redis.expire(setKey, 86400 * 7);
+    return results;
+  }
+
+  async getPublicEventInit(slug: string, passcode?: string, clientIp?: string) {
+    const event = await this.getPublicEventBySlug(slug);
+    if (!event) throw new NotFoundException('Event not found');
+
+    const photos = await this.getPublicEventPhotos(slug, passcode, 60, undefined, clientIp);
+    const favorites = await this.getClientFavorites(slug).catch(() => []);
+
+    return {
+      event,
+      photos,
+      favorites
+    };
   }
 
   async getEventFavorites(photographerId: string, eventId: string) {
@@ -2907,6 +3789,13 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Event not found');
     }
 
+    // Flush any pending sync so DB has latest
+    if (this.favoritesSyncTimers.has(eventId)) {
+      clearTimeout(this.favoritesSyncTimers.get(eventId)!);
+      this.favoritesSyncTimers.delete(eventId);
+      await this.flushFavoritesToDb(eventId);
+    }
+
     const favorites = await this.prisma.favoritePhoto.findMany({
       where: { eventId },
       include: {
@@ -2915,44 +3804,53 @@ export class StorageService implements OnModuleInit {
       orderBy: { createdAt: 'desc' }
     });
 
-    // Group favorites by clientSessionId
-    const groupsMap = new Map<string, { clientName: string; clientPhone: string; photos: any[] }>();
+    if (favorites.length === 0) return [];
 
+    const photosList: any[] = [];
     for (const fav of favorites) {
-      const key = fav.clientSessionId;
-      if (!groupsMap.has(key)) {
-        groupsMap.set(key, {
-          clientName: fav.clientName || 'Anonymous Guest',
-          clientPhone: fav.clientPhone || 'No Phone',
-          photos: []
-        });
-      }
-
-      const group = groupsMap.get(key)!;
+      if (!fav.photo) continue;
+      const previewKey = fav.photo.type === 'VIDEO'
+        ? fav.photo.r2KeyOriginal
+        : (fav.photo.r2KeyPreview || fav.photo.r2KeyThumb || fav.photo.r2KeyOriginal);
       const url = await this.getReadUrl(fav.photo.r2KeyOriginal);
+      const previewUrl = previewKey ? await this.getReadUrl(previewKey) : url;
       const thumbUrl = fav.photo.r2KeyThumb
         ? await this.getReadUrl(fav.photo.r2KeyThumb)
-        : url;
+        : (previewUrl || url);
 
-      group.photos.push({
+      photosList.push({
         id: fav.photo.id,
         filenameOriginal: fav.photo.filenameOriginal,
+        name: fav.photo.filenameOriginal,
         url,
+        previewUrl,
         thumbUrl,
+        type: fav.photo.type || 'IMAGE',
+        duration: fav.photo.duration || 0,
         fileSize: Number(fav.photo.fileSize)
       });
     }
 
-    return Array.from(groupsMap.entries()).map(([clientSessionId, val]) => ({
-      clientSessionId,
-      ...val
-    }));
+    return [{
+      clientSessionId: 'SHARED_SELECTION',
+      photos: photosList
+    }];
   }
 
-  async getWatermarkedImageStream(slug: string, photoId: string, isThumb: boolean) {
+  async getWatermarkedImageStream(slug: string, photoId: string, isThumb: boolean, isDownload: boolean = false) {
+    const cacheKey = `cache:public:view:${photoId}:${isThumb ? '1' : '0'}:${isDownload ? '1' : '0'}`;
+    try {
+      const cachedUrl = await this.redis.get(cacheKey);
+      if (cachedUrl) {
+        return { redirectUrl: cachedUrl };
+      }
+    } catch (err: any) {
+      this.logger.error(`[getWatermarkedImageStream] Redis get error: ${err.message}`);
+    }
+
     const event = await this.prisma.event.findUnique({
       where: { slug },
-      include: { photographer: true }
+      select: { id: true, allowDownload: true }
     });
 
     if (!event) {
@@ -2960,91 +3858,83 @@ export class StorageService implements OnModuleInit {
     }
 
     const photo = await this.prisma.photo.findUnique({
-      where: { id: photoId }
+      where: { id: photoId },
+      select: { eventId: true, type: true, filenameOriginal: true, r2KeyPreview: true, r2KeyThumb: true, r2KeyOriginal: true }
     });
 
     if (!photo || photo.eventId !== event.id) {
       throw new NotFoundException('Photo not found');
     }
 
-    const readKey = isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : photo.r2KeyOriginal;
-
-    // Direct CDN redirection for VIDEO types or pending approval files to avoid server RAM exhaustion
-    if (photo.type === 'VIDEO' || photo.status === 'PENDING_APPROVAL') {
-      const directUrl = await this.getReadUrl(readKey);
-      return { redirectUrl: directUrl };
+    let directUrl: string;
+    if (isDownload) {
+      if (!event.allowDownload) {
+        throw new ForbiddenException('Download is not enabled for this gallery');
+      }
+      directUrl = await this.getDownloadUrl(photo.r2KeyOriginal, photo.filenameOriginal);
+    } else {
+      // If thumb is requested (for video or image), always serve the .jpg thumbnail!
+      // If full preview is requested: videos serve original video file, images serve 1920px preview or original
+      const readKey = isThumb
+        ? (photo.r2KeyThumb || photo.r2KeyOriginal)
+        : (photo.type === 'VIDEO' ? photo.r2KeyOriginal : (photo.r2KeyPreview || photo.r2KeyThumb || photo.r2KeyOriginal));
+      directUrl = await this.getReadUrl(readKey);
     }
 
-    // Check if photographer plan allows watermark feature
-    let hasWatermarkFeature = false;
-    let hasCustomBranding = false;
-    if (event.photographer) {
-      const activeSub = await this.prisma.subscription.findFirst({
-        where: { photographerId: event.photographer.id, status: 'ACTIVE' },
-        include: { package: true },
-        orderBy: { createdAt: 'desc' }
-      });
-      hasWatermarkFeature = activeSub?.package ? activeSub.package.featureWatermark : false;
-      hasCustomBranding = activeSub?.package ? activeSub.package.featureCustomBranding : false;
-    }
-
-    const shouldWatermark = event.watermarkEnabled && hasWatermarkFeature;
-
-    if (!shouldWatermark) {
-      const directUrl = await this.getReadUrl(readKey);
-      return { redirectUrl: directUrl };
-    }
-
-    // Call Modal Dynamic Watermark Service to offload RAM processing!
     try {
-      const imageUrl = await this.getReadUrl(readKey);
-      const photographer = event.photographer;
+      await this.redis.setex(cacheKey, 300, directUrl); // Cache for 5 minutes
+    } catch (err: any) {
+      this.logger.error(`[getWatermarkedImageStream] Redis set error: ${err.message}`);
+    }
 
-      const watermarkType = hasCustomBranding ? (photographer ? photographer.watermarkType : 'NONE') : 'IMAGE';
-      const sizeSetting = hasCustomBranding ? (photographer ? photographer.watermarkSize : 'MEDIUM') : 'LARGE';
-      const position = hasCustomBranding ? (photographer ? photographer.watermarkPosition : 'CENTER') : 'CENTER';
-      const opacity = hasCustomBranding ? (photographer ? photographer.watermarkOpacity : 50) : 50;
-      const watermarkText = photographer?.watermarkText || 'PhotosetGo';
+    return { redirectUrl: directUrl };
+  }
 
-      let logoUrl: string | null = null;
-      if (watermarkType === 'IMAGE') {
-        const logoKey = (hasCustomBranding && photographer?.watermarkImageKey)
-          ? photographer.watermarkImageKey
-          : 'assets/logo/fotosetgo.png';
-        logoUrl = await this.getReadUrl(logoKey);
-      }
+  async streamPhotoToResponse(slug: string, photoId: string, isThumb: boolean, isDownload: boolean, res: any) {
+    const event = await this.prisma.event.findUnique({
+      where: { slug },
+      select: { id: true, allowDownload: true }
+    });
+    if (!event) {
+      throw new NotFoundException('Event not found');
+    }
 
-      const modalEngineUrl = process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run';
+    const photo = await this.prisma.photo.findUnique({
+      where: { id: photoId },
+      select: { eventId: true, type: true, filenameOriginal: true, r2KeyPreview: true, r2KeyThumb: true, r2KeyOriginal: true }
+    });
+    if (!photo || photo.eventId !== event.id) {
+      throw new NotFoundException('Photo not found');
+    }
 
-      const response = await fetch(`${modalEngineUrl}/generate-dynamic-watermark`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          imageUrl,
-          watermarkType,
-          watermarkText,
-          logoUrl,
-          size: sizeSetting,
-          position,
-          opacity
-        })
+    if (isDownload && !event.allowDownload) {
+      throw new ForbiddenException('Download is not enabled for this gallery');
+    }
+
+    const readKey = isDownload
+      ? photo.r2KeyOriginal
+      : (isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : (photo.type === 'VIDEO' ? photo.r2KeyOriginal : (photo.r2KeyPreview || photo.r2KeyThumb || photo.r2KeyOriginal)));
+
+    try {
+      const getCmd = new GetObjectCommand({
+        Bucket: this.bucketName,
+        Key: readKey
       });
-
-      if (!response.ok) {
-        throw new Error(`Modal returned status: ${response.status} ${response.statusText}`);
+      const s3Res = await this.s3Client.send(getCmd);
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', '*');
+      res.setHeader('Content-Type', s3Res.ContentType || 'image/jpeg');
+      if (s3Res.ContentLength) {
+        res.setHeader('Content-Length', s3Res.ContentLength);
       }
-
-      const arrayBuffer = await response.arrayBuffer();
-      const imageBuffer = Buffer.from(arrayBuffer);
-
-      return {
-        buffer: imageBuffer,
-        contentType: 'image/jpeg',
-        filename: photo.filenameOriginal || `photo_${photo.id}.jpg`
-      };
-    } catch (modalErr: any) {
-      this.logger.error(`[Modal Watermark] Serverless offloading failed: ${modalErr.message}`);
-      throw modalErr;
+      if (isDownload) {
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(photo.filenameOriginal || 'photo.jpg')}"`);
+      }
+      return (s3Res.Body as any).pipe(res);
+    } catch (err: any) {
+      this.logger.error(`[streamPhotoToResponse] S3 pipe error for ${readKey}: ${err.message}`);
+      throw new NotFoundException('Failed to stream photo');
     }
   }
 
@@ -3096,6 +3986,11 @@ export class StorageService implements OnModuleInit {
       throw new BadRequestException('No file provided');
     }
 
+    const isPng = file.mimetype === 'image/png' || file.originalname?.toLowerCase().endsWith('.png');
+    if (!isPng) {
+      throw new BadRequestException('Only PNG images (.png) are allowed for Studio Logo');
+    }
+
     // Limit to 1 MB
     const maxSizeBytes = 1024 * 1024;
     if (file.size > maxSizeBytes) {
@@ -3118,56 +4013,6 @@ export class StorageService implements OnModuleInit {
     });
 
     return { success: true, key };
-  }
-
-  async uploadBrandingBanner(userId: string, file: any) {
-    const photographer = await this.prisma.photographer.findUnique({
-      where: { userId }
-    });
-
-    if (!photographer) {
-      throw new NotFoundException('Photographer profile not found');
-    }
-
-    if (!file) {
-      throw new BadRequestException('No file provided');
-    }
-
-    // Limit to 4 MB for banner cover images
-    const maxSizeBytes = 4 * 1024 * 1024;
-    if (file.size > maxSizeBytes) {
-      throw new BadRequestException('Banner file size must be less than 4 MB');
-    }
-
-    const key = `${photographer.id}/branding/banner.png`;
-
-
-    await this.s3Client.send(new PutObjectCommand({
-      Bucket: this.bucketName,
-      Key: key,
-      Body: file.buffer,
-      ContentType: file.mimetype || 'image/png',
-    }));
-
-    await this.prisma.photographer.update({
-      where: { id: photographer.id },
-      data: { studioHeroBannerKey: key }
-    });
-
-    return { success: true, key };
-  }
-
-  async getBrandingBannerStream(photographerId: string) {
-    const photographer = await this.prisma.photographer.findUnique({
-      where: { id: photographerId }
-    });
-
-    if (!photographer || !photographer.studioHeroBannerKey) {
-      throw new NotFoundException('Banner not found');
-    }
-
-    const directUrl = await this.getReadUrl(photographer.studioHeroBannerKey);
-    return { redirectUrl: directUrl };
   }
 
   async updateBrandingSettings(userId: string, data: any) {
@@ -3198,18 +4043,55 @@ export class StorageService implements OnModuleInit {
       where: { id: photographer.id },
       data: {
         studioSubdomain: data.studioSubdomain || null,
-        primaryColor: data.primaryColor || null,
-        secondaryColor: data.secondaryColor || null,
         instagramUrl: data.instagramUrl || null,
         facebookUrl: data.facebookUrl || null,
         whatsappPhone: data.whatsappPhone || null,
-        studioFontFamily: data.studioFontFamily || null,
         seoTitle: data.seoTitle || null,
         seoDescription: data.seoDescription || null,
         hidePoweredBy: data.hidePoweredBy ?? false,
         customFooterText: data.customFooterText || null,
       }
     });
+
+    // Invalidate caches for all events belonging to this photographer to sync branding updates immediately
+    try {
+      const events = await this.prisma.event.findMany({
+        where: { photographerId: photographer.id },
+        select: { id: true, slug: true }
+      });
+
+      const keysToInvalidate: string[] = [
+        `user:jwt:${userId}`,
+        `cache:events:list:${photographer.id}`,
+        `cache:portfolio:public:${photographer.slug}`
+      ];
+
+      if (photographer.studioSubdomain) {
+        keysToInvalidate.push(`cache:portfolio:public:${photographer.studioSubdomain}`);
+      }
+      if (data.studioSubdomain) {
+        keysToInvalidate.push(`cache:portfolio:public:${data.studioSubdomain}`);
+      }
+
+      for (const ev of events) {
+        keysToInvalidate.push(
+          `cache:event:detail:${ev.id}`,
+          `cache:public:event:${ev.slug}`,
+          `cache:public:event:limits:${ev.slug}`
+        );
+        const matchKeys = await this.scanKeys(`cache:public:photos:${ev.slug}:*`);
+        if (matchKeys && matchKeys.length > 0) {
+          keysToInvalidate.push(...matchKeys);
+        }
+      }
+
+      if (keysToInvalidate.length > 0) {
+        await this.redis.del(...keysToInvalidate);
+        this.logger.log(`[Cache Invalidation] Cleared ${keysToInvalidate.length} cache keys due to branding settings update.`);
+      }
+    } catch (cacheErr: any) {
+      this.logger.error(`[Cache Invalidation] Failed to clear caches on branding update: ${cacheErr.message}`);
+    }
 
     // Automatically sync BusinessCard slug with the new studioSubdomain
     if (data.studioSubdomain) {
@@ -3229,41 +4111,12 @@ export class StorageService implements OnModuleInit {
       const match = decodedUrl.match(/((?:[a-f0-9-]+\/)?portfolio\/reels\/[^?#]+)/);
       if (match) {
         const key = match[1];
-        const baseUrl = process.env.PUBLIC_API_URL || 'http://localhost:5000';
-        return `${baseUrl}/api/public/portfolio/video/stream?key=${encodeURIComponent(key)}`;
+        return await this.getReadUrl(key);
       }
     } catch (err) {
       console.error('[StorageService] Failed to parse video url key:', url, err);
     }
     return url;
-  }
-
-  async streamPortfolioVideo(key: string, range?: string) {
-    try {
-      let targetKey = key;
-      const legacyMatch = key.match(/^portfolio\/reels\/([a-f0-9-]+)_(\d+\.[a-z0-9]+)$/i);
-      if (legacyMatch) {
-        targetKey = `${legacyMatch[1]}/portfolio/reels/${legacyMatch[2]}`;
-      }
-
-      const getCommand = new GetObjectCommand({
-        Bucket: this.bucketName,
-        Key: targetKey,
-        Range: range,
-      });
-
-      const response = await this.s3Client.send(getCommand);
-      return {
-        stream: response.Body,
-        contentType: response.ContentType || 'video/mp4',
-        contentLength: response.ContentLength,
-        contentRange: response.ContentRange,
-        statusCode: range ? 206 : 200,
-      };
-    } catch (err) {
-      console.error('[StorageService] Error streaming video from R2 for key:', key, err);
-      throw new NotFoundException('Video file not found or streaming error');
-    }
   }
 
   async getPortfolioSettings(userId: string) {
@@ -3272,6 +4125,9 @@ export class StorageService implements OnModuleInit {
       include: {
         portfolioPhotos: {
           orderBy: { sortOrder: 'asc' }
+        },
+        portfolioReels: {
+          orderBy: { createdAt: 'desc' }
         }
       }
     });
@@ -3294,21 +4150,27 @@ export class StorageService implements OnModuleInit {
       })
     );
 
+    const reels = await Promise.all(
+      (photographer.portfolioReels || []).map(async (r) => {
+        const url = await this.getReadUrl(r.r2Key);
+        return {
+          id: r.id,
+          title: r.title,
+          category: r.category || 'Highlights',
+          r2Key: r.r2Key,
+          url,
+          viewsCount: r.viewsCount,
+          createdAt: r.createdAt
+        };
+      })
+    );
+
     const aboutImageUrl = photographer.portfolioAboutImageKey
       ? await this.getReadUrl(photographer.portfolioAboutImageKey)
       : null;
 
-    const heroImageUrl = photographer.portfolioHeroImageKey
-      ? await this.getReadUrl(photographer.portfolioHeroImageKey)
-      : null;
-
     const freshVideoUrl = await this.getFreshVideoUrl(photographer.portfolioVideoUrl);
     const freshBtsUrl = await this.getFreshVideoUrl(photographer.portfolioBtsUrl);
-    const rawReels = photographer.portfolioReels ? (photographer.portfolioReels as any[]) : [];
-    const freshReels = await Promise.all(rawReels.map(async (r) => {
-      const freshUrl = await this.getFreshVideoUrl(r.url);
-      return { ...r, url: freshUrl };
-    }));
 
     return {
       portfolioEnabled: photographer.portfolioEnabled,
@@ -3318,7 +4180,6 @@ export class StorageService implements OnModuleInit {
       portfolioAboutTitle: photographer.portfolioAboutTitle,
       portfolioAboutText: photographer.portfolioAboutText,
       portfolioAboutImageUrl: aboutImageUrl,
-      portfolioHeroImageUrl: heroImageUrl,
       portfolioMapEmbed: photographer.portfolioMapEmbed,
       portfolioPackages: photographer.portfolioPackages,
       portfolioServices: photographer.portfolioServices,
@@ -3331,7 +4192,7 @@ export class StorageService implements OnModuleInit {
       portfolioDestinations: photographer.portfolioDestinations,
       portfolioBookingPolicy: photographer.portfolioBookingPolicy,
       portfolioPress: photographer.portfolioPress,
-      portfolioReels: freshReels,
+      portfolioReels: reels,
       portfolioStyles: photographer.portfolioStyles,
       portfolioPhone: photographer.portfolioPhone,
       portfolioEmail: photographer.portfolioEmail,
@@ -3340,14 +4201,10 @@ export class StorageService implements OnModuleInit {
       portfolioPhotos: photos,
       studioSubdomain: photographer.studioSubdomain,
       studioName: photographer.studioName,
-      primaryColor: photographer.primaryColor,
-      secondaryColor: photographer.secondaryColor,
       instagramUrl: photographer.instagramUrl,
       facebookUrl: photographer.facebookUrl,
       whatsappPhone: photographer.whatsappPhone,
       studioLogoKey: photographer.studioLogoKey,
-      studioHeroBannerKey: photographer.studioHeroBannerKey,
-      studioFontFamily: photographer.studioFontFamily,
       seoTitle: photographer.seoTitle,
       seoDescription: photographer.seoDescription,
       hidePoweredBy: photographer.hidePoweredBy,
@@ -3365,7 +4222,35 @@ export class StorageService implements OnModuleInit {
     }
 
     try {
-      return await this.prisma.photographer.update({
+      // 1. Delete replaced old Teaser Video from R2 if new video is uploaded
+      if (data.portfolioVideoUrl !== undefined && photographer.portfolioVideoUrl && photographer.portfolioVideoUrl !== data.portfolioVideoUrl) {
+        const oldKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioVideoUrl, photographer.id);
+        if (oldKey) {
+          try {
+            await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldKey }));
+            this.urlCache.delete(oldKey);
+            this.logger.log(`[StorageService] Deleted replaced old Teaser Video from R2: ${oldKey}`);
+          } catch (err: any) {
+            this.logger.error(`[StorageService] Failed to delete replaced Teaser Video: ${err.message}`);
+          }
+        }
+      }
+
+      // 2. Delete replaced old BTS Video from R2 if new BTS video is uploaded
+      if (data.portfolioBtsUrl !== undefined && photographer.portfolioBtsUrl && photographer.portfolioBtsUrl !== data.portfolioBtsUrl) {
+        const oldKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioBtsUrl, photographer.id);
+        if (oldKey) {
+          try {
+            await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldKey }));
+            this.urlCache.delete(oldKey);
+            this.logger.log(`[StorageService] Deleted replaced old BTS Video from R2: ${oldKey}`);
+          } catch (err: any) {
+            this.logger.error(`[StorageService] Failed to delete replaced BTS Video: ${err.message}`);
+          }
+        }
+      }
+
+      const updated = await this.prisma.photographer.update({
         where: { id: photographer.id },
         data: {
           portfolioEnabled: data.portfolioEnabled ?? photographer.portfolioEnabled,
@@ -3380,13 +4265,14 @@ export class StorageService implements OnModuleInit {
           portfolioStats: data.portfolioStats !== undefined ? (data.portfolioStats as any) : (photographer.portfolioStats as any),
           portfolioFaqs: data.portfolioFaqs !== undefined ? (data.portfolioFaqs as any) : (photographer.portfolioFaqs as any),
           portfolioVideoUrl: data.portfolioVideoUrl !== undefined ? data.portfolioVideoUrl : photographer.portfolioVideoUrl,
+          portfolioVideoSizeBytes: data.portfolioVideoSizeBytes !== undefined ? BigInt(data.portfolioVideoSizeBytes) : (data.portfolioVideoUrl === '' ? BigInt(0) : photographer.portfolioVideoSizeBytes),
           portfolioProcess: data.portfolioProcess !== undefined ? (data.portfolioProcess as any) : (photographer.portfolioProcess as any),
           portfolioBtsUrl: data.portfolioBtsUrl !== undefined ? data.portfolioBtsUrl : photographer.portfolioBtsUrl,
+          portfolioBtsSizeBytes: data.portfolioBtsSizeBytes !== undefined ? BigInt(data.portfolioBtsSizeBytes) : (data.portfolioBtsUrl === '' ? BigInt(0) : photographer.portfolioBtsSizeBytes),
           portfolioEquipment: data.portfolioEquipment !== undefined ? (data.portfolioEquipment as any) : (photographer.portfolioEquipment as any),
           portfolioDestinations: data.portfolioDestinations !== undefined ? (data.portfolioDestinations as any) : (photographer.portfolioDestinations as any),
           portfolioBookingPolicy: data.bookingPolicy !== undefined ? data.bookingPolicy : (data.portfolioBookingPolicy !== undefined ? data.portfolioBookingPolicy : photographer.portfolioBookingPolicy),
           portfolioPress: data.portfolioPress !== undefined ? (data.portfolioPress as any) : (photographer.portfolioPress as any),
-          portfolioReels: data.portfolioReels !== undefined ? (data.portfolioReels as any) : (photographer.portfolioReels as any),
           portfolioStyles: data.portfolioStyles !== undefined ? (data.portfolioStyles as any) : (photographer.portfolioStyles as any),
           portfolioPhone: data.portfolioPhone !== undefined ? data.portfolioPhone : photographer.portfolioPhone,
           portfolioEmail: data.portfolioEmail !== undefined ? data.portfolioEmail : photographer.portfolioEmail,
@@ -3394,37 +4280,190 @@ export class StorageService implements OnModuleInit {
           portfolioWhatsapp: data.portfolioWhatsapp !== undefined ? data.portfolioWhatsapp : photographer.portfolioWhatsapp,
         }
       });
+      if (data.portfolioVideoSizeBytes !== undefined || data.portfolioBtsSizeBytes !== undefined) {
+        await this.recalculateStorage(photographer.id);
+      }
+      await this.invalidatePortfolioCache(photographer.id);
+      return updated;
     } catch (err) {
       console.error('[StorageService] updatePortfolioSettings error:', err);
       throw err;
     }
   }
 
-  // Helper: compute portfolio-only storage used by listing all portfolio/* keys in R2
-  private async getPortfolioStorageUsed(photographerId: string): Promise<bigint> {
-    let totalBytes = BigInt(0);
+  private extractR2KeyFromUrlOrKey(urlOrKey: string | null | undefined, photographerId: string): string | null {
+    if (!urlOrKey) return null;
+    if (urlOrKey.startsWith(`${photographerId}/`)) {
+      return urlOrKey;
+    }
     try {
-      const prefix = `${photographerId}/portfolio/`;
-      let continuationToken: string | undefined;
-      do {
-        const listCmd = new ListObjectsV2Command({
-          Bucket: this.bucketName,
-          Prefix: prefix,
-          ContinuationToken: continuationToken,
-        });
-        const response = await this.s3Client.send(listCmd);
-        for (const obj of response.Contents || []) {
-          totalBytes += BigInt(obj.Size || 0);
+      const urlObj = new URL(urlOrKey);
+      let path = decodeURIComponent(urlObj.pathname);
+      if (path.startsWith('/')) path = path.slice(1);
+      const photogIdx = path.indexOf(photographerId);
+      if (photogIdx !== -1) {
+        return path.slice(photogIdx);
+      }
+    } catch {
+      const photogIdx = urlOrKey.indexOf(photographerId);
+      if (photogIdx !== -1) {
+        return urlOrKey.slice(photogIdx).split('?')[0];
+      }
+    }
+    return null;
+  }
+
+  async deletePortfolioHeroVideo(userId: string) {
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { userId }
+    });
+    if (!photographer) {
+      throw new NotFoundException('Photographer profile not found');
+    }
+
+    const videoUrlOrKey = photographer.portfolioVideoUrl;
+    if (videoUrlOrKey) {
+      const r2Key = this.extractR2KeyFromUrlOrKey(videoUrlOrKey, photographer.id);
+      if (r2Key) {
+        try {
+          await this.s3Client.send(new DeleteObjectCommand({
+            Bucket: this.bucketName,
+            Key: r2Key,
+          }));
+          this.urlCache.delete(r2Key);
+          this.logger.log(`[StorageService] Deleted Teaser Video from R2: ${r2Key}`);
+        } catch (err: any) {
+          this.logger.error(`[StorageService] Failed to delete Teaser Video from R2: ${err.message}`);
         }
-        continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
-      } while (continuationToken);
+      }
+    }
+
+    await this.prisma.photographer.update({
+      where: { id: photographer.id },
+      data: {
+        portfolioVideoUrl: null,
+        portfolioVideoSizeBytes: BigInt(0),
+      }
+    });
+
+    await this.recalculateStorage(photographer.id);
+    await this.invalidatePortfolioCache(photographer.id);
+    return { success: true };
+  }
+
+  async deletePortfolioBtsVideo(userId: string) {
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { userId }
+    });
+    if (!photographer) {
+      throw new NotFoundException('Photographer profile not found');
+    }
+
+    const btsUrlOrKey = photographer.portfolioBtsUrl;
+    if (btsUrlOrKey) {
+      const r2Key = this.extractR2KeyFromUrlOrKey(btsUrlOrKey, photographer.id);
+      if (r2Key) {
+        try {
+          await this.s3Client.send(new DeleteObjectCommand({
+            Bucket: this.bucketName,
+            Key: r2Key,
+          }));
+          this.urlCache.delete(r2Key);
+          this.logger.log(`[StorageService] Deleted BTS Video from R2: ${r2Key}`);
+        } catch (err: any) {
+          this.logger.error(`[StorageService] Failed to delete BTS Video from R2: ${err.message}`);
+        }
+      }
+    }
+
+    await this.prisma.photographer.update({
+      where: { id: photographer.id },
+      data: {
+        portfolioBtsUrl: null,
+        portfolioBtsSizeBytes: BigInt(0),
+      }
+    });
+
+    await this.recalculateStorage(photographer.id);
+    await this.invalidatePortfolioCache(photographer.id);
+    return { success: true };
+  }
+
+  // Helper: compute portfolio-only storage directly from PostgreSQL DB (Instant <1ms query)
+  private async getPortfolioStorageUsed(photographerId: string): Promise<bigint> {
+    try {
+      const [photosSum, reelsSum, photographer] = await Promise.all([
+        this.prisma.portfolioPhoto.aggregate({
+          where: { photographerId },
+          _sum: { fileSize: true, thumbSizeBytes: true },
+        }),
+        this.prisma.portfolioReel.aggregate({
+          where: { photographerId },
+          _sum: { fileSize: true },
+        }),
+        this.prisma.photographer.findUnique({
+          where: { id: photographerId },
+          select: {
+            portfolioAboutImageSizeBytes: true,
+            portfolioVideoSizeBytes: true,
+            portfolioBtsSizeBytes: true,
+          },
+        }),
+      ]);
+
+      const totalBytes =
+        BigInt(photosSum._sum.fileSize ? photosSum._sum.fileSize.toString() : '0') +
+        BigInt(photosSum._sum.thumbSizeBytes ? photosSum._sum.thumbSizeBytes.toString() : '0') +
+        BigInt(reelsSum._sum.fileSize ? reelsSum._sum.fileSize.toString() : '0') +
+        BigInt(photographer?.portfolioAboutImageSizeBytes ? photographer.portfolioAboutImageSizeBytes.toString() : '0') +
+        BigInt(photographer?.portfolioVideoSizeBytes ? photographer.portfolioVideoSizeBytes.toString() : '0') +
+        BigInt(photographer?.portfolioBtsSizeBytes ? photographer.portfolioBtsSizeBytes.toString() : '0');
+
+      return totalBytes;
+    } catch (err: any) {
+      this.logger.error(`[StorageService] getPortfolioStorageUsed DB aggregate error: ${err.message}`);
+      return BigInt(0);
+    }
+  }
+
+  async deletePortfolioReelItem(userId: string, reelId: string) {
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { userId }
+    });
+    if (!photographer) {
+      throw new NotFoundException('Photographer profile not found');
+    }
+
+    const reel = await this.prisma.portfolioReel.findFirst({
+      where: { id: reelId, photographerId: photographer.id }
+    });
+
+    if (!reel) {
+      throw new NotFoundException('Reel not found or does not belong to photographer');
+    }
+
+    // Delete from R2 cloud storage
+    try {
+      await this.s3Client.send(new DeleteObjectCommand({
+        Bucket: this.bucketName,
+        Key: reel.r2Key,
+      }));
+      this.urlCache.delete(reel.r2Key);
     } catch (err) {
-      console.error('[StorageService] getPortfolioStorageUsed R2 list error:', err);
+      console.error('[StorageService] Delete reel R2 file error:', err);
     }
-    return totalBytes;
+
+    // Delete from database
+    await this.prisma.portfolioReel.delete({
+      where: { id: reelId }
+    });
+
+    await this.recalculateStorage(photographer.id);
+    await this.invalidatePortfolioCache(photographer.id);
+    return { success: true };
   }
 
-  async uploadPortfolioAboutImage(userId: string, file: any) {
+  async getPortfolioAboutImageUploadUrl(userId: string, data: { mimeType: string; fileSize: number }) {
     const photographer = await this.prisma.photographer.findUnique({
       where: { userId },
       include: {
@@ -3440,48 +4479,70 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Photographer profile not found');
     }
 
-    if (!file) {
-      throw new BadRequestException('No file provided');
-    }
-
-    // Portfolio storage limit check
     const activeSub = photographer.subscriptions[0];
     const portfolioLimitBytes = activeSub
       ? (activeSub.limitPortfolioBytes ?? BigInt(0))
       : BigInt(0);
     if (portfolioLimitBytes > BigInt(0)) {
       const portfolioUsed = await this.getPortfolioStorageUsed(photographer.id);
-      if (portfolioUsed + BigInt(file.size) > portfolioLimitBytes) {
+      if (portfolioUsed + BigInt(data.fileSize) > portfolioLimitBytes) {
         throw new BadRequestException(
           `Portfolio storage limit exceeded (${Math.round(Number(portfolioLimitBytes) / 1024 / 1024)} MB). Please upgrade your plan.`
         );
       }
     }
 
-    const maxSizeBytes = 2 * 1024 * 1024; // 2MB per-file cap
-    if (file.size > maxSizeBytes) {
-      throw new BadRequestException('About image file size must be less than 2 MB');
-    }
+    const ext = data.mimeType?.includes('webp') ? 'webp' : 'jpg';
+    const key = `${photographer.id}/portfolio/about.${ext}`;
 
-    const key = `${photographer.id}/portfolio/about.png`;
-
-    await this.s3Client.send(new PutObjectCommand({
+    const command = new PutObjectCommand({
       Bucket: this.bucketName,
       Key: key,
-      Body: file.buffer,
-      ContentType: file.mimetype || 'image/png',
-    }));
+      ContentType: data.mimeType,
+    });
+
+    const uploadUrl = await getSignedUrl(this.s3Client, command, {
+      expiresIn: 3600,
+      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+    });
+    return { uploadUrl, key };
+  }
+
+  async completePortfolioAboutImageUpload(userId: string, key: string, fileSize?: number) {
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { userId }
+    });
+
+    if (!photographer) {
+      throw new NotFoundException('Photographer profile not found');
+    }
+
+    const oldKey = photographer.portfolioAboutImageKey;
+
+    if (oldKey && oldKey !== key) {
+      try {
+        await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldKey }));
+        this.urlCache.delete(oldKey);
+      } catch { }
+    }
 
     await this.prisma.photographer.update({
       where: { id: photographer.id },
-      data: { portfolioAboutImageKey: key }
+      data: {
+        portfolioAboutImageKey: key,
+        portfolioAboutImageSizeBytes: fileSize ? BigInt(fileSize) : BigInt(0),
+      }
     });
 
+    await this.recalculateStorage(photographer.id);
+    await this.invalidatePortfolioCache(photographer.id);
+
+    this.urlCache.delete(key);
     const url = await this.getReadUrl(key);
     return { success: true, url, key };
   }
 
-  async uploadPortfolioHeroImage(userId: string, file: any) {
+  async getPortfolioReelVideoUploadUrl(userId: string, data: { filename: string; mimeType: string; fileSize: number }) {
     const photographer = await this.prisma.photographer.findUnique({
       where: { userId },
       include: {
@@ -3497,102 +4558,39 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Photographer profile not found');
     }
 
-    if (!file) {
-      throw new BadRequestException('No file provided');
-    }
-
-    // Portfolio storage limit check
     const activeSub = photographer.subscriptions[0];
     const portfolioLimitBytes = activeSub
       ? (activeSub.limitPortfolioBytes ?? BigInt(0))
       : BigInt(0);
     if (portfolioLimitBytes > BigInt(0)) {
       const portfolioUsed = await this.getPortfolioStorageUsed(photographer.id);
-      if (portfolioUsed + BigInt(file.size) > portfolioLimitBytes) {
+      if (portfolioUsed + BigInt(data.fileSize) > portfolioLimitBytes) {
         throw new BadRequestException(
           `Portfolio storage limit exceeded (${Math.round(Number(portfolioLimitBytes) / 1024 / 1024)} MB). Please upgrade your plan.`
         );
       }
     }
 
-    const maxSizeBytes = 4 * 1024 * 1024; // 4MB per-file cap for hero cover
-    if (file.size > maxSizeBytes) {
-      throw new BadRequestException('Hero cover file size must be less than 4 MB');
-    }
-
-    const key = `${photographer.id}/portfolio/hero.png`;
-
-    await this.s3Client.send(new PutObjectCommand({
-      Bucket: this.bucketName,
-      Key: key,
-      Body: file.buffer,
-      ContentType: file.mimetype || 'image/png',
-    }));
-
-    await this.prisma.photographer.update({
-      where: { id: photographer.id },
-      data: { portfolioHeroImageKey: key }
-    });
-
-    const url = await this.getReadUrl(key);
-    return { success: true, url, key };
-  }
-
-  async uploadPortfolioReelVideo(userId: string, file: any) {
-    const photographer = await this.prisma.photographer.findUnique({
-      where: { userId },
-      include: {
-        subscriptions: {
-          where: { status: 'ACTIVE' },
-          orderBy: { startsAt: 'desc' },
-          take: 1
-        }
-      }
-    });
-
-    if (!photographer) {
-      throw new NotFoundException('Photographer profile not found');
-    }
-
-    if (!file) {
-      throw new BadRequestException('No file provided');
-    }
-
-    // Portfolio storage limit check
-    const activeSub = photographer.subscriptions[0];
-    const portfolioLimitBytes = activeSub
-      ? (activeSub.limitPortfolioBytes ?? BigInt(0))
-      : BigInt(0);
-    if (portfolioLimitBytes > BigInt(0)) {
-      const portfolioUsed = await this.getPortfolioStorageUsed(photographer.id);
-      if (portfolioUsed + BigInt(file.size) > portfolioLimitBytes) {
-        throw new BadRequestException(
-          `Portfolio storage limit exceeded (${Math.round(Number(portfolioLimitBytes) / 1024 / 1024)} MB). Please upgrade your plan.`
-        );
-      }
-    }
-
-    const maxSizeBytes = 500 * 1024 * 1024; // 500MB per-file cap for videos
-    if (file.size > maxSizeBytes) {
-      throw new BadRequestException('Video file size must be less than 500 MB');
-    }
-
-    const ext = file.originalname ? file.originalname.split('.').pop() : 'mp4';
+    const ext = data.filename ? data.filename.split('.').pop() : 'mp4';
     const timestamp = Date.now();
     const key = `${photographer.id}/portfolio/reels/${timestamp}.${ext}`;
 
-    await this.s3Client.send(new PutObjectCommand({
+    const command = new PutObjectCommand({
       Bucket: this.bucketName,
       Key: key,
-      Body: file.buffer,
-      ContentType: file.mimetype || 'video/mp4',
-    }));
+      ContentType: data.mimeType,
+    });
 
+    const uploadUrl = await getSignedUrl(this.s3Client, command, {
+      expiresIn: 3600,
+      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+    });
     const url = await this.getReadUrl(key);
-    return { success: true, url, key };
+
+    return { uploadUrl, key, url };
   }
 
-  async uploadPortfolioPhoto(userId: string, file: any, category?: string) {
+  async getPortfolioReelItemUploadUrl(userId: string, data: { filename: string; mimeType: string; fileSize: number }) {
     const photographer = await this.prisma.photographer.findUnique({
       where: { userId },
       include: {
@@ -3608,87 +4606,174 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Photographer profile not found');
     }
 
-    if (!file) {
-      throw new BadRequestException('No file provided');
-    }
-
-    // Portfolio storage limit check
     const activeSub = photographer.subscriptions[0];
     const portfolioLimitBytes = activeSub
       ? (activeSub.limitPortfolioBytes ?? BigInt(0))
       : BigInt(0);
     if (portfolioLimitBytes > BigInt(0)) {
       const portfolioUsed = await this.getPortfolioStorageUsed(photographer.id);
-      if (portfolioUsed + BigInt(file.size) > portfolioLimitBytes) {
+      if (portfolioUsed + BigInt(data.fileSize) > portfolioLimitBytes) {
         throw new BadRequestException(
           `Portfolio storage limit exceeded (${Math.round(Number(portfolioLimitBytes) / 1024 / 1024)} MB). Please upgrade your plan.`
         );
       }
     }
 
-    const maxSizeBytes = 10 * 1024 * 1024; // 10MB per-file cap
-    if (file.size > maxSizeBytes) {
-      throw new BadRequestException('Showcase photo file size must be less than 10 MB');
+    const ext = data.filename ? data.filename.split('.').pop() : 'mp4';
+    const reelUuid = uuidv4();
+    const key = `${photographer.id}/portfolio/reels/${reelUuid}.${ext}`;
+
+    const command = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: key,
+      ContentType: data.mimeType,
+    });
+
+    const uploadUrl = await getSignedUrl(this.s3Client, command, {
+      expiresIn: 3600,
+      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+    });
+    const url = await this.getReadUrl(key);
+
+    return { uploadUrl, key, url };
+  }
+
+  async completePortfolioReelItemUpload(userId: string, data: { key: string; title?: string; category?: string; fileSize?: number }) {
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { userId }
+    });
+
+    if (!photographer) {
+      throw new NotFoundException('Photographer profile not found');
     }
 
-    const photoUuid = uuidv4();
-    const originalKey = `${photographer.id}/portfolio/showcase/${photoUuid}_original.jpg`;
-    const thumbKey = `${photographer.id}/portfolio/showcase/${photoUuid}_thumb.jpg`;
-
-
-    // 1. Upload original photo
-    await this.s3Client.send(new PutObjectCommand({
-      Bucket: this.bucketName,
-      Key: originalKey,
-      Body: file.buffer,
-      ContentType: file.mimetype || 'image/jpeg',
-    }));
-
-    // 2. Generate fast loading preview/thumbnail (800px max width/height)
-    let thumbBuffer = file.buffer;
-    try {
-      thumbBuffer = await sharp(file.buffer)
-        .resize({ width: 800, height: 800, fit: 'inside', withoutEnlargement: true })
-        .jpeg({ quality: 80 })
-        .toBuffer();
-    } catch (err) {
-      console.error('[StorageService] Portfolio photo thumbnail generation failed:', err);
-    }
-
-    // 3. Upload thumbnail photo
-    await this.s3Client.send(new PutObjectCommand({
-      Bucket: this.bucketName,
-      Key: thumbKey,
-      Body: thumbBuffer,
-      ContentType: 'image/jpeg',
-    }));
-
-    // 4. Update photographer storage consumption
-    const totalAddedBytes = BigInt(file.buffer.length + thumbBuffer.length);
-    await this.prisma.photographer.update({
-      where: { id: photographer.id },
+    const reel = await this.prisma.portfolioReel.create({
       data: {
-        totalStorageUsedBytes: {
-          increment: totalAddedBytes
+        photographerId: photographer.id,
+        title: data.title || 'Untitled Reel',
+        category: data.category || 'Highlights',
+        r2Key: data.key,
+        fileSize: data.fileSize ? BigInt(data.fileSize) : BigInt(0),
+      }
+    });
+
+    await this.recalculateStorage(photographer.id);
+    await this.invalidatePortfolioCache(photographer.id);
+    const url = await this.getReadUrl(data.key);
+    return {
+      success: true,
+      reel: {
+        id: reel.id,
+        title: reel.title,
+        category: reel.category,
+        r2Key: reel.r2Key,
+        url,
+        viewsCount: reel.viewsCount,
+        createdAt: reel.createdAt
+      }
+    };
+  }
+
+  async getPortfolioPhotoUploadUrl(
+    userId: string,
+    data: {
+      original: { filename: string; mimeType: string; fileSize: number };
+      thumb: { filename: string; mimeType: string; fileSize: number };
+    }
+  ) {
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { userId },
+      include: {
+        subscriptions: {
+          where: { status: 'ACTIVE' },
+          orderBy: { startsAt: 'desc' },
+          take: 1
         }
       }
     });
 
-    // 5. Create PortfolioPhoto database record
+    if (!photographer) {
+      throw new NotFoundException('Photographer profile not found');
+    }
+
+    const activeSub = photographer.subscriptions[0];
+    const portfolioLimitBytes = activeSub
+      ? (activeSub.limitPortfolioBytes ?? BigInt(0))
+      : BigInt(0);
+    if (portfolioLimitBytes > BigInt(0)) {
+      const portfolioUsed = await this.getPortfolioStorageUsed(photographer.id);
+      const totalRequested = BigInt(data.original.fileSize) + BigInt(data.thumb.fileSize);
+      if (portfolioUsed + totalRequested > portfolioLimitBytes) {
+        throw new BadRequestException(
+          `Portfolio storage limit exceeded (${Math.round(Number(portfolioLimitBytes) / 1024 / 1024)} MB). Please upgrade your plan.`
+        );
+      }
+    }
+
+    const photoUuid = uuidv4();
+    const originalExt = data.original.filename?.split('.').pop() || 'jpg';
+    const thumbExt = data.thumb.filename?.split('.').pop() || 'jpg';
+    const originalKey = `${photographer.id}/portfolio/showcase/${photoUuid}_original.${originalExt}`;
+    const thumbKey = `${photographer.id}/portfolio/showcase/${photoUuid}_thumb.${thumbExt}`;
+
+    const originalCommand = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: originalKey,
+      ContentType: data.original.mimeType,
+    });
+
+    const thumbCommand = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: thumbKey,
+      ContentType: data.thumb.mimeType,
+    });
+
+    const originalUploadUrl = await getSignedUrl(this.s3Client, originalCommand, {
+      expiresIn: 3600,
+      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+    });
+    const thumbUploadUrl = await getSignedUrl(this.s3Client, thumbCommand, {
+      expiresIn: 3600,
+      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+    });
+
+    return {
+      original: {
+        uploadUrl: originalUploadUrl,
+        key: originalKey
+      },
+      thumb: {
+        uploadUrl: thumbUploadUrl,
+        key: thumbKey
+      }
+    };
+  }
+
+  async completePortfolioPhotoUpload(userId: string, data: { originalKey: string; thumbKey: string; category?: string; fileSize?: number; thumbSizeBytes?: number }) {
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { userId }
+    });
+
+    if (!photographer) {
+      throw new NotFoundException('Photographer profile not found');
+    }
+
     const portfolioPhoto = await this.prisma.portfolioPhoto.create({
       data: {
         photographerId: photographer.id,
-        r2KeyOriginal: originalKey,
-        r2KeyThumb: thumbKey,
-        category: category || 'General'
+        r2KeyOriginal: data.originalKey,
+        r2KeyThumb: data.thumbKey,
+        fileSize: data.fileSize ? BigInt(data.fileSize) : BigInt(0),
+        thumbSizeBytes: data.thumbSizeBytes ? BigInt(data.thumbSizeBytes) : BigInt(0),
+        category: data.category || 'General'
       }
     });
 
-    // 6. Recalculate storage to ensure perfect synchronization
     await this.recalculateStorage(photographer.id);
+    await this.invalidatePortfolioCache(photographer.id);
 
-    const url = await this.getReadUrl(originalKey);
-    const thumbUrl = await this.getReadUrl(thumbKey);
+    const url = await this.getReadUrl(data.originalKey);
+    const thumbUrl = await this.getReadUrl(data.thumbKey);
 
     return {
       success: true,
@@ -3696,10 +4781,10 @@ export class StorageService implements OnModuleInit {
         id: portfolioPhoto.id,
         url,
         thumbUrl,
+        category: portfolioPhoto.category,
         sortOrder: portfolioPhoto.sortOrder
       }
     };
-
   }
 
   async deletePortfolioPhoto(userId: string, photoId: string) {
@@ -3746,6 +4831,7 @@ export class StorageService implements OnModuleInit {
 
     // 4. Recalculate storage
     await this.recalculateStorage(photographer.id);
+    await this.invalidatePortfolioCache(photographer.id);
 
     return { success: true };
   }
@@ -3790,7 +4876,7 @@ export class StorageService implements OnModuleInit {
 
     // Recalculate storage after all photos in the category are deleted
     await this.recalculateStorage(photographer.id);
-
+    await this.invalidatePortfolioCache(photographer.id);
 
     return { success: true, count: photosToDelete.length };
   }
@@ -3835,7 +4921,6 @@ export class StorageService implements OnModuleInit {
     };
 
     await deleteIfKeyExists(photographer.portfolioAboutImageKey);
-    await deleteIfKeyExists(photographer.portfolioHeroImageKey);
 
     // Also delete any direct video keys
     if (photographer.portfolioVideoUrl) {
@@ -3845,13 +4930,16 @@ export class StorageService implements OnModuleInit {
       await deleteIfKeyExists(photographer.portfolioBtsUrl);
     }
 
-    // Clean reels keys
-    if (photographer.portfolioReels && Array.isArray(photographer.portfolioReels)) {
-      for (const r of photographer.portfolioReels as any[]) {
-        if (r && r.r2Key) {
-          await deleteIfKeyExists(r.r2Key);
-        }
+    // Clean reels keys from database and R2
+    const dbReels = await this.prisma.portfolioReel.findMany({
+      where: { photographerId: photographer.id },
+      select: { id: true, r2Key: true }
+    });
+    for (const r of dbReels) {
+      if (r.r2Key) {
+        await deleteIfKeyExists(r.r2Key);
       }
+      await this.prisma.portfolioReel.delete({ where: { id: r.id } });
     }
 
 
@@ -3860,28 +4948,62 @@ export class StorageService implements OnModuleInit {
       where: { id: photographer.id },
       data: {
         portfolioAboutImageKey: null,
-        portfolioHeroImageKey: null,
+        portfolioAboutImageSizeBytes: BigInt(0),
         portfolioVideoUrl: null,
+        portfolioVideoSizeBytes: BigInt(0),
         portfolioBtsUrl: null,
-        portfolioReels: []
+        portfolioBtsSizeBytes: BigInt(0),
       }
     });
 
     // Recalculate storage
     await this.recalculateStorage(photographer.id);
+    await this.invalidatePortfolioCache(photographer.id);
 
     return { success: true };
   }
 
-
+  async invalidatePortfolioCache(photographerId: string, subdomain?: string) {
+    try {
+      if (subdomain) {
+        const clean = subdomain.toLowerCase().replace(/[^a-z0-9-]/g, '');
+        await this.redis.del(`cache:public:portfolio:${clean}`);
+      } else {
+        const photographer = await this.prisma.photographer.findUnique({
+          where: { id: photographerId },
+          select: { studioSubdomain: true }
+        });
+        if (photographer?.studioSubdomain) {
+          const clean = photographer.studioSubdomain.toLowerCase().replace(/[^a-z0-9-]/g, '');
+          await this.redis.del(`cache:public:portfolio:${clean}`);
+        }
+      }
+    } catch (err: any) {
+      this.logger.error(`[invalidatePortfolioCache] Redis del error: ${err.message}`);
+    }
+  }
 
   async getPublicPortfolioBySubdomain(subdomain: string) {
     const cleanSubdomain = subdomain.toLowerCase().replace(/[^a-z0-9-]/g, '');
+    const cacheKey = `cache:public:portfolio:${cleanSubdomain}`;
+
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
+        return JSON.parse(cached);
+      }
+    } catch (err: any) {
+      this.logger.error(`[getPublicPortfolioBySubdomain] Redis get error: ${err.message}`);
+    }
+
     const photographer = await this.prisma.photographer.findUnique({
       where: { studioSubdomain: cleanSubdomain },
       include: {
         portfolioPhotos: {
           orderBy: { sortOrder: 'asc' }
+        },
+        portfolioReels: {
+          orderBy: { createdAt: 'desc' }
         }
       }
     });
@@ -3904,23 +5026,29 @@ export class StorageService implements OnModuleInit {
       })
     );
 
+    const reels = await Promise.all(
+      (photographer.portfolioReels || []).map(async (r) => {
+        const url = await this.getReadUrl(r.r2Key);
+        return {
+          id: r.id,
+          title: r.title,
+          category: r.category || 'Highlights',
+          r2Key: r.r2Key,
+          url,
+          viewsCount: r.viewsCount,
+          createdAt: r.createdAt
+        };
+      })
+    );
+
     const aboutImageUrl = photographer.portfolioAboutImageKey
       ? await this.getReadUrl(photographer.portfolioAboutImageKey)
       : null;
 
-    const heroImageUrl = photographer.portfolioHeroImageKey
-      ? await this.getReadUrl(photographer.portfolioHeroImageKey)
-      : null;
-
     const freshVideoUrl = await this.getFreshVideoUrl(photographer.portfolioVideoUrl);
     const freshBtsUrl = await this.getFreshVideoUrl(photographer.portfolioBtsUrl);
-    const rawReels = photographer.portfolioReels ? (photographer.portfolioReels as any[]) : [];
-    const freshReels = await Promise.all(rawReels.map(async (r) => {
-      const freshUrl = await this.getFreshVideoUrl(r.url);
-      return { ...r, url: freshUrl };
-    }));
 
-    return {
+    const result = {
       portfolioEnabled: photographer.portfolioEnabled,
       portfolioTheme: photographer.portfolioTheme,
       portfolioHeroTitle: photographer.portfolioHeroTitle,
@@ -3928,7 +5056,6 @@ export class StorageService implements OnModuleInit {
       portfolioAboutTitle: photographer.portfolioAboutTitle,
       portfolioAboutText: photographer.portfolioAboutText,
       portfolioAboutImageUrl: aboutImageUrl,
-      portfolioHeroImageUrl: heroImageUrl,
       portfolioMapEmbed: photographer.portfolioMapEmbed,
       portfolioPackages: photographer.portfolioPackages,
       portfolioServices: photographer.portfolioServices,
@@ -3942,7 +5069,7 @@ export class StorageService implements OnModuleInit {
       portfolioDestinations: photographer.portfolioDestinations,
       portfolioBookingPolicy: photographer.portfolioBookingPolicy,
       portfolioPress: photographer.portfolioPress,
-      portfolioReels: freshReels,
+      portfolioReels: reels,
       portfolioStyles: photographer.portfolioStyles,
       portfolioPhone: photographer.portfolioPhone,
       portfolioEmail: photographer.portfolioEmail,
@@ -3950,20 +5077,24 @@ export class StorageService implements OnModuleInit {
       portfolioWhatsapp: photographer.portfolioWhatsapp,
       portfolioPhotos: photos,
       studioName: photographer.studioName,
-      primaryColor: photographer.primaryColor,
-      secondaryColor: photographer.secondaryColor,
       instagramUrl: photographer.instagramUrl,
       facebookUrl: photographer.facebookUrl,
       whatsappPhone: photographer.whatsappPhone,
       studioLogoKey: photographer.studioLogoKey,
-      studioHeroBannerKey: photographer.studioHeroBannerKey,
-      studioFontFamily: photographer.studioFontFamily,
       seoTitle: photographer.seoTitle,
       seoDescription: photographer.seoDescription,
       hidePoweredBy: photographer.hidePoweredBy,
       customFooterText: photographer.customFooterText,
       photographerId: photographer.id
     };
+
+    try {
+      await this.redis.setex(cacheKey, 600, JSON.stringify(result));
+    } catch (err: any) {
+      this.logger.error(`[getPublicPortfolioBySubdomain] Redis set error: ${err.message}`);
+    }
+
+    return result;
   }
 
   async createPortfolioInquiry(subdomain: string, data: {
@@ -4150,188 +5281,6 @@ export class StorageService implements OnModuleInit {
     return { success: true, key };
   }
 
-  private async applyWatermark(imageBuffer: Buffer, photographer: any): Promise<Buffer> {
-    let hasCustomBranding = false;
-    if (photographer) {
-      const activeSub = await this.prisma.subscription.findFirst({
-        where: { photographerId: photographer.id, status: 'ACTIVE' },
-        include: { package: true },
-        orderBy: { createdAt: 'desc' }
-      });
-      hasCustomBranding = activeSub?.package ? activeSub.package.featureCustomBranding : false;
-    }
-
-    const watermarkType = hasCustomBranding ? (photographer ? photographer.watermarkType : 'NONE') : 'IMAGE';
-
-    const sizeSetting = hasCustomBranding ? (photographer ? photographer.watermarkSize : 'MEDIUM') : 'LARGE';
-    const position = hasCustomBranding ? (photographer ? photographer.watermarkPosition : 'CENTER') : 'CENTER';
-    const opacity = hasCustomBranding ? (photographer ? photographer.watermarkOpacity : 50) : 50;
-
-    console.log('[WM] applyWatermark called:', { watermarkType, sizeSetting, position, opacity, hasImageKey: !!photographer?.watermarkImageKey, hasCustomBranding });
-
-    if (watermarkType === 'NONE' || !watermarkType) {
-      console.log('[WM] watermarkType is NONE, returning original');
-      return imageBuffer;
-    }
-
-    let sizePercent = 0.30;
-    if (sizeSetting === 'SMALL') sizePercent = 0.12;
-    if (sizeSetting === 'LARGE') sizePercent = 0.45;
-
-    const metadata = await sharp(imageBuffer).metadata();
-    const imgWidth = metadata.width || 1200;
-    const imgHeight = metadata.height || 800;
-
-    // Helper: clamp composites so they never go outside image bounds
-    const clampLeft = (l: number, ww: number) => Math.max(0, Math.min(imgWidth - ww - 1, l));
-    const clampTop = (t: number, wh: number) => Math.max(0, Math.min(imgHeight - wh - 1, t));
-
-    // Compute left/top from gravity for CENTER and BOTTOM_RIGHT
-    const placeWatermark = (ww: number, wh: number): { left: number; top: number } => {
-      if (position === 'BOTTOM_RIGHT') {
-        return {
-          left: clampLeft(imgWidth - ww - Math.round(imgWidth * 0.03), ww),
-          top: clampTop(imgHeight - wh - Math.round(imgHeight * 0.03), wh),
-        };
-      }
-      // CENTER default
-      return {
-        left: clampLeft(Math.round((imgWidth - ww) / 2), ww),
-        top: clampTop(Math.round((imgHeight - wh) / 2), wh),
-      };
-    };
-
-    if (watermarkType === 'TEXT') {
-      const text = photographer.watermarkText || 'PhotosetGo';
-      const tileReducer = position === 'TILE' ? 0.5 : 1.0;
-      const fontSize = Math.max(16, Math.round(imgWidth * sizePercent * 0.15 * tileReducer));
-      const svgPad = Math.round(fontSize * 0.5);
-      const svgWidth = Math.round(text.length * fontSize * 0.62) + svgPad * 2;
-      const svgHeight = Math.round(fontSize * 1.8);
-      const textOpacity = opacity / 100;
-
-      const makeSvg = (w: number, h: number) => Buffer.from(`
-        <svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
-          <style>
-            .t { fill: rgba(255,255,255,${textOpacity}); font-size: ${fontSize}px; font-family: Arial,sans-serif; font-weight: bold; letter-spacing: 1px; }
-            .s { fill: rgba(0,0,0,${textOpacity * 0.4}); font-size: ${fontSize}px; font-family: Arial,sans-serif; font-weight: bold; letter-spacing: 1px; }
-          </style>
-          <text x="${w / 2 + 1}" y="${h * 0.72}" text-anchor="middle" class="s">${text}</text>
-          <text x="${w / 2}" y="${h * 0.70}" text-anchor="middle" class="t">${text}</text>
-        </svg>
-      `);
-
-      const svgBuf = makeSvg(svgWidth, svgHeight);
-      let composites: any[] = [];
-
-      if (position === 'TILE') {
-        const cols = 3, rows = 3;
-        for (let r = 0; r < rows; r++) {
-          for (let c = 0; c < cols; c++) {
-            composites.push({
-              input: svgBuf,
-              left: clampLeft(Math.round((imgWidth / cols) * (c + 0.5) - svgWidth / 2), svgWidth),
-              top: clampTop(Math.round((imgHeight / rows) * (r + 0.5) - svgHeight / 2), svgHeight),
-            });
-          }
-        }
-      } else {
-        const pos = placeWatermark(svgWidth, svgHeight);
-        composites.push({ input: svgBuf, ...pos });
-      }
-
-      return sharp(imageBuffer)
-        .composite(composites)
-        .extract({ left: 0, top: 0, width: imgWidth, height: imgHeight })
-        .toBuffer();
-    }
-
-    if (watermarkType === 'IMAGE') {
-      try {
-        let watermarkRaw: Buffer | null = null;
-
-        if (photographer.watermarkImageKey && hasCustomBranding) {
-          const getCommand = new GetObjectCommand({
-            Bucket: this.bucketName,
-            Key: photographer.watermarkImageKey,
-          });
-          const s3Response = await this.s3Client.send(getCommand);
-          if (s3Response.Body) {
-            watermarkRaw = Buffer.from(await s3Response.Body.transformToByteArray());
-          }
-        } else {
-          const fs = require('fs');
-          const path = require('path');
-          const logoPath = path.join(process.cwd(), 'assets', 'logo', 'fotosetgo.png');
-          if (fs.existsSync(logoPath)) {
-            watermarkRaw = fs.readFileSync(logoPath);
-          }
-        }
-
-        if (!watermarkRaw) return imageBuffer;
-
-        const tileReducer = position === 'TILE' ? 0.35 : 1.0;
-        const wWidth = Math.max(30, Math.round(imgWidth * sizePercent * tileReducer));
-        const alphaFraction = Math.min(1, Math.max(0, opacity / 100));
-
-        // Resize first
-        const resizedPipeline = sharp(watermarkRaw)
-          .resize({ width: wWidth, fit: 'inside' })
-          .ensureAlpha();
-
-        const resizedBuf = await resizedPipeline.toBuffer();
-        const resizedMeta = await sharp(resizedBuf).metadata();
-        const rW = resizedMeta.width || wWidth;
-        const rH = resizedMeta.height || Math.round(wWidth * 0.4);
-
-        // Get raw pixel data and manually scale alpha channel
-        const { data, info } = await sharp(resizedBuf)
-          .raw()
-          .toBuffer({ resolveWithObject: true });
-
-        const pixelData = new Uint8Array(data.buffer);
-        for (let i = 3; i < pixelData.length; i += 4) {
-          pixelData[i] = Math.round(pixelData[i] * alphaFraction);
-        }
-
-        const resized = await sharp(Buffer.from(pixelData.buffer), {
-          raw: { width: rW, height: rH, channels: 4 }
-        }).png().toBuffer();
-
-        const wMeta = await sharp(resized).metadata();
-        const wW = wMeta.width || wWidth;
-        const wH = wMeta.height || Math.round(wWidth * 0.4);
-
-        let composites: any[] = [];
-
-        if (position === 'TILE') {
-          const cols = 3, rows = 3;
-          for (let r = 0; r < rows; r++) {
-            for (let c = 0; c < cols; c++) {
-              composites.push({
-                input: resized,
-                left: clampLeft(Math.round((imgWidth / cols) * (c + 0.5) - wW / 2), wW),
-                top: clampTop(Math.round((imgHeight / rows) * (r + 0.5) - wH / 2), wH),
-              });
-            }
-          }
-        } else {
-          const pos = placeWatermark(wW, wH);
-          composites.push({ input: resized, ...pos });
-        }
-
-        return sharp(imageBuffer)
-          .composite(composites)
-          .extract({ left: 0, top: 0, width: imgWidth, height: imgHeight })
-          .toBuffer();
-      } catch (err) {
-        console.error('[StorageService] Image watermark error:', err);
-      }
-    }
-
-    return imageBuffer;
-  }
-
   // ─── Portfolio Reviews ─────────────────────────────────────────────────────
 
   async createPortfolioReview(subdomain: string, data: {
@@ -4374,10 +5323,12 @@ export class StorageService implements OnModuleInit {
     if (!review || review.photographerId !== photographer.id) {
       throw new NotFoundException('Review not found or ownership mismatch');
     }
-    return this.prisma.portfolioReview.update({
+    const updated = await this.prisma.portfolioReview.update({
       where: { id: reviewId },
       data: { isApproved: approve }
     });
+    await this.invalidatePortfolioCache(photographer.id);
+    return updated;
   }
 
   async deletePortfolioReview(userId: string, reviewId: string) {
@@ -4388,6 +5339,7 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Review not found or ownership mismatch');
     }
     await this.prisma.portfolioReview.delete({ where: { id: reviewId } });
+    await this.invalidatePortfolioCache(photographer.id);
     return { success: true };
   }
 
@@ -4449,117 +5401,7 @@ export class StorageService implements OnModuleInit {
     }
   }
 
-  async uploadGuestPhotoDirect(slug: string, file: any) {
-    const event = await this.prisma.event.findUnique({
-      where: { slug },
-      include: {
-        photographer: {
-          include: {
-            subscriptions: {
-              where: { status: 'ACTIVE' },
-              orderBy: { startsAt: 'desc' },
-              take: 1
-            }
-          }
-        }
-      }
-    });
-
-    if (!event) {
-      throw new NotFoundException('Event not found');
-    }
-
-    if (!event.allowGuestUploads) {
-      throw new BadRequestException('Guest uploads are not enabled for this event');
-    }
-
-    // 1. Verify Photographer level storage limit
-    const photographer = event.photographer;
-    const activeSubscription = photographer.subscriptions[0];
-    const limitBytes = activeSubscription?.limitEventsBytes ?? activeSubscription?.limitBytes ?? BigInt(5000 * 1024 * 1024);
-    const totalStorageUsedBytes = photographer.totalStorageUsedBytes || BigInt(0);
-
-    if (totalStorageUsedBytes + BigInt(file.size) > limitBytes) {
-      throw new BadRequestException('Photographer storage space is full. Cannot accept uploads.');
-    }
-
-    // 2. Verify Event Guest Upload Limits
-    const guestPhotosStats = await this.prisma.photo.aggregate({
-      where: { eventId: event.id, isGuestUpload: true },
-      _count: { id: true },
-      _sum: { fileSize: true }
-    });
-
-    const currentGuestCount = guestPhotosStats._count.id || 0;
-    const currentGuestSize = guestPhotosStats._sum.fileSize ? BigInt(guestPhotosStats._sum.fileSize.toString()) : BigInt(0);
-
-    if (currentGuestCount >= event.maxGuestUploadFiles) {
-      throw new BadRequestException(`Guest upload file limit reached (${event.maxGuestUploadFiles} files max).`);
-    }
-
-    if (currentGuestSize + BigInt(file.size) > event.maxGuestUploadStorage) {
-      const maxMB = Math.round(Number(event.maxGuestUploadStorage) / 1024 / 1024);
-      throw new BadRequestException(`Guest upload storage size limit reached (${maxMB} MB max).`);
-    }
-
-    const isVideo = file.mimetype.startsWith('video/') || file.originalname.match(/\.(mp4|mkv|mov|webm)$/i);
-    const fileUuid = uuidv4();
-    const cleanFilename = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-
-    // Set R2 Path
-    const objectKey = isVideo
-      ? `${photographer.id}/events/${event.id}/videos/${fileUuid}_${cleanFilename}`
-      : `${photographer.id}/events/${event.id}/photos/${fileUuid}_${cleanFilename}`;
-
-    // Upload directly to Cloudflare R2 from server side
-    await this.s3Client.send(new PutObjectCommand({
-      Bucket: this.bucketName,
-      Key: objectKey,
-      Body: file.buffer,
-      ContentType: file.mimetype
-    }));
-
-    // Create Photo entry in DB
-    const photo = await this.prisma.photo.create({
-      data: {
-        eventId: event.id,
-        photographerId: photographer.id,
-        filenameOriginal: file.originalname,
-        filenameStored: `${fileUuid}_${cleanFilename}`,
-        r2KeyOriginal: objectKey,
-        mimeType: file.mimetype,
-        fileSize: BigInt(file.size),
-        status: 'PENDING_APPROVAL',
-        type: isVideo ? 'VIDEO' : 'IMAGE',
-        isGuestUpload: true
-      },
-    });
-
-    // Update photographer storage usage allocation
-    await this.prisma.photographer.update({
-      where: { id: photographer.id },
-      data: {
-        totalStorageUsedBytes: {
-          increment: BigInt(file.size)
-        }
-      }
-    });
-
-    if (activeSubscription) {
-      await this.prisma.subscription.update({
-        where: { id: activeSubscription.id },
-        data: {
-          usedBytes: {
-            increment: BigInt(file.size)
-          }
-        }
-      });
-    }
-
-    return photo;
-  }
-
-  async completeThumbnailWebhook(data: { photoId: string; thumbKey: string; previewKey?: string; secretKey: string }) {
+  async completeThumbnailWebhook(data: { photoId: string; thumbKey: string; previewKey?: string; thumbSize?: number; previewSize?: number; secretKey: string }) {
     // Validate secret key to match environmental setup
     const secret = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
     if (data.secretKey !== secret) {
@@ -4575,36 +5417,60 @@ export class StorageService implements OnModuleInit {
       throw new Error('Photo not found');
     }
 
-    // Update photo with thumbnail keys + set thumbnailStatus to READY
+    const thumbSizeBytes = data.thumbSize ? BigInt(data.thumbSize) : BigInt(0);
+    const previewSizeBytes = data.previewSize ? BigInt(data.previewSize) : BigInt(0);
+    const extraBytes = thumbSizeBytes + previewSizeBytes;
+
+    // Update photo with thumbnail keys, byte sizes + set thumbnailStatus & overall status to READY
+    const isPendingApproval = photo.status === 'PENDING_APPROVAL';
+
     await this.prisma.photo.update({
       where: { id: data.photoId },
       data: {
         r2KeyThumb: data.thumbKey,
         r2KeyPreview: data.previewKey || null,
-        thumbnailStatus: 'READY'
+        thumbSizeBytes,
+        previewSizeBytes,
+        thumbnailStatus: 'READY',
+        ...(isPendingApproval ? {} : { status: 'READY' })
       }
     });
 
-    // If photo is a pending guest upload, do NOT transition status to READY!
-    const isPendingApproval = photo.status === 'PENDING_APPROVAL';
+    // Add generated derivatives size to Redis storage counters
+    if (extraBytes > BigInt(0)) {
+      await this.redis.hincrby("agg:photographer:storage", photo.photographerId, extraBytes.toString()).catch(() => { });
+      const activeSub = await this.prisma.subscription.findFirst({
+        where: { photographerId: photo.photographerId, status: 'ACTIVE' },
+        orderBy: { startsAt: 'desc' }
+      });
+      if (activeSub) {
+        await this.redis.hincrby("agg:subscription:storage", activeSub.id, extraBytes.toString()).catch(() => { });
+      }
+    }
+
+    await this.invalidateStorageBreakdownCache(photo.photographerId);
 
     if (!isPendingApproval) {
-      // If face scanning is enabled, trigger background batch face indexing
-      if (photo.event.faceScanningEnabled) {
-        this.triggerFaceScanForEvent(
+      if (photo.type === 'VIDEO') {
+        this.runBackgroundVideoProcessing(
           photo.photographerId,
-          photo.eventId
+          photo.id,
+          photo.eventId,
+          photo.r2KeyOriginal,
+          photo.uploadBatchId
         ).catch(err => {
-          console.error('[Webhook] Background Face Indexing trigger failed:', err);
+          this.logger.error(`[Webhook] Background video processing failed for ${photo.id}: ${err.message}`);
         });
       } else {
-        // Mark overall photo status as READY if AI is disabled
-        await this.prisma.photo.update({
-          where: { id: data.photoId },
-          data: {
-            status: 'READY'
-          }
-        });
+        // If face scanning is enabled, trigger background batch face indexing silently without blocking photo status
+        if (photo.event.faceScanningEnabled) {
+          this.triggerFaceScanForEvent(
+            photo.photographerId,
+            photo.eventId
+          ).catch(err => {
+            console.error('[Webhook] Background Face Indexing trigger failed:', err);
+          });
+        }
 
         // Update upload batch progress status
         if (photo.uploadBatchId) {
@@ -4620,6 +5486,355 @@ export class StorageService implements OnModuleInit {
 
     await this.invalidateEventCache(photo.eventId);
     return { success: true };
+  }
+
+  async completeVideoFaceWebhook(data: {
+    photoId: string;
+    duration?: number;
+    faces?: Array<{
+      faceIndex?: number;
+      bbox?: { x: number; y: number; w: number; h: number };
+      confidence?: number;
+      embedding: number[];
+      timestamp?: number;
+    }>;
+    secretKey: string;
+    error?: string;
+  }) {
+    const secret = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
+    if (data.secretKey !== secret) {
+      throw new UnauthorizedException('Unauthorized webhook signature mismatch');
+    }
+
+    const photo = await this.prisma.photo.findUnique({
+      where: { id: data.photoId },
+      include: { event: true }
+    });
+
+    if (!photo) {
+      throw new NotFoundException('Photo not found');
+    }
+
+    const photographerId = photo.photographerId;
+    const eventId = photo.eventId;
+    const duration = Math.round(data.duration || photo.duration || 0);
+
+    if (data.error) {
+      this.logger.error(`[VideoFaceWebhook] Processing failed for video ${data.photoId}: ${data.error}`);
+      await this.prisma.photo.update({
+        where: { id: data.photoId },
+        data: { faceScanStatus: 'SKIPPED', status: 'READY' }
+      });
+      return { success: false, message: 'Recorded failure status without deducting credits' };
+    }
+
+    // Deduct actual cost from photographer credit balance atomically upon verified success
+    const actualMinutes = Math.ceil(duration / 60) || 1;
+    const actualCost = actualMinutes * 50; // 50 paise per minute
+
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { id: photographerId },
+      select: { creditBalance: true }
+    });
+    const latestBalance = photographer?.creditBalance || 0;
+    const deductAmount = Math.min(actualCost, latestBalance);
+
+    if (deductAmount > 0) {
+      await this.prisma.photographer.update({
+        where: { id: photographerId },
+        data: {
+          creditBalance: {
+            decrement: deductAmount
+          }
+        }
+      });
+
+      // Log transaction
+      await this.prisma.creditTransaction.create({
+        data: {
+          photographerId,
+          amount: -deductAmount,
+          action: 'VIDEO_SCAN',
+          description: `Scanned video (duration ${actualMinutes} min) for event: ${photo.event?.title || 'Unknown Event'}`
+        }
+      });
+    }
+
+    // Delete any existing face embeddings for this video photo first to prevent duplicates
+    await this.prisma.faceEmbedding.deleteMany({
+      where: { photoId: data.photoId }
+    });
+
+    if (data.faces && data.faces.length > 0) {
+      const faceData = data.faces.map((f: any) => ({
+        photoId: data.photoId,
+        eventId,
+        photographerId,
+        faceIndex: f.faceIndex ?? 0,
+        bboxX: f.bbox?.x ?? 0,
+        bboxY: f.bbox?.y ?? 0,
+        bboxW: f.bbox?.w ?? 0,
+        bboxH: f.bbox?.h ?? 0,
+        confidence: f.confidence ?? 0.95,
+        embedding: f.embedding,
+        timestamp: f.timestamp || 0,
+      }));
+
+      const values = faceData.map((f: any) => {
+        const vectorStr = `[${f.embedding.join(',')}]`;
+        return `('${uuidv4()}', '${f.photoId}', '${f.eventId}', '${f.photographerId}', ${f.faceIndex}, ${f.bboxX}, ${f.bboxY}, ${f.bboxW}, ${f.bboxH}, ${f.confidence}, '${vectorStr}'::vector, NULL, ${f.timestamp})`;
+      }).join(',');
+
+      await this.prisma.$executeRawUnsafe(`
+        INSERT INTO face_embeddings ("id", "photoId", "eventId", "photographerId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding", "clusterId", "timestamp")
+        VALUES ${values}
+      `);
+    }
+
+    const targetStatus = photo.status === 'PENDING_APPROVAL' ? 'PENDING_APPROVAL' : 'READY';
+    await this.prisma.photo.update({
+      where: { id: data.photoId },
+      data: {
+        faceScanStatus: 'READY',
+        status: targetStatus,
+        duration: duration > 0 ? duration : undefined
+      }
+    });
+
+    if (photo.uploadBatchId) {
+      await this.updateBatchProgress(photo.uploadBatchId, true);
+    }
+
+    await this.invalidateEventCache(eventId);
+
+    this.logger.log(`[VideoFaceWebhook] Successfully indexed video ${data.photoId} with ${data.faces?.length || 0} faces, duration ${duration}s.`);
+    return { success: true, faceCount: data.faces?.length || 0, duration };
+  }
+
+  async completePhotoFaceWebhook(data: {
+    eventId?: string;
+    photographerId?: string;
+    results?: Array<{
+      photoId: string;
+      faces?: Array<{
+        faceIndex?: number;
+        bbox?: { x: number; y: number; w: number; h: number };
+        confidence?: number;
+        embedding: number[];
+      }>;
+      faceCount?: number;
+      success?: boolean;
+      error?: string;
+    }>;
+    photoId?: string;
+    faces?: Array<{
+      faceIndex?: number;
+      bbox?: { x: number; y: number; w: number; h: number };
+      confidence?: number;
+      embedding: number[];
+    }>;
+    secretKey: string;
+    error?: string;
+  }) {
+    const secret = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
+    if (data.secretKey !== secret) {
+      throw new UnauthorizedException('Unauthorized webhook signature mismatch');
+    }
+
+    // Normalize single-photo or batch format to standard results array
+    let items = data.results || [];
+    if (!items.length && data.photoId) {
+      items = [{
+        photoId: data.photoId,
+        faces: data.faces,
+        faceCount: data.faces?.length || 0,
+        success: !data.error,
+        error: data.error
+      }];
+    }
+
+    if (items.length === 0) {
+      return { success: true, processedCount: 0 };
+    }
+
+    const firstPhoto = await this.prisma.photo.findUnique({
+      where: { id: items[0].photoId },
+      include: { event: true }
+    });
+
+    if (!firstPhoto) {
+      this.logger.error(`[PhotoFaceWebhook] Photo ${items[0].photoId} not found`);
+      return { success: false, message: 'Photo not found' };
+    }
+
+    const photographerId = data.photographerId || firstPhoto.photographerId;
+    const eventId = data.eventId || firstPhoto.eventId;
+
+    // Filter successfully scanned photos (only deduct for photos that were actually processed without error)
+    const successfulItems = items.filter(r => r.success !== false && !r.error);
+    const totalSuccessfulPhotos = successfulItems.length;
+
+    // For failed items from Modal, update status to SKIPPED to prevent infinite background retry loops
+    const failedItems = items.filter(r => r.success === false || !!r.error);
+    if (failedItems.length > 0) {
+      const failedIds = failedItems.map(f => f.photoId);
+      await this.prisma.photo.updateMany({
+        where: { id: { in: failedIds } },
+        data: { faceScanStatus: 'SKIPPED' }
+      }).catch(err => this.logger.error(`[PhotoFaceWebhook] Error marking failed items: ${err.message}`));
+    }
+
+    // 10 paise per successfully scanned photo
+    const actualCost = totalSuccessfulPhotos * 10;
+
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { id: photographerId },
+      select: { creditBalance: true }
+    });
+    const latestBalance = photographer?.creditBalance || 0;
+    const deductAmount = Math.min(actualCost, latestBalance);
+
+    if (deductAmount > 0) {
+      await this.prisma.photographer.update({
+        where: { id: photographerId },
+        data: {
+          creditBalance: {
+            decrement: deductAmount
+          }
+        }
+      });
+
+      // Log transaction
+      await this.prisma.creditTransaction.create({
+        data: {
+          photographerId,
+          amount: -deductAmount,
+          action: 'PHOTO_SCAN',
+          description: `Scanned ${totalSuccessfulPhotos} photo(s) for event: ${firstPhoto.event?.title || 'Unknown Event'}`
+        }
+      });
+    }
+
+    // Fetch existing faces in this event for auto-cluster assignment
+    interface RawExistingFace {
+      clusterId: string;
+      embeddingStr: string;
+    }
+    const existingFaces = await this.prisma.$queryRaw<RawExistingFace[]>`
+      SELECT "clusterId", "embedding"::text as "embeddingStr"
+      FROM face_embeddings
+      WHERE "eventId" = ${eventId} AND "clusterId" IS NOT NULL
+    `.catch(() => [] as RawExistingFace[]);
+
+    // Process each item: insert face embeddings and update photo record
+    for (const item of items) {
+      if (item.success === false || item.error) {
+        this.logger.warn(`[PhotoFaceWebhook] Photo ${item.photoId} face scan failed: ${item.error}`);
+        await this.prisma.photo.update({
+          where: { id: item.photoId },
+          data: { faceScanStatus: 'SKIPPED', status: 'READY' }
+        }).catch(() => { });
+        continue;
+      }
+
+      const faces = item.faces || [];
+      const hasFaces = faces.length > 0;
+      const faceCount = faces.length;
+
+      // Delete any previous face embeddings for this photo first to prevent duplicates
+      await this.prisma.faceEmbedding.deleteMany({
+        where: { photoId: item.photoId }
+      }).catch(() => { });
+
+      if (hasFaces) {
+        const faceData = faces.map((f: any, idx: number) => {
+          const newEmb = f.embedding;
+          let assignedClusterId: string | null = null;
+
+          if (Array.isArray(newEmb) && existingFaces.length > 0) {
+            let maxSimilarity = -1;
+            let bestClusterId: string | null = null;
+
+            for (const ext of existingFaces) {
+              let extEmb: any = ext.embeddingStr;
+              if (typeof extEmb === 'string') {
+                try { extEmb = JSON.parse(extEmb); } catch { continue; }
+              }
+              const extEmbArray = extEmb as number[];
+              const newEmbArray = newEmb as number[];
+              if (!Array.isArray(extEmbArray) || extEmbArray.length !== newEmbArray.length) continue;
+
+              let dotProduct = 0;
+              for (let i = 0; i < newEmbArray.length; i++) {
+                dotProduct += newEmbArray[i] * extEmbArray[i];
+              }
+
+              if (dotProduct > 0.45 && dotProduct > maxSimilarity) {
+                maxSimilarity = dotProduct;
+                bestClusterId = ext.clusterId;
+              }
+            }
+
+            if (bestClusterId) {
+              assignedClusterId = bestClusterId;
+            }
+          }
+
+          return {
+            photoId: item.photoId,
+            eventId,
+            photographerId,
+            faceIndex: f.faceIndex ?? idx,
+            bboxX: f.bbox?.x ?? 0,
+            bboxY: f.bbox?.y ?? 0,
+            bboxW: f.bbox?.w ?? 0,
+            bboxH: f.bbox?.h ?? 0,
+            confidence: f.confidence ?? 0.95,
+            embedding: f.embedding,
+            clusterId: assignedClusterId
+          };
+        });
+
+        const values = faceData.map((f: any) => {
+          const vectorStr = `[${f.embedding.join(',')}]`;
+          const clusterIdVal = f.clusterId ? `'${f.clusterId}'` : 'NULL';
+          return `('${uuidv4()}', '${f.photoId}', '${f.eventId}', '${f.photographerId}', ${f.faceIndex}, ${f.bboxX}, ${f.bboxY}, ${f.bboxW}, ${f.bboxH}, ${f.confidence}, '${vectorStr}'::vector, ${clusterIdVal})`;
+        }).join(',');
+
+        await this.prisma.$executeRawUnsafe(`
+          INSERT INTO face_embeddings ("id", "photoId", "eventId", "photographerId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding", "clusterId")
+          VALUES ${values}
+        `).catch(err => {
+          this.logger.error(`[PhotoFaceWebhook] Error inserting face embeddings for photo ${item.photoId}: ${err.message}`);
+        });
+      }
+
+      const currentPhoto = await this.prisma.photo.findUnique({
+        where: { id: item.photoId },
+        select: { status: true }
+      });
+
+      const targetStatus = currentPhoto?.status === 'PENDING_APPROVAL' ? 'PENDING_APPROVAL' : 'READY';
+
+      const updated = await this.prisma.photo.update({
+        where: { id: item.photoId },
+        data: {
+          faceScanStatus: 'READY',
+          hasFaces,
+          faceCount,
+          status: targetStatus
+        }
+      }).catch(() => null);
+
+      if (updated?.uploadBatchId) {
+        await this.updateBatchProgress(updated.uploadBatchId, true).catch(() => { });
+      }
+    }
+
+    await this.invalidateEventCache(eventId);
+
+    this.logger.log(`[PhotoFaceWebhook] Successfully indexed ${totalSuccessfulPhotos}/${items.length} photos for event ${eventId}. Deducted ${deductAmount} paise.`);
+    return { success: true, processedCount: totalSuccessfulPhotos, totalCount: items.length };
   }
 
   async triggerCloudflareWorker(photoId: string, r2KeyOriginal: string): Promise<void> {
@@ -4639,7 +5854,8 @@ export class StorageService implements OnModuleInit {
         body: JSON.stringify({
           objectKey: r2KeyOriginal,
           photoId: photoId
-        })
+        }),
+        signal: AbortSignal.timeout(30000)
       });
 
       this.logger.log(`[Worker Trigger] Response status from ${selectedUrl} for photo ${photoId}: ${res.status}`);
@@ -4647,11 +5863,13 @@ export class StorageService implements OnModuleInit {
         const data: any = await res.json();
         const result = data?.results?.[0];
         if (result && result.success && result.thumbKey) {
-          this.logger.log(`[Worker Trigger] Updating DB thumbnailStatus to READY for photo: ${photoId}`);
+          this.logger.log(`[Worker Trigger] Updating DB thumbnailStatus to READY for photo: ${photoId} (thumb: ${result.thumbSize}B, preview: ${result.previewSize}B)`);
           await this.completeThumbnailWebhook({
             photoId: photoId,
             thumbKey: result.thumbKey,
             previewKey: result.previewKey || null,
+            thumbSize: result.thumbSize,
+            previewSize: result.previewSize,
             secretKey: process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123'
           }).catch(err => this.logger.error(`[Worker Trigger] Local DB update error for ${photoId}: ${err.message}`));
         } else {
@@ -4686,7 +5904,8 @@ export class StorageService implements OnModuleInit {
         const res = await fetch(selectedUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: chunk })
+          body: JSON.stringify({ items: chunk }),
+          signal: AbortSignal.timeout(30000)
         });
 
         if (res.ok) {
@@ -4694,11 +5913,15 @@ export class StorageService implements OnModuleInit {
           if (data && data.results) {
             const readyItems = data.results.filter((r: any) => r.success);
             for (const item of readyItems) {
+              const tSize = item.thumbSize ? BigInt(item.thumbSize) : BigInt(0);
+              const pSize = item.previewSize ? BigInt(item.previewSize) : BigInt(0);
               await this.prisma.photo.update({
                 where: { id: item.photoId },
                 data: {
                   r2KeyThumb: item.thumbKey,
                   r2KeyPreview: item.previewKey || null,
+                  thumbSizeBytes: tSize,
+                  previewSizeBytes: pSize,
                   thumbnailStatus: 'READY',
                   status: 'READY'
                 }
@@ -4727,20 +5950,40 @@ export class StorageService implements OnModuleInit {
 
   // AI Face Toggle ON hone par ya Thumbnail complete hone par Batch Scan chalata hai (with Auto-Recheck loop)
   async triggerFaceScanForEvent(photographerId: string, eventId: string): Promise<void> {
+    if (this.activeEventScans.has(eventId)) {
+      this.logger.log(`[BatchFaceScan] Scanning is already active for event ${eventId}. Skipping trigger.`);
+      return;
+    }
     const initialEventObj = await this.prisma.event.findUnique({ where: { id: eventId } });
     if (!initialEventObj) return;
 
     this.activeEventScans.add(eventId);
 
     try {
+      // Reset any stuck faceScanStatus from 'PROCESSING' to 'PENDING' at start to allow reprocessing if server crashed
+      await this.prisma.photo.updateMany({
+        where: { eventId, faceScanStatus: 'PROCESSING' },
+        data: { faceScanStatus: 'PENDING' }
+      });
+
       while (true) {
         // Re-fetch event settings on EVERY iteration so toggle changes are picked up dynamically
         const eventObj = await this.prisma.event.findUnique({ where: { id: eventId } });
         if (!eventObj) break;
 
-        // Enforce toggle settings dynamically (fresh from DB)
-        if (!eventObj.faceScanningEnabled && !eventObj.videoScanningEnabled) {
-          this.logger.log(`[BatchFaceScan] Both photo and video scanning toggles are disabled. Aborting loop.`);
+        // Enforce toggle settings dynamically and verify photographer's active plan features
+        const activeSub = await this.prisma.subscription.findFirst({
+          where: { photographerId, status: 'ACTIVE' },
+          include: { package: true }
+        });
+        const hasPhotoAi = activeSub?.package ? activeSub.package.featureAiPhotoSearch : false;
+        const hasVideoAi = activeSub?.package ? activeSub.package.featureAiVideoSearch : false;
+
+        const isPhotoScanningActive = Boolean(eventObj.faceScanningEnabled && hasPhotoAi);
+        const isVideoScanningActive = Boolean(eventObj.videoScanningEnabled && hasVideoAi);
+
+        if (!isPhotoScanningActive && !isVideoScanningActive) {
+          this.logger.log(`[BatchFaceScan] Both photo and video scanning are disabled or not included in plan. Aborting loop.`);
           break;
         }
 
@@ -4749,15 +5992,16 @@ export class StorageService implements OnModuleInit {
           where: { eventId, status: 'UPLOADING' }
         });
 
-        // Build type filter from FRESH event settings
+        // Build type filter from active settings
         const typeFilter: string[] = [];
-        if (eventObj.faceScanningEnabled) typeFilter.push('IMAGE');
-        if (eventObj.videoScanningEnabled) typeFilter.push('VIDEO');
+        if (isPhotoScanningActive) typeFilter.push('IMAGE');
+        if (isVideoScanningActive) typeFilter.push('VIDEO');
 
         const pendingItems = await this.prisma.photo.findMany({
           where: {
             eventId,
             photographerId,
+            status: 'READY',
             faceScanStatus: { notIn: ['PROCESSING', 'READY'] },
             type: { in: typeFilter },
             OR: [
@@ -4766,7 +6010,7 @@ export class StorageService implements OnModuleInit {
             ],
             embeddings: { none: {} }
           },
-          take: 150
+          take: 30
         });
 
         if (pendingItems.length === 0) {
@@ -4774,9 +6018,9 @@ export class StorageService implements OnModuleInit {
           break;
         }
 
-        // Rule: If uploading is currently active and we have less than 150 ready items, defer scanning until 150 accumulate or uploading finishes
-        if (activeUploadingCount > 0 && pendingItems.length < 150) {
-          this.logger.log(`[BatchFaceScan] Uploading in progress (${activeUploadingCount} uploading). Waiting for 150 items or upload finish. Current ready: ${pendingItems.length}`);
+        // Rule: If uploading is currently active and we have less than 30 ready items, defer scanning until 30 accumulate or uploading finishes
+        if (activeUploadingCount > 0 && pendingItems.length < 30) {
+          this.logger.log(`[BatchFaceScan] Uploading in progress (${activeUploadingCount} uploading). Waiting for 30 items or upload finish. Current ready: ${pendingItems.length}`);
           break;
         }
 
@@ -4785,8 +6029,77 @@ export class StorageService implements OnModuleInit {
         const photos = pendingItems.filter(p => p.type === 'IMAGE');
         const videos = pendingItems.filter(p => p.type === 'VIDEO');
 
+        // Enforce pay-per-use credits for photos
+        const photographer = await this.prisma.photographer.findUnique({
+          where: { id: photographerId }
+        });
+        const currentCredits = photographer?.creditBalance || 0;
+        const maxPhotosAllowed = Math.floor(currentCredits / 10);
+
+        if (maxPhotosAllowed === 0) {
+          this.logger.warn(`[BatchFaceScan] Photographer ${photographerId} has insufficient credits (${currentCredits} paise). Skipping photo scanning.`);
+          // Mark as SKIPPED (not READY) so the UI knows these were NOT actually scanned
+          const photoIds = photos.map(p => p.id);
+          if (photoIds.length > 0) {
+            await this.prisma.photo.updateMany({
+              where: { id: { in: photoIds } },
+              data: { faceScanStatus: 'SKIPPED', status: 'READY' }
+            });
+            for (const p of photos) {
+              if (p.uploadBatchId) {
+                await this.updateBatchProgress(p.uploadBatchId, true);
+              }
+            }
+          }
+          // Also mark videos as SKIPPED — no credits for AI scanning
+          const videoIds = videos.map(v => v.id);
+          if (videoIds.length > 0) {
+            await this.prisma.photo.updateMany({
+              where: { id: { in: videoIds } },
+              data: { faceScanStatus: 'SKIPPED', status: 'READY' }
+            });
+            for (const v of videos) {
+              if (v.uploadBatchId) {
+                await this.updateBatchProgress(v.uploadBatchId, true);
+              }
+            }
+          }
+          // Auto-disable scanning toggles on this event since credits are exhausted
+          await this.prisma.event.update({
+            where: { id: eventId },
+            data: { faceScanningEnabled: false, videoScanningEnabled: false }
+          });
+          await this.invalidateEventCache(eventId);
+          this.logger.warn(`[BatchFaceScan] Credits exhausted. Auto-disabled scanning toggles for event ${eventId}. Breaking out of scan loop.`);
+          break; // Fully stop the loop — no more scanning possible
+        } else if (photos.length > maxPhotosAllowed) {
+          const scannablePhotos = photos.slice(0, maxPhotosAllowed);
+          const skippedPhotos = photos.slice(maxPhotosAllowed);
+
+          this.logger.warn(`[BatchFaceScan] Photographer ${photographerId} has credits for only ${maxPhotosAllowed} photos. Skipping remaining ${skippedPhotos.length} photos.`);
+          const skippedIds = skippedPhotos.map(p => p.id);
+          await this.prisma.photo.updateMany({
+            where: { id: { in: skippedIds } },
+            data: { faceScanStatus: 'SKIPPED', status: 'READY' }
+          });
+          for (const p of skippedPhotos) {
+            if (p.uploadBatchId) {
+              await this.updateBatchProgress(p.uploadBatchId, true);
+            }
+          }
+
+          photos.length = 0;
+          photos.push(...scannablePhotos);
+        }
+
         // Mark items as PROCESSING
-        const itemIds = pendingItems.map(p => p.id);
+        const finalPendingItems = [...photos, ...videos];
+        if (finalPendingItems.length === 0) {
+          await new Promise(resolve => setTimeout(resolve, 300));
+          continue;
+        }
+
+        const itemIds = finalPendingItems.map(p => p.id);
         await this.prisma.photo.updateMany({
           where: { id: { in: itemIds } },
           data: { faceScanStatus: 'PROCESSING' }
@@ -4799,93 +6112,52 @@ export class StorageService implements OnModuleInit {
             const photoBatchPayload: { photoId: string; imageUrl: string }[] = [];
 
             for (const photo of photos) {
-              // Target preview key first, fallback to original if preview key is not set
-              const previewKey = photo.r2KeyOriginal.replace("/photos/", "/previews/").replace("/Photos/", "/previews/");
-              const signedUrl = await this.getReadUrl(previewKey).catch(() => null) || await this.getReadUrl(photo.r2KeyOriginal);
+              // Use real r2KeyPreview if present in database (correct .jpg extension for HEIC/images), fallback to r2KeyOriginal
+              const scanKey = photo.r2KeyPreview || photo.r2KeyOriginal;
+              const signedUrl = await this.getReadUrl(scanKey);
               if (signedUrl) {
                 photoBatchPayload.push({ photoId: photo.id, imageUrl: signedUrl });
               }
             }
 
             if (photoBatchPayload.length > 0) {
+              const backendAppUrl = process.env.APP_URL || 'http://localhost:5000';
+              const webhookUrl = `${backendAppUrl}/api/public/webhook/photo-face-complete`;
+              const secretKey = process.env.WORKER_SECRET_KEY || 'default-worker-secret-key-123';
+
               const response = await fetch(`${faceEngineUrl}/faces/index-batch-photos`, {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
                   'x-api-key': process.env.MODAL_API_KEY || 'default-secret-key-123'
                 },
-                body: JSON.stringify({ items: photoBatchPayload })
+                body: JSON.stringify({
+                  eventId,
+                  photographerId,
+                  items: photoBatchPayload,
+                  webhookUrl,
+                  secretKey
+                }),
+                signal: AbortSignal.timeout(40000)
               });
 
               if (response.ok) {
                 const batchResult = await response.json();
-                const results = batchResult.results || [];
-
-                for (const res of results) {
-                  const photoId = res.photoId;
-                  const faces = res.faces || [];
-                  const hasFaces = faces.length > 0;
-                  const faceCount = faces.length;
-
-                  if (hasFaces) {
-                    const faceData = faces.map((f: any) => ({
-                      photoId,
-                      eventId,
-                      photographerId,
-                      faceIndex: f.faceIndex,
-                      bboxX: f.bbox.x,
-                      bboxY: f.bbox.y,
-                      bboxW: f.bbox.w,
-                      bboxH: f.bbox.h,
-                      confidence: f.confidence,
-                      embedding: f.embedding,
-                    }));
-
-                    const values = faceData.map((f: any) => {
-                      const vectorStr = `[${f.embedding.join(',')}]`;
-                      return `('${uuidv4()}', '${f.photoId}', '${f.eventId}', '${f.photographerId}', ${f.faceIndex}, ${f.bboxX}, ${f.bboxY}, ${f.bboxW}, ${f.bboxH}, ${f.confidence}, '${vectorStr}'::vector, NULL)`;
-                    }).join(',');
-
-                    await this.prisma.$executeRawUnsafe(`
-                      INSERT INTO face_embeddings ("id", "photoId", "eventId", "photographerId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding", "clusterId")
-                      VALUES ${values}
-                    `);
-                  }
-
-                  await this.prisma.photo.update({
-                    where: { id: photoId },
-                    data: {
-                      status: 'READY',
-                      faceScanStatus: 'READY',
-                      hasFaces,
-                      faceCount
-                    }
+                if (batchResult && batchResult.results) {
+                  // Synchronous return from Modal: complete using standard webhook handler
+                  await this.completePhotoFaceWebhook({
+                    eventId,
+                    photographerId,
+                    results: batchResult.results,
+                    secretKey
                   });
-
-                  await this.invalidateEventCache(eventId);
-
-                  const p = photos.find(item => item.id === photoId);
-                  if (p) {
-                    // Delete temporary preview file from R2 to save space
-                    const previewKey = p.r2KeyOriginal.replace("/photos/", "/previews/").replace("/Photos/", "/previews/");
-                    try {
-                      await this.s3Client.send(new DeleteObjectCommand({
-                        Bucket: this.bucketName,
-                        Key: previewKey,
-                      }));
-                    } catch (delErr: any) {
-                      this.logger.error(`[Cleanup] Failed to delete temporary preview file ${previewKey}: ${delErr.message}`);
-                    }
-
-                    if (p.uploadBatchId) {
-                      await this.updateBatchProgress(p.uploadBatchId, true);
-                    }
-                  }
+                } else if (batchResult && batchResult.status === 'QUEUED') {
+                  this.logger.log(`[BatchFaceScan] Batch of ${photoBatchPayload.length} photos queued in Modal worker. Result will arrive via Webhook.`);
                 }
               }
             }
-          } catch (batchErr) {
-            this.logger.error(`[BatchFaceScan] Photo batch scanning failed for event ${eventId}:`, batchErr);
+          } catch (batchErr: any) {
+            this.logger.error(`[BatchFaceScan] Photo batch scanning dispatch error for event ${eventId}: ${batchErr.message}`);
             const photoIds = photos.map(p => p.id);
             await this.prisma.photo.updateMany({
               where: { id: { in: photoIds } },

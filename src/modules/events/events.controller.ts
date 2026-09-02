@@ -33,6 +33,11 @@ export class EventsController {
     return this.eventsService.softDelete(user.photographer.id, id);
   }
 
+  @Post('bulk-trash')
+  async bulkTrash(@CurrentUser() user: any, @Body() body: { eventIds: string[] }) {
+    return this.eventsService.bulkSoftDelete(user.photographer.id, body.eventIds || []);
+  }
+
   @Post(':id/restore')
   async restore(@CurrentUser() user: any, @Param('id') id: string) {
     return this.eventsService.restore(user.photographer.id, id);

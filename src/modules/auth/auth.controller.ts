@@ -19,6 +19,13 @@ export class AuthController {
     return this.authService.login(body, { ipAddress, userAgent });
   }
 
+  @Post('google')
+  async googleAuth(@Body() body: { credential: string; referralCode?: string }, @Req() req: any) {
+    const ipAddress = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'] || '';
+    return this.authService.googleAuth(body, { ipAddress, userAgent });
+  }
+
   @Post('admin/login')
   async adminLogin(@Body() body: any) {
     const { email, password } = body;

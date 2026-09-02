@@ -1,11 +1,10 @@
-import { Controller, Post, Get, Body, Param, UseInterceptors, UploadedFile, Res, Query, Headers, NotFoundException, UseGuards } from '@nestjs/common';
-import { FileInterceptor } from '@nestjs/platform-express';
+import { Controller, Post, Get, Body, Param, Res, Query, NotFoundException, UseGuards, Req } from '@nestjs/common';
 import { StorageService } from './storage.service';
 import { FeatureGuard } from 'src/common/guards/feature.guard';
 
 @Controller('public')
 export class PublicStorageController {
-  constructor(private storageService: StorageService) {}
+  constructor(private storageService: StorageService) { }
 
   @Get('events')
   async getPublicEvents() {
@@ -17,12 +16,24 @@ export class PublicStorageController {
     return this.storageService.getPublicEventBySlug(slug);
   }
 
+  @Post('events/:slug/init')
+  async getPublicEventInit(
+    @Param('slug') slug: string,
+    @Body() body: { passcode?: string },
+    @Req() req: any
+  ) {
+    const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
+    return this.storageService.getPublicEventInit(slug, body.passcode, clientIp);
+  }
+
   @Post('events/:slug/photos')
   async getPublicEventPhotos(
     @Param('slug') slug: string,
-    @Body() body: { passcode?: string }
+    @Body() body: { passcode?: string; limit?: number; cursor?: string },
+    @Req() req: any
   ) {
-    return this.storageService.getPublicEventPhotos(slug, body.passcode);
+    const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
+    return this.storageService.getPublicEventPhotos(slug, body.passcode, body.limit, body.cursor, clientIp);
   }
 
   @Post('events/:slug/guest-upload-url')
@@ -36,18 +47,9 @@ export class PublicStorageController {
   @Post('events/:slug/guest-complete-upload')
   async completeGuestUpload(
     @Param('slug') slug: string,
-    @Body() body: { photoId: string }
+    @Body() body: { photoId: string; thumbSizeBytes?: number; previewSizeBytes?: number; duration?: number }
   ) {
-    return this.storageService.completeGuestUpload(body.photoId);
-  }
-
-  @Post('events/:slug/guest-direct-upload')
-  @UseInterceptors(FileInterceptor('file'))
-  async uploadGuestPhotoDirect(
-    @Param('slug') slug: string,
-    @UploadedFile() file: any
-  ) {
-    return this.storageService.uploadGuestPhotoDirect(slug, file);
+    return this.storageService.completeGuestUpload(body.photoId, body.thumbSizeBytes, body.previewSizeBytes, body.duration);
   }
 
   @Get('events/:slug/guest-upload-status')
@@ -58,31 +60,39 @@ export class PublicStorageController {
 
 
 
+  @Post('events/:slug/favorites/toggle')
+  async toggleClientFavorite(
+    @Param('slug') slug: string,
+    @Body() body: {
+      photoId: string;
+      action?: 'ADD' | 'REMOVE' | 'TOGGLE';
+    }
+  ) {
+    return this.storageService.toggleClientFavorite(
+      slug,
+      body.photoId,
+      body.action
+    );
+  }
+
   @Post('events/:slug/favorites')
   async saveClientFavorites(
     @Param('slug') slug: string,
     @Body() body: {
-      clientSessionId: string;
-      clientName: string;
-      clientPhone?: string;
       photoIds: string[];
     }
   ) {
     return this.storageService.saveClientFavorites(
       slug,
-      body.clientSessionId,
-      body.clientName,
-      body.clientPhone,
-      body.photoIds
+      body.photoIds || []
     );
   }
 
   @Post('events/:slug/get-client-favorites')
   async getClientFavorites(
-    @Param('slug') slug: string,
-    @Body() body: { clientSessionId: string; clientPhone?: string }
+    @Param('slug') slug: string
   ) {
-    return this.storageService.getClientFavorites(slug, body.clientSessionId, body.clientPhone);
+    return this.storageService.getClientFavorites(slug);
   }
 
   @Get('events/:slug/photos/:photoId/view')
@@ -90,18 +100,20 @@ export class PublicStorageController {
     @Param('slug') slug: string,
     @Param('photoId') photoId: string,
     @Query('thumb') thumb: string,
+    @Query('download') download: string,
+    @Query('stream') stream: string,
     @Res() res: any
   ) {
     const isThumb = thumb === 'true';
-    const result = await this.storageService.getWatermarkedImageStream(slug, photoId, isThumb);
-    if (result.redirectUrl) {
-      return res.redirect(result.redirectUrl);
+    const isDownload = download === 'true';
+    const isStream = stream === 'true';
+
+    if (isStream) {
+      return this.storageService.streamPhotoToResponse(slug, photoId, isThumb, isDownload, res);
     }
-    res.setHeader('Content-Type', result.contentType);
-    res.setHeader('Content-Disposition', 'inline; filename="preview.jpg"');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    return res.end(result.buffer);
+
+    const result = await this.storageService.getWatermarkedImageStream(slug, photoId, isThumb, isDownload);
+    return res.redirect(result.redirectUrl);
   }
 
   @Get('watermark/:photographerId')
@@ -132,20 +144,6 @@ export class PublicStorageController {
     return res.end(result.buffer);
   }
 
-  @Get('branding/banner/:photographerId')
-  async viewPublicBrandingBanner(
-    @Param('photographerId') photographerId: string,
-    @Res() res: any
-  ) {
-    const result = await this.storageService.getBrandingBannerStream(photographerId) as any;
-    if (result.redirectUrl) {
-      return res.redirect(result.redirectUrl);
-    }
-    res.setHeader('Content-Type', result.contentType);
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    return res.end(result.buffer);
-  }
-
   @Get('subdomain/check/:subdomain')
   async checkSubdomain(
     @Param('subdomain') subdomain: string,
@@ -154,13 +152,20 @@ export class PublicStorageController {
     return this.storageService.checkSubdomainAvailability(subdomain, photographerId);
   }
 
-  @Post('search-face')
-  @UseInterceptors(FileInterceptor('selfie'))
-  async searchFacePublic(
-    @UploadedFile() selfie: any,
-    @Body() body: { eventId?: string; passcode?: string },
+  @Post('selfie-upload-url')
+  async getSelfieUploadUrl(
+    @Body() body: { filename: string; mimeType: string }
   ) {
-    return this.storageService.searchFacePublic(selfie, body.eventId, body.passcode);
+    return this.storageService.getSelfieUploadUrl(body.filename, body.mimeType);
+  }
+
+  @Post('search-face')
+  async searchFacePublic(
+    @Body() body: { r2Key: string; eventId?: string; passcode?: string },
+    @Req() req: any
+  ) {
+    const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
+    return this.storageService.searchFacePublic(body.r2Key, body.eventId, body.passcode, clientIp);
   }
 
   @Get('portfolio/:subdomain')
@@ -209,45 +214,49 @@ export class PublicStorageController {
     return this.storageService.getActivePortfolioThemes();
   }
 
-  @Get('portfolio/video/stream')
-  async streamVideo(
-    @Query('key') key: string,
-    @Headers('range') range: string,
-    @Res() res: any
-  ) {
-    if (!key) {
-      return res.status(400).send('Missing key parameter');
-    }
-    const { stream, contentType, contentLength, contentRange, statusCode } = 
-      await this.storageService.streamPortfolioVideo(key, range);
-
-    res.status(statusCode);
-    res.setHeader('Content-Type', contentType);
-    if (contentLength) {
-      res.setHeader('Content-Length', contentLength);
-    }
-    if (contentRange) {
-      res.setHeader('Content-Range', contentRange);
-    }
-    res.setHeader('Accept-Ranges', 'bytes');
-    
-    // Pipe the S3 readable stream to the express response object
-    if (stream && typeof (stream as any).pipe === 'function') {
-      (stream as any).pipe(res);
-    } else if (stream) {
-      const readable = require('stream').Readable.from(stream as any);
-      readable.pipe(res);
-    } else {
-      res.end();
-    }
-  }
-
   // Public webhook call from Cloudflare Worker upon thumbnail resize success
   @Post('webhook/thumbnail-complete')
   async handleThumbnailComplete(
-    @Body() body: { photoId: string; thumbKey: string; previewKey?: string; secretKey: string }
+    @Body() body: { photoId: string; thumbKey: string; previewKey?: string; thumbSize?: number; previewSize?: number; secretKey: string }
   ) {
     return this.storageService.completeThumbnailWebhook(body);
+  }
+
+  // Public webhook call from Modal GPU upon video face indexing completion
+  @Post('webhook/video-face-complete')
+  async handleVideoFaceComplete(
+    @Body() body: {
+      photoId: string;
+      duration?: number;
+      faces?: any[];
+      secretKey: string;
+      error?: string;
+    }
+  ) {
+    return this.storageService.completeVideoFaceWebhook(body);
+  }
+
+  // Public webhook call from Modal GPU upon photo face batch/single indexing completion
+  @Post('webhook/photo-face-complete')
+  async handlePhotoFaceComplete(
+    @Body() body: {
+      eventId?: string;
+      photographerId?: string;
+      results?: Array<{
+        photoId: string;
+        faces?: any[];
+        faceCount?: number;
+        success?: boolean;
+        error?: string;
+      }>;
+      // Also support single photo payload format
+      photoId?: string;
+      faces?: any[];
+      secretKey: string;
+      error?: string;
+    }
+  ) {
+    return this.storageService.completePhotoFaceWebhook(body);
   }
 }
 

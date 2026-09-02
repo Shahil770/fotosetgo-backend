@@ -8,6 +8,9 @@ import { StorageModule } from './modules/storage/storage.module';
 import { BillingModule } from './modules/billing/billing.module';
 import { BusinessCardsModule } from './modules/business-cards/business-cards.module';
 import { RedisModule } from './modules/redis/redis.module';
+import { BeamModule } from './modules/beam/beam.module';
+import { ReferralsModule } from './modules/referrals/referrals.module';
+import { WalletModule } from './modules/wallet/wallet.module';
 
 @Module({
   imports: [
@@ -18,6 +21,9 @@ import { RedisModule } from './modules/redis/redis.module';
     StorageModule,
     BillingModule,
     BusinessCardsModule,
+    BeamModule,
+    ReferralsModule,
+    WalletModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -1,6 +1,7 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Inject, Logger, NotFoundException } from '@nestjs/common';
 import { IsOptional, IsString, IsArray } from 'class-validator';
 import { PrismaService } from '../../prisma.service';
+import Redis from 'ioredis';
 
 export class SaveBusinessCardDto {
   @IsOptional()
@@ -70,7 +71,44 @@ export class SaveBusinessCardDto {
 
 @Injectable()
 export class BusinessCardsService {
-  constructor(private readonly prisma: PrismaService) { }
+  private readonly logger = new Logger(BusinessCardsService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    @Inject('REDIS_CLIENT') private readonly redis: Redis
+  ) {
+    this.startCardViewsSyncProcessor();
+  }
+
+  private startCardViewsSyncProcessor() {
+    setInterval(async () => {
+      try {
+        await this.syncAggregatedCardViews();
+      } catch (err: any) {
+        this.logger.error(`[CardViewsSync] Error in periodic sync: ${err.message}`);
+      }
+    }, 10000); // sync every 10 seconds
+  }
+
+  private async syncAggregatedCardViews() {
+    try {
+      const viewsMap = await this.redis.hgetall('agg:businessCard:views');
+      if (!viewsMap || Object.keys(viewsMap).length === 0) return;
+
+      for (const [cardId, countStr] of Object.entries(viewsMap)) {
+        const count = parseInt(countStr, 10);
+        if (count > 0) {
+          await this.prisma.businessCard.update({
+            where: { id: cardId },
+            data: { viewsCount: { increment: count } }
+          }).catch(err => this.logger.error(`[CardViewsSync] Failed to update card ${cardId}: ${err.message}`));
+          await this.redis.hincrby('agg:businessCard:views', cardId, -count).catch(() => {});
+        }
+      }
+    } catch (err: any) {
+      this.logger.error(`[CardViewsSync] Error in syncAggregatedCardViews: ${err.message}`);
+    }
+  }
 
   async getCardThemes(includeInactive = false) {
     return this.prisma.cardTheme.findMany({
@@ -184,7 +222,7 @@ export class BusinessCardsService {
       }
     }
 
-    return this.prisma.businessCard.upsert({
+    const savedCard = await this.prisma.businessCard.upsert({
       where: { photographerId },
       create: {
         photographerId,
@@ -224,9 +262,35 @@ export class BusinessCardsService {
         customLinks: dto.customLinks ? dto.customLinks : []
       }
     });
+
+    // Invalidate Redis card caches
+    try {
+      if (savedCard.slug) await this.redis.del(`cache:public:card:${savedCard.slug.toLowerCase().trim()}`);
+      if (savedCard.id) await this.redis.del(`cache:public:card:${savedCard.id.toLowerCase().trim()}`);
+      if (card?.slug && card.slug !== savedCard.slug) await this.redis.del(`cache:public:card:${card.slug.toLowerCase().trim()}`);
+    } catch (err: any) {
+      this.logger.error(`[saveBusinessCard] Redis cache del error: ${err.message}`);
+    }
+
+    return savedCard;
   }
 
   async getPublicBusinessCardBySlug(slugOrId: string) {
+    const cleanKey = slugOrId.toLowerCase().trim();
+    const cacheKey = `cache:public:card:${cleanKey}`;
+
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
+        const card = JSON.parse(cached);
+        // Increment views count in-memory in Redis hash (Zero Row-Level Locks)
+        await this.redis.hincrby('agg:businessCard:views', card.id, 1).catch(() => {});
+        return card;
+      }
+    } catch (err: any) {
+      this.logger.error(`[getPublicBusinessCardBySlug] Redis cache get error: ${err.message}`);
+    }
+
     const include = {
       photographer: {
         include: {
@@ -256,11 +320,8 @@ export class BusinessCardsService {
       throw new NotFoundException('Digital Business Card not found');
     }
 
-    // Increment views count asynchronously
-    this.prisma.businessCard.update({
-      where: { id: card.id },
-      data: { viewsCount: { increment: 1 } }
-    }).catch(err => console.error('Failed to increment card views:', err));
+    // Increment views count in Redis hash
+    await this.redis.hincrby('agg:businessCard:views', card.id, 1).catch(() => {});
 
     const activeSub = card.photographer?.subscriptions?.[0];
     const hasBranding = activeSub?.package ? activeSub.package.featureCustomBranding : false;
@@ -279,6 +340,15 @@ export class BusinessCardsService {
       // Override slug with card.id → frontend will redirect to /c/{card.id}
       // This hides ALL branding info from the URL completely
       card.slug = card.id;
+    }
+
+    try {
+      await this.redis.setex(cacheKey, 600, JSON.stringify(card));
+      if (card.slug && card.id && card.slug.toLowerCase().trim() !== cleanKey) {
+        await this.redis.setex(`cache:public:card:${card.id.toLowerCase().trim()}`, 600, JSON.stringify(card));
+      }
+    } catch (err: any) {
+      this.logger.error(`[getPublicBusinessCardBySlug] Redis cache set error: ${err.message}`);
     }
 
     return card;

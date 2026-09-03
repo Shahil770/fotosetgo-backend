@@ -6,14 +6,19 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { PrismaService } from '../../prisma.service';
+import { PrismaClient } from '@prisma/client';
 
 @Injectable()
 export class AdminGuard implements CanActivate {
-  constructor(
-    private jwtService: JwtService,
-    private prisma: PrismaService,
-  ) {}
+  private jwtService: JwtService;
+  private prisma: PrismaClient;
+
+  constructor() {
+    this.jwtService = new JwtService({
+      secret: process.env.JWT_SECRET || '9f4e2a8c1d7b3e5a0f6c4b2e8d1a7f3e9c5b1d7e3a9f0c2b4d8e6a1f5c3b7e9a',
+    });
+    this.prisma = new PrismaClient();
+  }
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest();

@@ -314,6 +314,14 @@ export class StorageController {
     return this.storageService.deletePortfolioHeroVideo(user.id);
   }
 
+  @Post('portfolio/bts-video/upload-url')
+  async getPortfolioBtsVideoUploadUrl(
+    @CurrentUser() user: any,
+    @Body() body: { filename: string; mimeType: string; fileSize: number; thumbMimeType?: string; thumbFileSize?: number }
+  ) {
+    return this.storageService.getPortfolioBtsVideoUploadUrl(user.id, body);
+  }
+
   @Delete('portfolio/bts-video')
   async deletePortfolioBtsVideo(@CurrentUser() user: any) {
     return this.storageService.deletePortfolioBtsVideo(user.id);

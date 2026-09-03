@@ -4293,7 +4293,9 @@ export class StorageService implements OnModuleInit {
           portfolioVideoThumbSizeBytes: data.portfolioVideoThumbSizeBytes !== undefined ? BigInt(data.portfolioVideoThumbSizeBytes) : (data.portfolioVideoThumbUrl === '' ? BigInt(0) : photographer.portfolioVideoThumbSizeBytes),
           portfolioProcess: data.portfolioProcess !== undefined ? (data.portfolioProcess as any) : (photographer.portfolioProcess as any),
           portfolioBtsUrl: data.portfolioBtsUrl !== undefined ? data.portfolioBtsUrl : photographer.portfolioBtsUrl,
+          portfolioBtsThumbUrl: data.portfolioBtsThumbUrl !== undefined ? data.portfolioBtsThumbUrl : photographer.portfolioBtsThumbUrl,
           portfolioBtsSizeBytes: data.portfolioBtsSizeBytes !== undefined ? BigInt(data.portfolioBtsSizeBytes) : (data.portfolioBtsUrl === '' ? BigInt(0) : photographer.portfolioBtsSizeBytes),
+          portfolioBtsThumbSizeBytes: data.portfolioBtsThumbSizeBytes !== undefined ? BigInt(data.portfolioBtsThumbSizeBytes) : (data.portfolioBtsThumbUrl === '' ? BigInt(0) : photographer.portfolioBtsThumbSizeBytes),
           portfolioEquipment: data.portfolioEquipment !== undefined ? (data.portfolioEquipment as any) : (photographer.portfolioEquipment as any),
           portfolioDestinations: data.portfolioDestinations !== undefined ? (data.portfolioDestinations as any) : (photographer.portfolioDestinations as any),
           portfolioBookingPolicy: data.bookingPolicy !== undefined ? data.bookingPolicy : (data.portfolioBookingPolicy !== undefined ? data.portfolioBookingPolicy : photographer.portfolioBookingPolicy),
@@ -4305,7 +4307,7 @@ export class StorageService implements OnModuleInit {
           portfolioWhatsapp: data.portfolioWhatsapp !== undefined ? data.portfolioWhatsapp : photographer.portfolioWhatsapp,
         }
       });
-      if (data.portfolioVideoSizeBytes !== undefined || data.portfolioVideoThumbSizeBytes !== undefined || data.portfolioBtsSizeBytes !== undefined) {
+      if (data.portfolioVideoSizeBytes !== undefined || data.portfolioVideoThumbSizeBytes !== undefined || data.portfolioBtsSizeBytes !== undefined || data.portfolioBtsThumbSizeBytes !== undefined) {
         await this.recalculateStorage(photographer.id);
       }
       await this.invalidatePortfolioCache(photographer.id);
@@ -4395,7 +4397,71 @@ export class StorageService implements OnModuleInit {
     return { success: true };
   }
 
+  // BTS Video: dedicated upload URL — R2 path: {photographerId}/portfolio/bts/video/ & /thumb/
+  async getPortfolioBtsVideoUploadUrl(userId: string, data: { filename: string; mimeType: string; fileSize: number; thumbMimeType?: string; thumbFileSize?: number }) {
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { userId },
+      include: {
+        subscriptions: {
+          where: { status: 'ACTIVE' },
+          orderBy: { startsAt: 'desc' },
+          take: 1
+        }
+      }
+    });
+
+    if (!photographer) {
+      throw new NotFoundException('Photographer profile not found');
+    }
+
+    const totalSize = BigInt(data.fileSize || 0) + BigInt(data.thumbFileSize || 0);
+    const activeSub = photographer.subscriptions[0];
+    const portfolioLimitBytes = activeSub
+      ? (activeSub.limitPortfolioBytes ?? BigInt(0))
+      : BigInt(0);
+    if (portfolioLimitBytes > BigInt(0)) {
+      const portfolioUsed = await this.getPortfolioStorageUsed(photographer.id);
+      if (portfolioUsed + totalSize > portfolioLimitBytes) {
+        throw new BadRequestException(
+          `Portfolio storage limit exceeded (${Math.round(Number(portfolioLimitBytes) / 1024 / 1024)} MB). Please upgrade your plan.`
+        );
+      }
+    }
+
+    const ext = data.filename ? data.filename.split('.').pop() : 'mp4';
+    const timestamp = Date.now();
+
+    // Video inside: {photographer.id}/portfolio/bts/video/{timestamp}.mp4
+    const key = `${photographer.id}/portfolio/bts/video/${timestamp}.${ext}`;
+    const command = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: key,
+      ContentType: data.mimeType || 'video/mp4',
+    });
+    const uploadUrl = await getSignedUrl(this.s3Client, command, {
+      expiresIn: 3600,
+      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+    });
+    const url = await this.getReadUrl(key);
+
+    // Thumb inside: {photographer.id}/portfolio/bts/thumb/{timestamp}_thumb.jpg
+    const thumbKey = `${photographer.id}/portfolio/bts/thumb/${timestamp}_thumb.jpg`;
+    const thumbCommand = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: thumbKey,
+      ContentType: data.thumbMimeType || 'image/jpeg',
+    });
+    const thumbUploadUrl = await getSignedUrl(this.s3Client, thumbCommand, {
+      expiresIn: 3600,
+      unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
+    });
+    const thumbUrl = await this.getReadUrl(thumbKey);
+
+    return { uploadUrl, key, url, thumbUploadUrl, thumbKey, thumbUrl };
+  }
+
   async deletePortfolioBtsVideo(userId: string) {
+
     const photographer = await this.prisma.photographer.findUnique({
       where: { userId }
     });
@@ -4420,11 +4486,31 @@ export class StorageService implements OnModuleInit {
       }
     }
 
+    // Also delete thumb from R2 if exists
+    const btsThumbUrlOrKey = (photographer as any).portfolioBtsThumbUrl;
+    if (btsThumbUrlOrKey) {
+      const thumbR2Key = this.extractR2KeyFromUrlOrKey(btsThumbUrlOrKey, photographer.id);
+      if (thumbR2Key) {
+        try {
+          await this.s3Client.send(new DeleteObjectCommand({
+            Bucket: this.bucketName,
+            Key: thumbR2Key,
+          }));
+          this.urlCache.delete(thumbR2Key);
+          this.logger.log(`[StorageService] Deleted BTS Thumb from R2: ${thumbR2Key}`);
+        } catch (err: any) {
+          this.logger.error(`[StorageService] Failed to delete BTS Thumb from R2: ${err.message}`);
+        }
+      }
+    }
+
     await this.prisma.photographer.update({
       where: { id: photographer.id },
       data: {
         portfolioBtsUrl: null,
+        portfolioBtsThumbUrl: null,
         portfolioBtsSizeBytes: BigInt(0),
+        portfolioBtsThumbSizeBytes: BigInt(0),
       }
     });
 
@@ -4432,6 +4518,7 @@ export class StorageService implements OnModuleInit {
     await this.invalidatePortfolioCache(photographer.id);
     return { success: true };
   }
+
 
   // Helper: compute portfolio-only storage directly from PostgreSQL DB (Instant <1ms query)
   private async getPortfolioStorageUsed(photographerId: string): Promise<bigint> {

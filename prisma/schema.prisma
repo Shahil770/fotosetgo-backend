@@ -99,8 +99,10 @@ model Photographer {
   portfolioVideoSizeBytes BigInt        @default(0)
   portfolioVideoThumbSizeBytes BigInt   @default(0)
   portfolioProcess       Json?          // Array of process steps: [{ step, title, desc }]
-  portfolioBtsUrl        String?        // BTS Video link or photo
+  portfolioBtsUrl        String?        // BTS Video (R2 key): {photographerId}/portfolio/bts/video/
+  portfolioBtsThumbUrl   String?        // BTS Thumb (R2 key): {photographerId}/portfolio/bts/thumb/
   portfolioBtsSizeBytes  BigInt         @default(0)
+  portfolioBtsThumbSizeBytes BigInt     @default(0)
   portfolioEquipment     Json?          // Array of gear: [{ category, items }]
   portfolioDestinations  Json?          // Array of cities/destinations covered: [string]
   portfolioBookingPolicy String?        // Booking terms & conditions text

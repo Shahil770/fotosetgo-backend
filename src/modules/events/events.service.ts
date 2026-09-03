@@ -85,6 +85,7 @@ export class EventsService {
           },
           photos: {
             where: { isDeleted: false },
+            orderBy: { createdAt: 'desc' },
             take: 1,
             select: { id: true, r2KeyThumb: true, r2KeyPreview: true, r2KeyOriginal: true },
           },

@@ -34,6 +34,19 @@ export class EventsService {
   }
 
   async create(photographerId: string, data: any) {
+    // Plan check: block disabling downloads if plan doesn't support it
+    if (data.allowDownload === false) {
+      const activeSub = await this.prisma.subscription.findFirst({
+        where: { photographerId, status: 'ACTIVE' },
+        include: { package: true },
+        orderBy: { createdAt: 'desc' }
+      });
+      const canDisableDownload = activeSub?.package?.featureDisableDownload ?? false;
+      if (!canDisableDownload) {
+        throw new ForbiddenException('Your current plan does not support disabling photo downloads. Please upgrade.');
+      }
+    }
+
     const slug = data.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') + '-' + Math.floor(1000 + Math.random() * 9000);
     const event = await this.prisma.event.create({
       data: {

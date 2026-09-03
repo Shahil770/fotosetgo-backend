@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, Inject } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException, Inject } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
 import { StorageService } from '../storage/storage.service';
 import Redis from 'ioredis';
@@ -44,7 +44,7 @@ export class EventsService {
         eventDate: data.eventDate ? new Date(data.eventDate) : null,
         visibility: data.visibility || 'PRIVATE',
         status: data.status || 'DRAFT',
-        allowDownload: data.allowDownload !== undefined ? data.allowDownload : false,
+        allowDownload: data.allowDownload !== undefined ? data.allowDownload : true,
         passcode: data.passcode !== undefined ? String(data.passcode).slice(0, 6) : '123456',
         allowFavorites: data.allowFavorites !== undefined ? Boolean(data.allowFavorites) : false,
         maxFavorites: data.maxFavorites !== undefined ? Number(data.maxFavorites) : 0,
@@ -239,6 +239,12 @@ export class EventsService {
 
     const hasPhotoAi = activeSub?.package ? activeSub.package.featureAiPhotoSearch : false;
     const hasVideoAi = activeSub?.package ? activeSub.package.featureAiVideoSearch : false;
+    const canDisableDownload = activeSub?.package ? activeSub.package.featureDisableDownload : false;
+
+    // Block disabling downloads if plan doesn't support it
+    if (data.allowDownload === false && !canDisableDownload) {
+      throw new ForbiddenException('Your current plan does not support disabling photo downloads. Please upgrade.');
+    }
 
     const faceScanningEnabled = hasPhotoAi ? data.faceScanningEnabled : false;
     const videoScanningEnabled = hasVideoAi ? data.videoScanningEnabled : false;

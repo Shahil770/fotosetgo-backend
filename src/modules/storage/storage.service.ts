@@ -4275,6 +4275,20 @@ export class StorageService implements OnModuleInit {
         }
       }
 
+      // 3. Delete replaced old BTS Thumbnail from R2 if new BTS thumbnail is uploaded
+      if (data.portfolioBtsThumbUrl !== undefined && photographer.portfolioBtsThumbUrl && photographer.portfolioBtsThumbUrl !== data.portfolioBtsThumbUrl) {
+        const oldThumbKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioBtsThumbUrl, photographer.id);
+        if (oldThumbKey) {
+          try {
+            await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldThumbKey }));
+            this.urlCache.delete(oldThumbKey);
+            this.logger.log(`[StorageService] Deleted replaced old BTS Thumbnail from R2: ${oldThumbKey}`);
+          } catch (err: any) {
+            this.logger.error(`[StorageService] Failed to delete replaced BTS Thumbnail: ${err.message}`);
+          }
+        }
+      }
+
       const updated = await this.prisma.photographer.update({
         where: { id: photographer.id },
         data: {

@@ -4180,6 +4180,7 @@ export class StorageService implements OnModuleInit {
     const freshVideoUrl = await this.getFreshVideoUrl(photographer.portfolioVideoUrl);
     const freshThumbUrl = await this.getFreshVideoUrl(photographer.portfolioVideoThumbUrl);
     const freshBtsUrl = await this.getFreshVideoUrl(photographer.portfolioBtsUrl);
+    const freshBtsThumbUrl = await this.getFreshVideoUrl(photographer.portfolioBtsThumbUrl);
 
     return {
       portfolioEnabled: photographer.portfolioEnabled,
@@ -4198,6 +4199,7 @@ export class StorageService implements OnModuleInit {
       portfolioVideoThumbUrl: freshThumbUrl,
       portfolioProcess: photographer.portfolioProcess,
       portfolioBtsUrl: freshBtsUrl,
+      portfolioBtsThumbUrl: freshBtsThumbUrl,
       portfolioEquipment: photographer.portfolioEquipment,
       portfolioDestinations: photographer.portfolioDestinations,
       portfolioBookingPolicy: photographer.portfolioBookingPolicy,
@@ -5262,6 +5264,7 @@ export class StorageService implements OnModuleInit {
     const freshVideoUrl = await this.getFreshVideoUrl(photographer.portfolioVideoUrl);
     const freshThumbUrl = await this.getFreshVideoUrl(photographer.portfolioVideoThumbUrl);
     const freshBtsUrl = await this.getFreshVideoUrl(photographer.portfolioBtsUrl);
+    const freshBtsThumbUrl = await this.getFreshVideoUrl(photographer.portfolioBtsThumbUrl);
 
     const result = {
       portfolioEnabled: photographer.portfolioEnabled,
@@ -5281,6 +5284,7 @@ export class StorageService implements OnModuleInit {
       portfolioVideoThumbUrl: freshThumbUrl,
       portfolioProcess: photographer.portfolioProcess,
       portfolioBtsUrl: freshBtsUrl,
+      portfolioBtsThumbUrl: freshBtsThumbUrl,
       portfolioEquipment: photographer.portfolioEquipment,
       portfolioDestinations: photographer.portfolioDestinations,
       portfolioBookingPolicy: photographer.portfolioBookingPolicy,

@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common';
 import { ReferralsService } from './referrals.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { AdminGuard } from '../../common/guards/admin.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 
 @Controller('referrals')
@@ -40,6 +41,7 @@ export class ReferralsController {
   /**
    * Admin: Get Referral Reward Configs Matrix
    */
+  @UseGuards(AdminGuard)
   @Get('admin/configs')
   async getAdminConfigs() {
     return this.referralsService.getAdminConfigs();
@@ -48,6 +50,7 @@ export class ReferralsController {
   /**
    * Admin: Update Referral Reward Configs Matrix
    */
+  @UseGuards(AdminGuard)
   @Put('admin/configs')
   async updateAdminConfigs(@Body() body: any) {
     const configs = Array.isArray(body) ? body : body.configs || [];
@@ -57,6 +60,7 @@ export class ReferralsController {
   /**
    * Admin: List All Platform Referrals
    */
+  @UseGuards(AdminGuard)
   @Get('admin/all')
   async getAdminAllReferrals(
     @Query('search') search?: string,
@@ -68,6 +72,7 @@ export class ReferralsController {
   /**
    * Admin: Override Referral Rate or Status
    */
+  @UseGuards(AdminGuard)
   @Patch('admin/:referralId/override')
   async overrideAdminReferral(
     @Param('referralId') referralId: string,

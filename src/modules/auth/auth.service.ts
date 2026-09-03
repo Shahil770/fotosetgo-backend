@@ -259,6 +259,40 @@ export class AuthService {
     };
   }
 
+  async adminLogin(credentials: { email: string; password: string }, requestInfo?: { ipAddress?: string; userAgent?: string }) {
+    const normalizedEmail = (credentials.email || '').toLowerCase().trim();
+    const user = await this.prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+
+    if (!user || !user.isActive) {
+      throw new UnauthorizedException('Invalid admin credentials.');
+    }
+
+    if (user.role !== 'ADMIN') {
+      throw new UnauthorizedException('Access denied. This account does not have administrator privileges.');
+    }
+
+    const passwordMatch = await bcrypt.compare(credentials.password, user.passwordHash);
+    if (!passwordMatch) {
+      throw new UnauthorizedException('Invalid admin credentials.');
+    }
+
+    const payload = { sub: user.id, email: user.email, role: 'ADMIN', type: 'ADMIN_SESSION' };
+    const token = this.jwtService.sign(payload, { expiresIn: '24h' });
+
+    return {
+      token,
+      accessToken: token,
+      admin: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+      },
+    };
+  }
+
   /**
    * Google OAuth 1-Click Login & Registration with automated Referral & Free Tier Setup
    */

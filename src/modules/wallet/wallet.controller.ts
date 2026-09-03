@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { WalletService } from './wallet.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { AdminGuard } from '../../common/guards/admin.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 
 @Controller('wallet')
@@ -65,6 +66,7 @@ export class WalletController {
   /**
    * Admin: Get Wallet Global Conversion Configuration
    */
+  @UseGuards(AdminGuard)
   @Get('admin/config')
   async getAdminConfig() {
     return this.walletService.getAdminConfig();
@@ -73,6 +75,7 @@ export class WalletController {
   /**
    * Admin: Update Global Conversion Settings (Rate, Min Limit, Toggle)
    */
+  @UseGuards(AdminGuard)
   @Put('admin/config')
   async updateAdminConfig(
     @Body()
@@ -89,6 +92,7 @@ export class WalletController {
   /**
    * Admin: Manually Adjust (Add/Deduct/Set) Studio Cash for any Photographer
    */
+  @UseGuards(AdminGuard)
   @Post('admin/adjust')
   async adminAdjustWalletCash(
     @Body()
@@ -108,6 +112,7 @@ export class WalletController {
   /**
    * Admin: Get All Studio Cash Wallets & Summary Statistics
    */
+  @UseGuards(AdminGuard)
   @Get('admin/summary')
   async getAdminWalletsSummary() {
     return this.walletService.getAdminWalletsSummary();

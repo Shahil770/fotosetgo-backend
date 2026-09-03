@@ -27,21 +27,10 @@ export class AuthController {
   }
 
   @Post('admin/login')
-  async adminLogin(@Body() body: any) {
-    const { email, password } = body;
-    // Super-Admin verification logic
-    if (email === 'admin@fotosetgo.com' || email.includes('admin')) {
-      return {
-        token: 'super_admin_jwt_session_token_fotosetgo_core_998877',
-        admin: {
-          id: 'admin_root',
-          email,
-          name: 'Super Admin',
-          role: 'SUPER_ADMIN'
-        }
-      };
-    }
-    return this.authService.login(body, { ipAddress: '127.0.0.1', userAgent: 'Admin Console' });
+  async adminLogin(@Body() body: any, @Req() req: any) {
+    const ipAddress = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'] || 'Admin Console';
+    return this.authService.adminLogin(body, { ipAddress, userAgent });
   }
 
   @UseGuards(JwtAuthGuard)

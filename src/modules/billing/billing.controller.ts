@@ -1,6 +1,7 @@
 import { Controller, Post, Get, Patch, Delete, Body, UseGuards, Headers, Param, Query, UnauthorizedException, Inject } from '@nestjs/common';
 import { BillingService } from './billing.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { AdminGuard } from '../../common/guards/admin.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { PrismaService } from '../../prisma.service';
 import Redis from 'ioredis';
@@ -23,11 +24,13 @@ export class BillingController {
     return this.billingService.getAiCreditPacks();
   }
 
+  @UseGuards(AdminGuard)
   @Get('admin/credit-packs')
   async adminGetCreditPacks() {
     return this.billingService.adminGetAiCreditPacks();
   }
 
+  @UseGuards(AdminGuard)
   @Post('admin/credit-packs')
   async adminSaveCreditPacks(@Body() body: { packs: any[] }) {
     return this.billingService.adminSaveAiCreditPacks(body.packs);
@@ -50,16 +53,19 @@ export class BillingController {
     return this.billingService.validatePromoCode(user.photographer.id, body);
   }
 
+  @UseGuards(AdminGuard)
   @Get('admin/promocodes')
   async adminGetPromoCodes() {
     return this.billingService.adminGetPromoCodes();
   }
 
+  @UseGuards(AdminGuard)
   @Post('admin/promocodes')
   async adminCreatePromoCode(@Body() body: any) {
     return this.billingService.adminCreatePromoCode(body);
   }
 
+  @UseGuards(AdminGuard)
   @Patch('admin/promocodes/:id/status')
   async adminTogglePromoCode(
     @Param('id') id: string,
@@ -68,6 +74,7 @@ export class BillingController {
     return this.billingService.adminTogglePromoCode(id, body.isActive);
   }
 
+  @UseGuards(AdminGuard)
   @Delete('admin/promocodes/:id')
   async adminDeletePromoCode(@Param('id') id: string) {
     return this.billingService.adminDeletePromoCode(id);
@@ -147,11 +154,13 @@ export class BillingController {
     return this.billingService.submitPlanInquiry(body);
   }
 
+  @UseGuards(AdminGuard)
   @Get('admin/inquiries')
   async adminGetInquiries() {
     return this.billingService.adminGetPlanInquiries();
   }
 
+  @UseGuards(AdminGuard)
   @Get('admin/packages')
   async adminGetPackages() {
     // Admin dashboard gets all packages to render the matrix
@@ -160,6 +169,7 @@ export class BillingController {
     });
   }
 
+  @UseGuards(AdminGuard)
   @Post('admin/packages')
   async adminSavePackages(
     @Body() body: {
@@ -286,6 +296,7 @@ export class BillingController {
     return { success: true };
   }
 
+  @UseGuards(AdminGuard)
   @Get('admin/photographers')
   async adminGetPhotographers() {
     const photographers = await this.prismaService.photographer.findMany({
@@ -322,14 +333,11 @@ export class BillingController {
     }));
   }
 
+  @UseGuards(AdminGuard)
   @Post('admin/photographers/plan')
   async adminUpdatePhotographerPlan(
-    @Headers('x-admin-token') adminToken: string,
     @Body() body: { photographerId: string; packageName: string }
   ) {
-    if (!adminToken || !adminToken.includes('super_admin')) {
-      throw new UnauthorizedException('Admin authorization required');
-    }
     const { photographerId, packageName } = body;
     return this.billingService.upgradePackage(photographerId, { packageName });
   }
@@ -343,14 +351,11 @@ export class BillingController {
     });
   }
 
+  @UseGuards(AdminGuard)
   @Post('admin/photographers/credits')
   async adminAddPhotographerCredits(
-    @Headers('x-admin-token') adminToken: string,
     @Body() body: { photographerId: string; amountRupees: number; mode?: 'ADD' | 'SET' }
   ) {
-    if (!adminToken || !adminToken.includes('super_admin')) {
-      throw new UnauthorizedException('Admin authorization required');
-    }
     const { photographerId, amountRupees, mode = 'ADD' } = body;
     const amountPaise = Math.round(amountRupees * 100);
 

@@ -4109,20 +4109,27 @@ export class StorageService implements OnModuleInit {
     return updatedPhotographer;
   }
 
-  async getFreshVideoUrl(url: string | null): Promise<string | null> {
-    if (!url) return null;
+  async getFreshVideoUrl(urlOrKey: string | null): Promise<string | null> {
+    if (!urlOrKey) return null;
     try {
-      const decodedUrl = decodeURIComponent(url);
-      const match = decodedUrl.match(/((?:[a-f0-9-]+\/)?portfolio\/reels\/[^?#]+)/);
+      // 1. If it's already a raw R2 key (e.g. "uuid/portfolio/hero-video/...")
+      if (!urlOrKey.startsWith('http://') && !urlOrKey.startsWith('https://') && urlOrKey.includes('/portfolio/')) {
+        return await this.getReadUrl(urlOrKey);
+      }
+      // 2. If it's a full URL containing a portfolio key
+      const decodedUrl = decodeURIComponent(urlOrKey);
+      const match = decodedUrl.match(/((?:[a-f0-9-]+\/)?portfolio\/(?:hero-video|bts|reels|photos|about)[^?#]+)/i)
+        || decodedUrl.match(/((?:[a-f0-9-]+\/)?portfolio\/[^?#]+)/i);
       if (match) {
         const key = match[1];
         return await this.getReadUrl(key);
       }
     } catch (err) {
-      console.error('[StorageService] Failed to parse video url key:', url, err);
+      console.error('[StorageService] Failed to parse video url key:', urlOrKey, err);
     }
-    return url;
+    return urlOrKey;
   }
+
 
   async getPortfolioSettings(userId: string) {
     const photographer = await this.prisma.photographer.findUnique({

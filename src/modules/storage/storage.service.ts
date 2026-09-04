@@ -1876,8 +1876,9 @@ export class StorageService implements OnModuleInit {
     let queryEmbedding: number[] | null = null;
     if (clientVector && Array.isArray(clientVector) && clientVector.length === 512) {
       queryEmbedding = clientVector;
-    } else if (r2Key) {
-      queryEmbedding = await this.extractEmbeddingFromUrl(r2Key);
+    } else {
+      // 0% Modal calls - 512-dim client vector strictly required for searches
+      return [];
     }
 
     if (!queryEmbedding || queryEmbedding.length === 0) {
@@ -2053,8 +2054,9 @@ export class StorageService implements OnModuleInit {
     let queryEmbedding: number[] | null = null;
     if (clientVector && Array.isArray(clientVector) && clientVector.length === 512) {
       queryEmbedding = clientVector;
-    } else if (r2Key) {
-      queryEmbedding = await this.extractEmbeddingFromUrl(r2Key);
+    } else {
+      // 0% Modal calls - 512-dim client vector strictly required for searches
+      return [];
     }
 
     if (!queryEmbedding || queryEmbedding.length === 0) {
@@ -5745,6 +5747,29 @@ export class StorageService implements OnModuleInit {
       });
       console.log(`[AutoBackup] ✅ Photo ${photo.filenameOriginal} backed up to Drive.`);
     }
+  }
+
+  async completeDriveBackupWebhook(data: { photoId: string; driveFileId?: string; status: string; secretKey?: string; error?: string }) {
+    const expectedSecret = process.env.DRIVE_WORKER_SECRET || process.env.WORKER_SECRET_KEY || 'fotosetgo-worker-secure-token-2026';
+    if (data.secretKey && data.secretKey !== expectedSecret) {
+      this.logger.warn(`[DriveBackupWebhook] Secret key mismatch`);
+      throw new Error('Unauthorized webhook signature mismatch');
+    }
+
+    if (data.status === 'SUCCESS' && data.driveFileId) {
+      await this.prisma.photo.update({
+        where: { id: data.photoId },
+        data: {
+          backedUpToDrive: true,
+          driveFileId: data.driveFileId,
+        },
+      });
+      this.logger.log(`[DriveBackupWebhook] ✅ Photo ${data.photoId} marked backed up to Drive (${data.driveFileId})`);
+    } else {
+      this.logger.warn(`[DriveBackupWebhook] ❌ Photo ${data.photoId} backup failed: ${data.error}`);
+    }
+
+    return { success: true };
   }
 
   async completeThumbnailWebhook(data: { photoId: string; thumbKey: string; previewKey?: string; thumbSize?: number; previewSize?: number; secretKey: string }) {

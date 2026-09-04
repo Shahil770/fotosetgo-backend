@@ -409,7 +409,7 @@ export class GoogleDriveService {
     }
   }
 
-  // Backup all pending (not yet backed up) photos for a photographer
+  // Backup all pending (not yet backed up) photos for a photographer via Cloudflare Worker (Zero VPS Bandwidth)
   async backupAllPendingPhotos(
     photographerId: string,
     s3Client: any,
@@ -420,42 +420,106 @@ export class GoogleDriveService {
     let failed = 0;
     let skippedDriveFull = false;
 
-    // Fetch pending photos with their event name
+    // 1. Fetch pending photos with their event details
     const pendingPhotos = await prisma.photo.findMany({
       where: {
         photographerId,
         backedUpToDrive: false,
         status: 'READY',
         isDeleted: false,
-        // Only backup original event media — not thumbnails or other types
         type: { in: ['IMAGE', 'VIDEO'] },
-        r2KeyOriginal: { not: '' }, // must have original file key
+        r2KeyOriginal: { not: '' },
       },
       include: { event: { select: { title: true } } },
       orderBy: { createdAt: 'asc' },
+      take: 100, // Batch limit per cycle
     });
 
-    if (pendingPhotos.length === 0) return { backed, failed, skippedDriveFull };
+    if (pendingPhotos.length === 0) return { backed: 0, failed: 0, skippedDriveFull: false };
 
-    this.logger.log(`[AutoBackup] ${pendingPhotos.length} pending photos for photographer ${photographerId}`);
+    this.logger.log(`[AutoBackup] ${pendingPhotos.length} pending photos found for photographer ${photographerId}`);
 
-    for (const photo of pendingPhotos) {
-      // Check Drive quota before each upload
-      const { hasSpace } = await this.checkDriveHasSpace(photographerId);
-      if (!hasSpace) {
-        this.logger.warn(`[AutoBackup] Google Drive full for photographer ${photographerId}. Stopping.`);
-        skippedDriveFull = true;
-        // Auto-disable backup and mark notification flag
-        await prisma.photographer.update({
-          where: { id: photographerId },
-          data: { autoBackupToDrive: false, driveBackupFullNotified: true },
-        });
-        break;
+    // 2. Check Drive quota before dispatching
+    const { hasSpace } = await this.checkDriveHasSpace(photographerId);
+    if (!hasSpace) {
+      this.logger.warn(`[AutoBackup] Google Drive full for photographer ${photographerId}. Disabling auto-backup.`);
+      await prisma.photographer.update({
+        where: { id: photographerId },
+        data: { autoBackupToDrive: false, driveBackupFullNotified: true },
+      });
+      return { backed: 0, failed: 0, skippedDriveFull: true };
+    }
+
+    const workerUrl = process.env.DRIVE_BACKUP_WORKER_URL || 'https://fotosetgo-drive-backup.sahilshah778800.workers.dev';
+    const workerSecret = process.env.DRIVE_WORKER_SECRET || 'fotosetgo-worker-secure-token-2026';
+    const backendAppUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
+    const webhookUrl = `${backendAppUrl}/api/public/webhook/drive-backup-complete`;
+
+    try {
+      // 3. Get fresh OAuth Access Token for Google Drive
+      const auth = await this.getAuthenticatedClient(photographerId);
+      const tokenRes = await auth.getAccessToken();
+      const accessToken = tokenRes.token;
+
+      if (!accessToken) {
+        throw new Error('Could not retrieve valid Google Drive access token');
       }
 
+      // 4. Resolve folder structure: FotosetGo → photographerId → EventName
+      const rootFolderId = await this.getOrCreateFolder(photographerId, 'FotosetGo');
+      const photographerFolderId = await this.getOrCreateFolder(photographerId, photographerId, rootFolderId);
+
+      const eventFolderCache = new Map<string, string>();
+      const tasks: any[] = [];
+
+      for (const photo of pendingPhotos) {
+        const eventName = photo.event?.title || 'Uncategorized';
+        let eventFolderId = eventFolderCache.get(eventName);
+        if (!eventFolderId) {
+          eventFolderId = await this.getOrCreateFolder(photographerId, eventName, photographerFolderId);
+          eventFolderCache.set(eventName, eventFolderId);
+        }
+
+        tasks.push({
+          photoId: photo.id,
+          r2Key: photo.r2KeyOriginal,
+          filename: photo.filenameOriginal,
+          mimeType: photo.mimeType || 'image/jpeg',
+          fileSize: photo.fileSizeBytes ? Number(photo.fileSizeBytes) : undefined,
+          googleAccessToken: accessToken,
+          eventFolderId,
+          webhookUrl,
+          secretKey: workerSecret,
+        });
+      }
+
+      // 5. Dispatch batch directly to Cloudflare Edge Worker (0% VPS Bandwidth)
+      this.logger.log(`[AutoBackup] 🚀 Dispatching ${tasks.length} tasks to Cloudflare Edge Worker (${workerUrl})...`);
+      const workerRes = await fetch(`${workerUrl}/backup-batch`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-worker-secret': workerSecret,
+        },
+        body: JSON.stringify({ tasks, webhookUrl, secretKey: workerSecret }),
+      });
+
+      if (workerRes.ok) {
+        this.logger.log(`[AutoBackup] ✅ ${tasks.length} backup tasks queued on Cloudflare Edge successfully!`);
+        return { backed: tasks.length, failed: 0, skippedDriveFull: false };
+      } else {
+        const errText = await workerRes.text();
+        this.logger.warn(`[AutoBackup] Cloudflare Worker response not ok (${workerRes.status}): ${errText}. Falling back to single streams.`);
+      }
+
+    } catch (workerErr: any) {
+      this.logger.error(`[AutoBackup] Cloudflare Worker dispatch error: ${workerErr.message}. Falling back to sequential streams.`);
+    }
+
+    // Fallback: Local stream if worker is unreachable
+    for (const photo of pendingPhotos) {
       const eventName = photo.event?.title || 'Uncategorized';
       const driveFileId = await this.backupSinglePhoto(photographerId, photo, eventName, s3Client, bucketName);
-
       if (driveFileId) {
         await prisma.photo.update({
           where: { id: photo.id },
@@ -467,7 +531,6 @@ export class GoogleDriveService {
       }
     }
 
-    this.logger.log(`[AutoBackup] Done. Backed: ${backed}, Failed: ${failed}, DriveFullStop: ${skippedDriveFull}`);
     return { backed, failed, skippedDriveFull };
   }
 }

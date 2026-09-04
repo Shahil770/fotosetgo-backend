@@ -232,6 +232,14 @@ export class PublicStorageController {
     return this.storageService.completeThumbnailWebhook(body);
   }
 
+  // Public webhook call from Cloudflare Worker upon Google Drive backup completion
+  @Post('webhook/drive-backup-complete')
+  async handleDriveBackupComplete(
+    @Body() body: { photoId: string; driveFileId?: string; status: string; secretKey?: string; error?: string }
+  ) {
+    return this.storageService.completeDriveBackupWebhook(body);
+  }
+
   // Public webhook call from Modal GPU upon video face indexing completion
   @Post('webhook/video-face-complete')
   async handleVideoFaceComplete(

@@ -17,7 +17,6 @@ export class StorageService implements OnModuleInit {
   private readonly logger = new Logger(StorageService.name);
   private s3Client: S3Client;
   private bucketName: string;
-  private readonly urlCache = new Map<string, { url: string; expiresAt: number }>();
   private readonly activeEventScans = new Set<string>();
   private readonly activeVideoProcessings = new Set<string>();
   private readonly pendingDriveBatchTimers = new Map<string, NodeJS.Timeout>();
@@ -91,9 +90,13 @@ export class StorageService implements OnModuleInit {
   private startUploadCompletionProcessor() {
     setInterval(async () => {
       try {
-        // High-throughput pipelined pop: pop up to 100 items every 500ms (Throughput: 200 photos/sec = 12,000 photos/min)
+        const queueLen = await this.redis.llen('queue:upload-completions').catch(() => 0);
+        if (!queueLen || queueLen === 0) return;
+
+        // High-throughput pipelined pop: pop up to 100 items (Throughput: 200 photos/sec = 12,000 photos/min)
+        const batchSize = Math.min(queueLen, 100);
         const pipeline = this.redis.pipeline();
-        for (let i = 0; i < 100; i++) {
+        for (let i = 0; i < batchSize; i++) {
           pipeline.rpop('queue:upload-completions');
         }
         const results = await pipeline.exec();
@@ -1757,23 +1760,12 @@ export class StorageService implements OnModuleInit {
   }
 
   async getReadUrl(key: string): Promise<string> {
-    const now = Date.now();
-    const cached = this.urlCache.get(key);
-    if (cached && cached.expiresAt > now + 300000) { // 5 minutes buffer
-      // Refresh recency for LRU ordering
-      this.urlCache.delete(key);
-      this.urlCache.set(key, cached);
-      return cached.url;
-    }
-
-    // True Bounded LRU Cache: strictly cap memory at 5,000 entries by evicting least recently used items
-    while (this.urlCache.size >= 5000) {
-      const oldestKey = this.urlCache.keys().next().value;
-      if (oldestKey) {
-        this.urlCache.delete(oldestKey);
-      } else {
-        break;
-      }
+    const redisKey = `cache:r2:url:${key}`;
+    try {
+      const cached = await this.redis.get(redisKey);
+      if (cached) return cached;
+    } catch (err: any) {
+      // Non-blocking Redis fallback
     }
 
     const getCommand = new GetObjectCommand({
@@ -1781,7 +1773,13 @@ export class StorageService implements OnModuleInit {
       Key: key,
     });
     const url = await getSignedUrl(this.s3Client, getCommand, { expiresIn: 3600 }); // 1 hour expiration
-    this.urlCache.set(key, { url, expiresAt: now + 3600000 });
+    
+    try {
+      await this.redis.set(redisKey, url, 'EX', 3000); // 50 minutes TTL
+    } catch (err: any) {
+      // Non-blocking Redis set error
+    }
+
     return url;
   }
 
@@ -3913,51 +3911,9 @@ export class StorageService implements OnModuleInit {
   }
 
   async streamPhotoToResponse(slug: string, photoId: string, isThumb: boolean, isDownload: boolean, res: any) {
-    const event = await this.prisma.event.findUnique({
-      where: { slug },
-      select: { id: true, allowDownload: true }
-    });
-    if (!event) {
-      throw new NotFoundException('Event not found');
-    }
-
-    const photo = await this.prisma.photo.findUnique({
-      where: { id: photoId },
-      select: { eventId: true, type: true, filenameOriginal: true, r2KeyPreview: true, r2KeyThumb: true, r2KeyOriginal: true }
-    });
-    if (!photo || photo.eventId !== event.id) {
-      throw new NotFoundException('Photo not found');
-    }
-
-    if (isDownload && !event.allowDownload) {
-      throw new ForbiddenException('Download is not enabled for this gallery');
-    }
-
-    const readKey = isDownload
-      ? photo.r2KeyOriginal
-      : (isThumb ? (photo.r2KeyThumb || photo.r2KeyOriginal) : (photo.type === 'VIDEO' ? photo.r2KeyOriginal : (photo.r2KeyPreview || photo.r2KeyThumb || photo.r2KeyOriginal)));
-
-    try {
-      const getCmd = new GetObjectCommand({
-        Bucket: this.bucketName,
-        Key: readKey
-      });
-      const s3Res = await this.s3Client.send(getCmd);
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', '*');
-      res.setHeader('Content-Type', s3Res.ContentType || 'image/jpeg');
-      if (s3Res.ContentLength) {
-        res.setHeader('Content-Length', s3Res.ContentLength);
-      }
-      if (isDownload) {
-        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(photo.filenameOriginal || 'photo.jpg')}"`);
-      }
-      return (s3Res.Body as any).pipe(res);
-    } catch (err: any) {
-      this.logger.error(`[streamPhotoToResponse] S3 pipe error for ${readKey}: ${err.message}`);
-      throw new NotFoundException('Failed to stream photo');
-    }
+    const result = await this.getWatermarkedImageStream(slug, photoId, isThumb, isDownload);
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    return res.redirect(result.redirectUrl);
   }
 
   async getBulkDownloadUrls(slug: string, photoIds?: string[], passcode?: string, clientIp?: string) {
@@ -4343,6 +4299,15 @@ export class StorageService implements OnModuleInit {
     };
   }
 
+  private async invalidateUrlCache(key?: string | null) {
+    if (!key) return;
+    try {
+      await this.redis.del(`cache:r2:url:${key}`);
+    } catch (err: any) {
+      // Non-blocking
+    }
+  }
+
   async updatePortfolioSettings(userId: string, data: any) {
     const photographer = await this.prisma.photographer.findUnique({
       where: { userId }
@@ -4359,7 +4324,7 @@ export class StorageService implements OnModuleInit {
         if (oldKey) {
           try {
             await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldKey }));
-            this.urlCache.delete(oldKey);
+            this.invalidateUrlCache(oldKey);
             this.logger.log(`[StorageService] Deleted replaced old Teaser Video from R2: ${oldKey}`);
           } catch (err: any) {
             this.logger.error(`[StorageService] Failed to delete replaced Teaser Video: ${err.message}`);
@@ -4372,7 +4337,7 @@ export class StorageService implements OnModuleInit {
         if (oldThumbKey) {
           try {
             await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldThumbKey }));
-            this.urlCache.delete(oldThumbKey);
+            this.invalidateUrlCache(oldThumbKey);
             this.logger.log(`[StorageService] Deleted replaced old Teaser Video Thumbnail from R2: ${oldThumbKey}`);
           } catch (err: any) {
             this.logger.error(`[StorageService] Failed to delete replaced Teaser Video Thumbnail: ${err.message}`);
@@ -4386,7 +4351,7 @@ export class StorageService implements OnModuleInit {
         if (oldKey) {
           try {
             await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldKey }));
-            this.urlCache.delete(oldKey);
+            this.invalidateUrlCache(oldKey);
             this.logger.log(`[StorageService] Deleted replaced old BTS Video from R2: ${oldKey}`);
           } catch (err: any) {
             this.logger.error(`[StorageService] Failed to delete replaced BTS Video: ${err.message}`);
@@ -4400,7 +4365,7 @@ export class StorageService implements OnModuleInit {
         if (oldThumbKey) {
           try {
             await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldThumbKey }));
-            this.urlCache.delete(oldThumbKey);
+            this.invalidateUrlCache(oldThumbKey);
             this.logger.log(`[StorageService] Deleted replaced old BTS Thumbnail from R2: ${oldThumbKey}`);
           } catch (err: any) {
             this.logger.error(`[StorageService] Failed to delete replaced BTS Thumbnail: ${err.message}`);
@@ -4492,7 +4457,7 @@ export class StorageService implements OnModuleInit {
             Bucket: this.bucketName,
             Key: r2Key,
           }));
-          this.urlCache.delete(r2Key);
+          this.invalidateUrlCache(r2Key);
           this.logger.log(`[StorageService] Deleted Teaser Video from R2: ${r2Key}`);
         } catch (err: any) {
           this.logger.error(`[StorageService] Failed to delete Teaser Video from R2: ${err.message}`);
@@ -4509,7 +4474,7 @@ export class StorageService implements OnModuleInit {
             Bucket: this.bucketName,
             Key: r2ThumbKey,
           }));
-          this.urlCache.delete(r2ThumbKey);
+          this.invalidateUrlCache(r2ThumbKey);
           this.logger.log(`[StorageService] Deleted Teaser Video Thumbnail from R2: ${r2ThumbKey}`);
         } catch (err: any) {
           this.logger.error(`[StorageService] Failed to delete Teaser Video Thumbnail from R2: ${err.message}`);
@@ -4613,7 +4578,7 @@ export class StorageService implements OnModuleInit {
             Bucket: this.bucketName,
             Key: r2Key,
           }));
-          this.urlCache.delete(r2Key);
+          this.invalidateUrlCache(r2Key);
           this.logger.log(`[StorageService] Deleted BTS Video from R2: ${r2Key}`);
         } catch (err: any) {
           this.logger.error(`[StorageService] Failed to delete BTS Video from R2: ${err.message}`);
@@ -4631,7 +4596,7 @@ export class StorageService implements OnModuleInit {
             Bucket: this.bucketName,
             Key: thumbR2Key,
           }));
-          this.urlCache.delete(thumbR2Key);
+          this.invalidateUrlCache(thumbR2Key);
           this.logger.log(`[StorageService] Deleted BTS Thumb from R2: ${thumbR2Key}`);
         } catch (err: any) {
           this.logger.error(`[StorageService] Failed to delete BTS Thumb from R2: ${err.message}`);
@@ -4716,14 +4681,14 @@ export class StorageService implements OnModuleInit {
           Bucket: this.bucketName,
           Key: reel.r2Key,
         }));
-        this.urlCache.delete(reel.r2Key);
+        this.invalidateUrlCache(reel.r2Key);
       }
       if (reel.r2KeyThumb) {
         await this.s3Client.send(new DeleteObjectCommand({
           Bucket: this.bucketName,
           Key: reel.r2KeyThumb,
         }));
-        this.urlCache.delete(reel.r2KeyThumb);
+        this.invalidateUrlCache(reel.r2KeyThumb);
       }
     } catch (err) {
       console.error('[StorageService] Delete reel R2 file error:', err);
@@ -4798,7 +4763,7 @@ export class StorageService implements OnModuleInit {
     if (oldKey && oldKey !== key) {
       try {
         await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldKey }));
-        this.urlCache.delete(oldKey);
+        this.invalidateUrlCache(oldKey);
       } catch { }
     }
 
@@ -4813,7 +4778,7 @@ export class StorageService implements OnModuleInit {
     await this.recalculateStorage(photographer.id);
     await this.invalidatePortfolioCache(photographer.id);
 
-    this.urlCache.delete(key);
+    this.invalidateUrlCache(key);
     const url = await this.getReadUrl(key);
     return { success: true, url, key };
   }

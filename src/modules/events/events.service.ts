@@ -76,16 +76,12 @@ export class EventsService {
   }
 
   async findAll(photographerId: string) {
-    // Redis cache query bypassed during local testing to avoid network connection blocks
-    const bypassCache = true;
     const cacheKey = `cache:events:list:${photographerId}`;
-    if (!bypassCache) {
-      try {
-        const cached = await this.redis.get(cacheKey);
-        if (cached) return JSON.parse(cached);
-      } catch (err) {
-        console.error('[EventsService] Redis get failed inside findAll:', err);
-      }
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch (err) {
+      console.error('[EventsService] Redis get failed inside findAll:', err);
     }
 
     const [events, storageGroup, typeGroup] = await Promise.all([
@@ -163,12 +159,10 @@ export class EventsService {
       })
     );
 
-    if (!bypassCache) {
-      try {
-        await this.redis.set(cacheKey, JSON.stringify(results), 'EX', 600); // 10 minutes cache TTL
-      } catch (err) {
-        console.error('[EventsService] Redis set failed inside findAll:', err);
-      }
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(results), 'EX', 120); // 2 minutes cache TTL (invalidated automatically on create/update/delete)
+    } catch (err) {
+      console.error('[EventsService] Redis set failed inside findAll:', err);
     }
 
     return results;

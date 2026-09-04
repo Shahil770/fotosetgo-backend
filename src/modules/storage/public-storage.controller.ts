@@ -101,18 +101,13 @@ export class PublicStorageController {
     @Param('photoId') photoId: string,
     @Query('thumb') thumb: string,
     @Query('download') download: string,
-    @Query('stream') stream: string,
     @Res() res: any
   ) {
     const isThumb = thumb === 'true';
     const isDownload = download === 'true';
-    const isStream = stream === 'true';
-
-    if (isStream) {
-      return this.storageService.streamPhotoToResponse(slug, photoId, isThumb, isDownload, res);
-    }
 
     const result = await this.storageService.getWatermarkedImageStream(slug, photoId, isThumb, isDownload);
+    res.setHeader('Cache-Control', 'public, max-age=300');
     return res.redirect(result.redirectUrl);
   }
 

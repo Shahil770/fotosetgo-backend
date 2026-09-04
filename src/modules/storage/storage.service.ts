@@ -1872,10 +1872,14 @@ export class StorageService implements OnModuleInit {
     }
   }
 
-  async searchFace(photographerId: string, r2Key: string, eventId?: string) {
-    if (!r2Key) return [];
+  async searchFace(photographerId: string, r2Key?: string, eventId?: string, clientVector?: number[]) {
+    let queryEmbedding: number[] | null = null;
+    if (clientVector && Array.isArray(clientVector) && clientVector.length === 512) {
+      queryEmbedding = clientVector;
+    } else if (r2Key) {
+      queryEmbedding = await this.extractEmbeddingFromUrl(r2Key);
+    }
 
-    const queryEmbedding = await this.extractEmbeddingFromUrl(r2Key);
     if (!queryEmbedding || queryEmbedding.length === 0) {
       return [];
     }
@@ -2000,8 +2004,8 @@ export class StorageService implements OnModuleInit {
     }
   }
 
-  async searchFacePublic(r2Key: string, eventId?: string, passcode?: string, clientIp?: string) {
-    if (!r2Key) return [];
+  async searchFacePublic(r2Key?: string, eventId?: string, passcode?: string, clientIp?: string, clientVector?: number[]) {
+    if (!r2Key && (!clientVector || !Array.isArray(clientVector) || clientVector.length !== 512)) return [];
 
     // Enforce 10 searches/min rate limit per client IP to protect Modal GPU costs
     if (clientIp) {
@@ -2046,7 +2050,13 @@ export class StorageService implements OnModuleInit {
       return [];
     }
 
-    const queryEmbedding = await this.extractEmbeddingFromUrl(r2Key);
+    let queryEmbedding: number[] | null = null;
+    if (clientVector && Array.isArray(clientVector) && clientVector.length === 512) {
+      queryEmbedding = clientVector;
+    } else if (r2Key) {
+      queryEmbedding = await this.extractEmbeddingFromUrl(r2Key);
+    }
+
     if (!queryEmbedding || queryEmbedding.length === 0) {
       return [];
     }

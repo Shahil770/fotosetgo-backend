@@ -171,11 +171,11 @@ export class PublicStorageController {
 
   @Post('search-face')
   async searchFacePublic(
-    @Body() body: { r2Key: string; eventId?: string; passcode?: string },
+    @Body() body: { r2Key?: string; vector?: number[]; eventId?: string; passcode?: string },
     @Req() req: any
   ) {
     const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
-    return this.storageService.searchFacePublic(body.r2Key, body.eventId, body.passcode, clientIp);
+    return this.storageService.searchFacePublic(body.r2Key, body.eventId, body.passcode, clientIp, body.vector);
   }
 
   @Get('portfolio/:subdomain')

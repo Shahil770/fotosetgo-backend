@@ -124,9 +124,9 @@ export class StorageController {
   @UseGuards(FeatureGuard('featureAiPhotoSearch'))
   async searchFace(
     @CurrentUser() user: any,
-    @Body() body: { r2Key: string; eventId?: string },
+    @Body() body: { r2Key?: string; vector?: number[]; eventId?: string },
   ) {
-    return this.storageService.searchFace(user.photographer?.id || user.id, body.r2Key, body.eventId);
+    return this.storageService.searchFace(user.photographer?.id || user.id, body.r2Key, body.eventId, body.vector);
   }
 
   @Delete('photo/:id')

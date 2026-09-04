@@ -3943,6 +3943,101 @@ export class StorageService implements OnModuleInit {
     }
   }
 
+  async getBulkDownloadUrls(slug: string, photoIds?: string[], passcode?: string, clientIp?: string) {
+    const ip = clientIp || '127.0.0.1';
+    const lockKey = `lock:passcode:${slug}:${ip}`;
+    const failKey = `fail:passcode:${slug}:${ip}`;
+
+    try {
+      const isLocked = await this.redis.get(lockKey);
+      if (isLocked) {
+        const ttl = await this.redis.ttl(lockKey);
+        const mins = Math.max(1, Math.ceil((ttl > 0 ? ttl : 300) / 60));
+        throw new ForbiddenException(`Too many failed attempts. Access is locked. Please try again after ${mins} minute${mins === 1 ? '' : 's'}.`);
+      }
+    } catch (err: any) {
+      if (err instanceof ForbiddenException) throw err;
+    }
+
+    const event = await this.prisma.event.findUnique({
+      where: { slug },
+      select: { id: true, title: true, status: true, visibility: true, passcode: true, allowDownload: true }
+    });
+
+    if (!event) {
+      throw new NotFoundException('Event not found');
+    }
+
+    if (event.status === 'DRAFT') {
+      throw new BadRequestException('This event is currently in draft.');
+    }
+
+    if (!event.allowDownload) {
+      throw new ForbiddenException('Download is not enabled for this event gallery.');
+    }
+
+    const requiresPasscode = event.visibility === 'PRIVATE' || (event.passcode && event.passcode !== '');
+    if (requiresPasscode) {
+      if (!passcode || passcode !== event.passcode) {
+        try {
+          const fails = await this.redis.incr(failKey);
+          if (fails === 1) await this.redis.expire(failKey, 300);
+          if (fails >= 5) {
+            await this.redis.set(lockKey, '1', 'EX', 300);
+            throw new ForbiddenException('Too many incorrect passcode attempts. Your access has been locked for 5 minutes.');
+          }
+        } catch (err: any) {
+          if (err instanceof ForbiddenException) throw err;
+        }
+        throw new UnauthorizedException('Invalid event passcode');
+      } else {
+        this.redis.del(failKey).catch(() => {});
+      }
+    }
+
+    const where: any = { eventId: event.id, status: 'READY', isDeleted: false };
+    if (photoIds && photoIds.length > 0) {
+      where.id = { in: photoIds };
+    }
+
+    const photos = await this.prisma.photo.findMany({
+      where,
+      select: {
+        id: true,
+        filenameOriginal: true,
+        r2KeyOriginal: true,
+        type: true,
+        duration: true,
+        fileSize: true,
+      },
+      orderBy: [
+        { createdAt: 'desc' },
+        { id: 'desc' }
+      ]
+    });
+
+    const downloadList = await Promise.all(
+      photos.map(async (photo) => {
+        const downloadUrl = await this.getDownloadUrl(photo.r2KeyOriginal, photo.filenameOriginal);
+        return {
+          id: photo.id,
+          filenameOriginal: photo.filenameOriginal,
+          downloadUrl,
+          type: photo.type || 'IMAGE',
+          duration: photo.duration || 0,
+          fileSize: Number(photo.fileSize || 0)
+        };
+      })
+    );
+
+    return {
+      eventSlug: slug,
+      eventTitle: event.title,
+      totalCount: downloadList.length,
+      photos: downloadList
+    };
+  }
+
   async getWatermarkImageStreamByPhotographerId(photographerId: string) {
     const photographer = await this.prisma.photographer.findUnique({
       where: { id: photographerId }

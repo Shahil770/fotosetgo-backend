@@ -116,6 +116,16 @@ export class PublicStorageController {
     return res.redirect(result.redirectUrl);
   }
 
+  @Post('events/:slug/bulk-download-urls')
+  async getBulkDownloadUrls(
+    @Param('slug') slug: string,
+    @Body() body: { photoIds?: string[]; passcode?: string },
+    @Req() req: any
+  ) {
+    const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
+    return this.storageService.getBulkDownloadUrls(slug, body.photoIds, body.passcode, clientIp);
+  }
+
   @Get('watermark/:photographerId')
   async viewPublicWatermark(
     @Param('photographerId') photographerId: string,

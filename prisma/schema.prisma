@@ -400,6 +400,7 @@ model FaceEmbedding {
   @@index([photographerId])
   @@index([photoId])
   @@index([clusterId])
+  @@index([eventId, photographerId])
   @@map("face_embeddings")
 }
 

@@ -20,6 +20,7 @@ export class StorageService implements OnModuleInit {
   private readonly urlCache = new Map<string, { url: string; expiresAt: number }>();
   private readonly activeEventScans = new Set<string>();
   private readonly activeVideoProcessings = new Set<string>();
+  private readonly pendingDriveBatchTimers = new Map<string, NodeJS.Timeout>();
   private workerDispatchCounter = 0;
 
   constructor(
@@ -27,7 +28,7 @@ export class StorageService implements OnModuleInit {
     private googleDriveService: GoogleDriveService,
     @Inject('REDIS_CLIENT') private redis: any,
   ) {
-    this.bucketName = process.env.R2_BUCKET_NAME || 'fotosetgo-photos';
+    this.bucketName = process.env.R2_BUCKET_NAME as string;
 
     const httpAgent = new http.Agent({
       keepAlive: true,
@@ -1431,7 +1432,7 @@ export class StorageService implements OnModuleInit {
       let videoThumbSize = 0;
       if (!actualThumbKey) {
         try {
-          const thumbnailEngineUrl = process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run';
+          const thumbnailEngineUrl = process.env.THUMBNAIL_ENGINE_URL;
           const thumbRes = await fetch(`${thumbnailEngineUrl}/generate-thumbnail`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1501,8 +1502,8 @@ export class StorageService implements OnModuleInit {
             data: { faceScanStatus: 'SKIPPED' }
           });
         } else {
-          const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
-          const backendAppUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
+          const faceEngineUrl = process.env.FACE_ENGINE_URL;
+          const backendAppUrl = process.env.APP_URL || process.env.PUBLIC_API_URL;
           const webhookUrl = `${backendAppUrl}/api/public/webhook/video-face-complete`;
           const secretKey = process.env.WORKER_SECRET_KEY || '';
 
@@ -1567,7 +1568,7 @@ export class StorageService implements OnModuleInit {
 
   async processIngestedPhoto(photographerId: string, photoId: string, eventId: string, r2KeyOriginal: string) {
     try {
-      const thumbnailEngineUrl = process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run';
+      const thumbnailEngineUrl = process.env.THUMBNAIL_ENGINE_URL;
       const thumbRes = await fetch(`${thumbnailEngineUrl}/generate-thumbnail`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1684,8 +1685,8 @@ export class StorageService implements OnModuleInit {
       const faceIndexUrl = await getSignedUrl(this.s3Client, origCommand, { expiresIn: 600 });
 
       // Call FastAPI Face Engine with Webhook callback support
-      const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
-      const backendAppUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
+      const faceEngineUrl = process.env.FACE_ENGINE_URL;
+      const backendAppUrl = process.env.APP_URL || process.env.PUBLIC_API_URL;
       const webhookUrl = `${backendAppUrl}/api/public/webhook/photo-face-complete`;
       const secretKey = process.env.WORKER_SECRET_KEY || '';
 
@@ -1814,7 +1815,11 @@ export class StorageService implements OnModuleInit {
   }
 
   private async extractEmbeddingFromUrl(r2Key: string): Promise<number[] | null> {
-    const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
+    const faceEngineUrl = process.env.FACE_ENGINE_URL;
+    if (!faceEngineUrl) {
+      this.logger.error('FACE_ENGINE_URL is not configured in environment variables');
+      return null;
+    }
 
     // 1. Generate a temporary presigned GET URL for the R2 key (valid for 5 mins)
     let imageUrl = '';
@@ -2125,7 +2130,7 @@ export class StorageService implements OnModuleInit {
         const hideDirectStorageUrl = isWatermarked || (event && !event.allowDownload);
 
         if (hideDirectStorageUrl) {
-          const apiBase = process.env.PUBLIC_API_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
+          const apiBase = process.env.PUBLIC_API_URL || process.env.APP_URL;
           url = `${apiBase}/api/public/events/${event.slug}/photos/${photo.id}/view`;
           thumbUrl = `${apiBase}/api/public/events/${event.slug}/photos/${photo.id}/view?thumb=true`;
         } else {
@@ -3575,7 +3580,7 @@ export class StorageService implements OnModuleInit {
         const hideDirectStorageUrl = event && !event.allowDownload;
 
         if (hideDirectStorageUrl) {
-          const apiBase = process.env.PUBLIC_API_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
+          const apiBase = process.env.PUBLIC_API_URL || process.env.APP_URL;
           url = `${apiBase}/api/public/events/${slug}/photos/${photo.id}/view`;
         } else {
           // Videos must always serve original file; images serve 800px preview or thumb
@@ -5750,26 +5755,52 @@ export class StorageService implements OnModuleInit {
   }
 
   async completeDriveBackupWebhook(data: { photoId: string; driveFileId?: string; status: string; secretKey?: string; error?: string }) {
-    const expectedSecret = process.env.DRIVE_WORKER_SECRET || process.env.WORKER_SECRET_KEY || 'fotosetgo-worker-secure-token-2026';
-    if (data.secretKey && data.secretKey !== expectedSecret) {
+    const expectedSecret = process.env.DRIVE_WORKER_SECRET || process.env.WORKER_SECRET_KEY;
+    if (!expectedSecret || (data.secretKey && data.secretKey !== expectedSecret)) {
       this.logger.warn(`[DriveBackupWebhook] Secret key mismatch`);
       throw new Error('Unauthorized webhook signature mismatch');
     }
 
     if (data.status === 'SUCCESS' && data.driveFileId) {
-      await this.prisma.photo.update({
+      const updatedPhoto = await this.prisma.photo.update({
         where: { id: data.photoId },
         data: {
           backedUpToDrive: true,
           driveFileId: data.driveFileId,
         },
+        select: { photographerId: true },
       });
       this.logger.log(`[DriveBackupWebhook] ✅ Photo ${data.photoId} marked backed up to Drive (${data.driveFileId})`);
+
+      if (updatedPhoto?.photographerId) {
+        this.scheduleNextDriveBackupBatch(updatedPhoto.photographerId);
+      }
     } else {
       this.logger.warn(`[DriveBackupWebhook] ❌ Photo ${data.photoId} backup failed: ${data.error}`);
     }
 
     return { success: true };
+  }
+
+  private scheduleNextDriveBackupBatch(photographerId: string) {
+    if (this.pendingDriveBatchTimers.has(photographerId)) return;
+
+    const timer = setTimeout(async () => {
+      this.pendingDriveBatchTimers.delete(photographerId);
+      try {
+        const photographer = await this.prisma.photographer.findUnique({
+          where: { id: photographerId },
+          select: { autoBackupToDrive: true, googleDriveConnected: true, googleDriveAccessToken: true },
+        });
+        if (photographer?.autoBackupToDrive && photographer?.googleDriveConnected && photographer?.googleDriveAccessToken) {
+          await this.googleDriveService.backupAllPendingPhotos(photographerId, this.s3Client, this.bucketName, this.prisma);
+        }
+      } catch (err: any) {
+        this.logger.error(`[DriveBackup] Auto-queue next batch failed for ${photographerId}: ${err.message}`);
+      }
+    }, 4000); // 4-second debounce to let previous batch settle cleanly
+
+    this.pendingDriveBatchTimers.set(photographerId, timer);
   }
 
   async completeThumbnailWebhook(data: { photoId: string; thumbKey: string; previewKey?: string; thumbSize?: number; previewSize?: number; secretKey: string }) {
@@ -6209,7 +6240,7 @@ export class StorageService implements OnModuleInit {
   }
 
   async triggerCloudflareWorker(photoId: string, r2KeyOriginal: string): Promise<void> {
-    const modalUrl = (process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run') + '/generate-thumbnail';
+    const modalUrl = `${process.env.THUMBNAIL_ENGINE_URL}/generate-thumbnail`;
     let selectedUrl = process.env.USE_MODAL_THUMBNAILS !== 'false' ? modalUrl : (process.env.THUMBNAIL_WORKER_URL || modalUrl);
 
     if (!selectedUrl.endsWith('/generate-thumbnail') && !selectedUrl.endsWith('/generate-batch-thumbnails')) {
@@ -6255,7 +6286,7 @@ export class StorageService implements OnModuleInit {
   async processBatchThumbnailsViaGoWorker(photos: { id: string; r2KeyOriginal: string }[]): Promise<void> {
     if (!photos || photos.length === 0) return;
 
-    const modalUrl = (process.env.THUMBNAIL_ENGINE_URL || 'https://sahilshah778800--thumbnail-engine-fastapi-app.modal.run') + '/generate-thumbnail';
+    const modalUrl = `${process.env.THUMBNAIL_ENGINE_URL}/generate-thumbnail`;
     let selectedUrl = process.env.USE_MODAL_THUMBNAILS !== 'false' ? modalUrl : (process.env.THUMBNAIL_WORKER_URL || modalUrl);
 
     if (!selectedUrl.endsWith('/generate-thumbnail') && !selectedUrl.endsWith('/generate-batch-thumbnails')) {
@@ -6479,7 +6510,7 @@ export class StorageService implements OnModuleInit {
         // 1. Process Batch of Photos in 1 SINGLE HTTP Request to Modal GPU (/faces/index-batch-photos)
         if (photos.length > 0) {
           try {
-            const faceEngineUrl = process.env.FACE_ENGINE_URL || 'https://sahilshah778800--face-engine-fastapi-app.modal.run';
+            const faceEngineUrl = process.env.FACE_ENGINE_URL;
             const photoBatchPayload: { photoId: string; imageUrl: string }[] = [];
 
             for (const photo of photos) {
@@ -6492,7 +6523,7 @@ export class StorageService implements OnModuleInit {
             }
 
             if (photoBatchPayload.length > 0) {
-              const backendAppUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
+              const backendAppUrl = process.env.APP_URL || process.env.PUBLIC_API_URL;
               const webhookUrl = `${backendAppUrl}/api/public/webhook/photo-face-complete`;
               const secretKey = process.env.WORKER_SECRET_KEY || '';
 

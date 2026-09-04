@@ -31,17 +31,25 @@ export class GoogleDriveController {
   ) {
     try {
       const photographerId = state;
-      const frontendUrl = process.env.FRONTEND_URL || 'https://fotosetgo.com';
+      const frontendUrl = process.env.FRONTEND_URL;
       await this.googleDriveService.handleCallback(code, photographerId);
       return res.redirect(`${frontendUrl}/dashboard/storage?drive=connected`);
     } catch (err) {
       console.error('[GoogleDrive] Auth callback failed:', err);
-      const frontendUrl = process.env.FRONTEND_URL || 'https://fotosetgo.com';
+      const frontendUrl = process.env.FRONTEND_URL;
       return res.redirect(`${frontendUrl}/dashboard/storage?drive=error`);
     }
   }
 
   // Disconnect Google Drive
+  @UseGuards(JwtAuthGuard)
+  @Get('disconnect')
+  async disconnectDriveGet(@Req() req: any) {
+    const photographerId = req.user.photographer?.id || req.user.id;
+    await this.googleDriveService.disconnect(photographerId);
+    return { disconnected: true };
+  }
+
   @UseGuards(JwtAuthGuard)
   @Post('disconnect')
   async disconnectDrive(@Req() req: any) {
@@ -153,10 +161,24 @@ export class GoogleDriveController {
 
     const pending = totalReady - backedUp;
 
+    let isFullNotified = photographer?.driveBackupFullNotified ?? false;
+    if (isFullNotified && photographer?.googleDriveConnected) {
+      try {
+        const spaceCheck = await this.googleDriveService.checkDriveHasSpace(photographerId);
+        if (spaceCheck.hasSpace) {
+          await this.prisma.photographer.update({
+            where: { id: photographerId },
+            data: { driveBackupFullNotified: false },
+          });
+          isFullNotified = false;
+        }
+      } catch {}
+    }
+
     return {
       autoBackupToDrive: photographer?.autoBackupToDrive ?? false,
       googleDriveConnected: photographer?.googleDriveConnected ?? false,
-      driveBackupFullNotified: photographer?.driveBackupFullNotified ?? false,
+      driveBackupFullNotified: isFullNotified,
       totalReady,
       backedUp,
       pending,

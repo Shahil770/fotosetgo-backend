@@ -16,7 +16,7 @@ export class DriveBackupCronService {
     private readonly prisma: PrismaService,
     private readonly googleDriveService: GoogleDriveService,
   ) {
-    this.bucketName = process.env.R2_BUCKET_NAME || 'fotosetgo-photos';
+    this.bucketName = process.env.R2_BUCKET_NAME as string;
     this.s3Client = new S3Client({
       region: 'auto',
       endpoint: process.env.R2_ENDPOINT_URL || '',

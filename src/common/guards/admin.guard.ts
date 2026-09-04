@@ -15,7 +15,7 @@ export class AdminGuard implements CanActivate {
 
   constructor() {
     this.jwtService = new JwtService({
-      secret: process.env.JWT_SECRET || '9f4e2a8c1d7b3e5a0f6c4b2e8d1a7f3e9c5b1d7e3a9f0c2b4d8e6a1f5c3b7e9a',
+      secret: process.env.JWT_SECRET,
     });
     this.prisma = new PrismaClient();
   }
@@ -35,7 +35,7 @@ export class AdminGuard implements CanActivate {
 
     try {
       const payload = this.jwtService.verify(token, {
-        secret: process.env.JWT_SECRET || '9f4e2a8c1d7b3e5a0f6c4b2e8d1a7f3e9c5b1d7e3a9f0c2b4d8e6a1f5c3b7e9a',
+        secret: process.env.JWT_SECRET,
       });
 
       // Verify user from DB and ensure role is ADMIN

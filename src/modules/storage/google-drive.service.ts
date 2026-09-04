@@ -432,7 +432,7 @@ export class GoogleDriveService {
       },
       include: { event: { select: { title: true } } },
       orderBy: { createdAt: 'asc' },
-      take: 100, // Batch limit per cycle
+      take: 12, // Optimal batch size for Cloudflare 30s serverless stream
     });
 
     if (pendingPhotos.length === 0) return { backed: 0, failed: 0, skippedDriveFull: false };
@@ -450,9 +450,13 @@ export class GoogleDriveService {
       return { backed: 0, failed: 0, skippedDriveFull: true };
     }
 
-    const workerUrl = process.env.DRIVE_BACKUP_WORKER_URL || 'https://fotosetgo-drive-backup.sahilshah778800.workers.dev';
-    const workerSecret = process.env.DRIVE_WORKER_SECRET || 'fotosetgo-worker-secure-token-2026';
-    const backendAppUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_API_URL || 'https://api.fotosetgo.com';
+    const workerUrl = process.env.DRIVE_BACKUP_WORKER_URL;
+    const workerSecret = process.env.DRIVE_WORKER_SECRET;
+    const backendAppUrl = process.env.APP_URL || process.env.PUBLIC_API_URL;
+    if (!workerUrl || !workerSecret || !backendAppUrl) {
+      this.logger.error('CRITICAL: DRIVE_BACKUP_WORKER_URL, DRIVE_WORKER_SECRET or APP_URL is not defined in environment variables!');
+      throw new Error('Drive backup worker configuration missing in environment variables');
+    }
     const webhookUrl = `${backendAppUrl}/api/public/webhook/drive-backup-complete`;
 
     try {

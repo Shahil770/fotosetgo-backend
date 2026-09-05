@@ -513,29 +513,14 @@ export class GoogleDriveService {
         return { backed: tasks.length, failed: 0, skippedDriveFull: false };
       } else {
         const errText = await workerRes.text();
-        this.logger.warn(`[AutoBackup] Cloudflare Worker response not ok (${workerRes.status}): ${errText}. Falling back to single streams.`);
+        this.logger.error(`[AutoBackup] Cloudflare Worker response not ok (${workerRes.status}): ${errText}`);
+        return { backed: 0, failed: tasks.length, skippedDriveFull: false };
       }
 
     } catch (workerErr: any) {
-      this.logger.error(`[AutoBackup] Cloudflare Worker dispatch error: ${workerErr.message}. Falling back to sequential streams.`);
+      this.logger.error(`[AutoBackup] Cloudflare Worker dispatch error: ${workerErr.message}`);
+      return { backed: 0, failed: pendingPhotos.length, skippedDriveFull: false };
     }
-
-    // Fallback: Local stream if worker is unreachable
-    for (const photo of pendingPhotos) {
-      const eventName = photo.event?.title || 'Uncategorized';
-      const driveFileId = await this.backupSinglePhoto(photographerId, photo, eventName, s3Client, bucketName);
-      if (driveFileId) {
-        await prisma.photo.update({
-          where: { id: photo.id },
-          data: { backedUpToDrive: true, driveFileId },
-        });
-        backed++;
-      } else {
-        failed++;
-      }
-    }
-
-    return { backed, failed, skippedDriveFull };
   }
 }
 

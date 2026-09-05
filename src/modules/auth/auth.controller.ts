@@ -12,6 +12,18 @@ export class AuthController {
     return this.authService.signup(body);
   }
 
+  @Post('send-signup-otp')
+  async sendSignupOtp(@Body() body: { email: string; name?: string }) {
+    return this.authService.sendSignupOtp(body.email, body.name);
+  }
+
+  @Post('verify-and-signup')
+  async verifyAndSignup(@Body() body: any, @Req() req: any) {
+    const ipAddress = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.ip || req.socket?.remoteAddress || '127.0.0.1';
+    const userAgent = req.headers['user-agent'] || '';
+    return this.authService.verifyAndSignup(body, { ipAddress, userAgent });
+  }
+
   @Post('login')
   async login(@Body() body: any, @Req() req: any) {
     const ipAddress = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.ip || req.socket?.remoteAddress || '127.0.0.1';

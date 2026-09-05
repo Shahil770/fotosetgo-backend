@@ -1,15 +1,242 @@
-import { Injectable, ConflictException, UnauthorizedException } from '@nestjs/common';
+import { Injectable, ConflictException, UnauthorizedException, BadRequestException, Inject, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import { OAuth2Client } from 'google-auth-library';
+import Redis from 'ioredis';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private prisma: PrismaService,
     private jwtService: JwtService,
+    @Inject('REDIS_CLIENT') private redis: Redis,
   ) {}
+
+  /**
+   * Send 6-Digit Email OTP for Studio Registration via Resend API
+   */
+  async sendSignupOtp(email: string, name?: string) {
+    const normalizedEmail = (email || '').toLowerCase().trim();
+    if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      throw new BadRequestException('Please enter a valid email address.');
+    }
+
+    // 1. Check if email is already registered
+    const existing = await this.prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+    if (existing) {
+      throw new ConflictException('An account with this email already exists. Please login instead.');
+    }
+
+    // 2. Rate limit cooldown (60 seconds between resends)
+    const rateKey = `rate:signup:otp:${normalizedEmail}`;
+    const isCoolingDown = await this.redis.get(rateKey);
+    if (isCoolingDown) {
+      const ttl = await this.redis.ttl(rateKey);
+      throw new BadRequestException(`Please wait ${ttl > 0 ? ttl : 60} seconds before requesting a new code.`);
+    }
+
+    // 3. Generate Cryptographic 6-digit numeric OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // 4. Store in Redis with 10 minutes (600s) TTL
+    const otpKey = `otp:signup:${normalizedEmail}`;
+    await this.redis.set(otpKey, JSON.stringify({ otp, attempts: 0 }), 'EX', 600);
+    await this.redis.set(rateKey, '1', 'EX', 60);
+
+    // 5. Send Branded Email via Resend API
+    const resendApiKey = process.env.RESEND_API_KEY;
+    const fromEmail = process.env.RESEND_FROM_EMAIL || 'PhotosetGo <auth@fotosetgo.com>';
+
+    if (!resendApiKey) {
+      this.logger.error('[Resend] RESEND_API_KEY is not configured in .env');
+      throw new BadRequestException('Email service configuration error. Please contact support.');
+    }
+
+    const recipientName = name?.trim() ? name.trim() : 'Photographer';
+    const emailHtml = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PhotosetGo Verification Code</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #0b0d14; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #f3f4f6;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color: #0b0d14; padding: 40px 15px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" max-width="560px" style="max-width: 560px; background-color: #121520; border: 1px solid #23283a; border-radius: 24px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.5);">
+          
+          <!-- Header Banner -->
+          <tr>
+            <td style="padding: 32px 36px 20px; text-align: center; border-bottom: 1px solid #1f2433; background: linear-gradient(180deg, #181d2c 0%, #121520 100%);">
+              <img src="https://fotosetgo.com/fotosetgo.png" alt="PhotosetGo" style="height: 38px; max-width: 180px; object-fit: contain; display: block; margin: 0 auto;" />
+              <p style="margin: 8px 0 0; color: #9ca3af; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; font-weight: 700;">AI Cloud Photography Platform</p>
+            </td>
+          </tr>
+
+          <!-- Main Content -->
+          <tr>
+            <td style="padding: 36px 36px 28px;">
+              <h1 style="margin: 0 0 12px; color: #ffffff; font-size: 22px; font-weight: 800; text-align: center; letter-spacing: -0.5px;">
+                Verify Your Studio Account
+              </h1>
+              <p style="margin: 0 0 24px; color: #9ca3af; font-size: 14px; line-height: 1.6; text-align: center;">
+                Hello <strong style="color: #f3f4f6;">${recipientName}</strong>, welcome to PhotosetGo! Use the 6-digit verification code below to complete your registration:
+              </p>
+
+              <!-- OTP Code Display Card -->
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin: 28px 0;">
+                <tr>
+                  <td align="center">
+                    <div style="display: inline-block; background: #08090e; border: 2px solid #f59e0b; border-radius: 16px; padding: 18px 36px; text-align: center; box-shadow: 0 8px 24px rgba(245,158,11,0.15);">
+                      <span style="font-family: 'SF Mono', Consolas, Monaco, monospace; font-size: 36px; font-weight: 900; letter-spacing: 12px; color: #fbbf24; display: block; margin-left: 12px;">
+                        ${otp}
+                      </span>
+                    </div>
+                  </td>
+                </tr>
+              </table>
+
+              <!-- Notice Box -->
+              <div style="background-color: #171b29; border: 1px solid #283046; border-radius: 14px; padding: 16px; margin: 24px 0 12px; text-align: left;">
+                <p style="margin: 0 0 6px; font-size: 12px; color: #d1d5db; font-weight: 600;">
+                  ⏱️ <strong>Valid for 10 minutes:</strong> This code will expire soon for your security.
+                </p>
+                <p style="margin: 0; font-size: 11.5px; color: #6b7280; line-height: 1.5;">
+                  🔒 If you did not attempt to register on PhotosetGo, you can safely ignore this email.
+                </p>
+              </div>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 24px 36px; background-color: #0b0d14; border-top: 1px solid #1f2433; text-align: center;">
+              <p style="margin: 0 0 6px; color: #6b7280; font-size: 11px; font-weight: 600;">
+                PhotosetGo • Fast AI Photo Delivery for Professional Photographers
+              </p>
+              <p style="margin: 0; color: #4b5563; font-size: 10px;">
+                © 2026 PhotosetGo. All rights reserved. • <a href="https://fotosetgo.com" style="color: #9ca3af; text-decoration: none;">fotosetgo.com</a>
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`;
+
+    try {
+      const resendResponse = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${resendApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: fromEmail,
+          to: [normalizedEmail],
+          subject: `${otp} is your PhotosetGo verification code`,
+          html: emailHtml,
+        }),
+      });
+
+      const resendData = await resendResponse.json();
+
+      if (!resendResponse.ok) {
+        this.logger.error(`[Resend] Failed to send OTP email: ${JSON.stringify(resendData)}`);
+        throw new BadRequestException(resendData.message || 'Failed to deliver verification email. Please check your email address.');
+      }
+
+      this.logger.log(`[AuthService] Signup OTP successfully dispatched to ${normalizedEmail} (ID: ${resendData.id})`);
+
+      return {
+        success: true,
+        message: `Verification code sent to ${normalizedEmail}`,
+        email: normalizedEmail,
+      };
+    } catch (err: any) {
+      this.logger.error(`[AuthService] Error sending signup OTP: ${err.message}`);
+      if (err instanceof BadRequestException || err instanceof ConflictException) throw err;
+      throw new BadRequestException('Unable to deliver verification email. Please try again.');
+    }
+  }
+
+  /**
+   * Verify Signup OTP & Complete User Registration Atomically
+   */
+  async verifyAndSignup(
+    data: {
+      email: string;
+      otp: string;
+      password: string;
+      name: string;
+      studioName?: string;
+      phone?: string;
+      referralCode?: string;
+    },
+    requestInfo?: { ipAddress?: string; userAgent?: string }
+  ) {
+    const normalizedEmail = (data.email || '').toLowerCase().trim();
+    const cleanOtp = (data.otp || '').trim();
+
+    if (!cleanOtp || cleanOtp.length !== 6) {
+      throw new BadRequestException('Please enter a valid 6-digit verification code.');
+    }
+
+    const otpKey = `otp:signup:${normalizedEmail}`;
+    const stored = await this.redis.get(otpKey);
+
+    if (!stored) {
+      throw new BadRequestException('Verification code has expired or was not requested. Please request a new code.');
+    }
+
+    let parsedOtp: { otp: string; attempts: number };
+    try {
+      parsedOtp = JSON.parse(stored);
+    } catch {
+      parsedOtp = { otp: stored, attempts: 0 };
+    }
+
+    // Check brute-force attempts
+    if (parsedOtp.attempts >= 3) {
+      await this.redis.del(otpKey);
+      throw new BadRequestException('Too many incorrect attempts. Please request a new verification code.');
+    }
+
+    if (parsedOtp.otp !== cleanOtp) {
+      parsedOtp.attempts += 1;
+      const ttl = await this.redis.ttl(otpKey);
+      await this.redis.set(otpKey, JSON.stringify(parsedOtp), 'EX', ttl > 0 ? ttl : 300);
+      throw new BadRequestException(`Invalid verification code. ${3 - parsedOtp.attempts} attempts remaining.`);
+    }
+
+    // OTP Verified! Delete OTP key immediately
+    await this.redis.del(otpKey);
+    await this.redis.del(`rate:signup:otp:${normalizedEmail}`);
+
+    // Create User & Photographer profile in database
+    await this.signup({
+      email: normalizedEmail,
+      password: data.password,
+      name: data.name,
+      studioName: data.studioName,
+      phone: data.phone,
+      referralCode: data.referralCode,
+    });
+
+    // Auto-login newly registered user
+    return this.login({ email: normalizedEmail, password: data.password }, requestInfo);
+  }
 
   async signup(data: { email: string; password: string; name: string; studioName?: string; phone?: string; referralCode?: string }) {
     const normalizedEmail = data.email.toLowerCase().trim();
@@ -176,8 +403,9 @@ export class AuthService {
   }
 
   async login(credentials: { email: string; password: string }, requestInfo?: { ipAddress?: string; userAgent?: string }) {
+    const normalizedEmail = (credentials.email || '').toLowerCase().trim();
     const user = await this.prisma.user.findUnique({
-      where: { email: credentials.email },
+      where: { email: normalizedEmail },
       include: { photographer: true },
     });
 

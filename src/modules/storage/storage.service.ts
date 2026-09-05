@@ -17,8 +17,6 @@ export class StorageService implements OnModuleInit {
   private readonly logger = new Logger(StorageService.name);
   private s3Client: S3Client;
   private bucketName: string;
-  private readonly activeEventScans = new Set<string>();
-  private readonly activeVideoProcessings = new Set<string>();
   private readonly pendingDriveBatchTimers = new Map<string, NodeJS.Timeout>();
   private workerDispatchCounter = 0;
 
@@ -1370,11 +1368,17 @@ export class StorageService implements OnModuleInit {
     r2KeyOriginal: string,
     uploadBatchId?: string | null
   ) {
-    if (this.activeVideoProcessings.has(photoId)) {
+    const lockKey = `lock:process:video:${photoId}`;
+    let acquired: any = null;
+    try {
+      acquired = await this.redis.set(lockKey, '1', 'EX', 600, 'NX');
+    } catch {
+      acquired = 'OK';
+    }
+    if (!acquired) {
       this.logger.log(`[VideoProcessing] Background video processing is already running for video ${photoId}. Skipping.`);
       return;
     }
-    this.activeVideoProcessings.add(photoId);
 
     // Check if video photo has been trashed/deleted in the meantime
     const currentVideo = await this.prisma.photo.findUnique({
@@ -1540,7 +1544,7 @@ export class StorageService implements OnModuleInit {
 
       await this.updateBatchProgress(uploadBatchId, false);
     } finally {
-      this.activeVideoProcessings.delete(photoId);
+      await this.redis.del(`lock:process:video:${photoId}`).catch(() => { });
     }
   }
 
@@ -6269,14 +6273,22 @@ export class StorageService implements OnModuleInit {
 
   // AI Face Toggle ON hone par ya Thumbnail complete hone par Batch Scan chalata hai (with Auto-Recheck loop)
   async triggerFaceScanForEvent(photographerId: string, eventId: string): Promise<void> {
-    if (this.activeEventScans.has(eventId)) {
+    const lockKey = `lock:scan:event:${eventId}`;
+    let acquired: any = null;
+    try {
+      acquired = await this.redis.set(lockKey, '1', 'EX', 1800, 'NX');
+    } catch {
+      acquired = 'OK';
+    }
+    if (!acquired) {
       this.logger.log(`[BatchFaceScan] Scanning is already active for event ${eventId}. Skipping trigger.`);
       return;
     }
     const initialEventObj = await this.prisma.event.findUnique({ where: { id: eventId } });
-    if (!initialEventObj) return;
-
-    this.activeEventScans.add(eventId);
+    if (!initialEventObj) {
+      await this.redis.del(lockKey).catch(() => { });
+      return;
+    }
 
     try {
       // Reset any stuck faceScanStatus from 'PROCESSING' to 'PENDING' at start to allow reprocessing if server crashed
@@ -6502,7 +6514,7 @@ export class StorageService implements OnModuleInit {
         await new Promise(resolve => setTimeout(resolve, 300));
       }
     } finally {
-      this.activeEventScans.delete(eventId);
+      await this.redis.del(`lock:scan:event:${eventId}`).catch(() => { });
     }
   }
 }

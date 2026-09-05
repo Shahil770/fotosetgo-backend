@@ -22,7 +22,7 @@ export class PublicStorageController {
     @Body() body: { passcode?: string },
     @Req() req: any
   ) {
-    const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
+    const clientIp = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
     return this.storageService.getPublicEventInit(slug, body.passcode, clientIp);
   }
 
@@ -32,7 +32,7 @@ export class PublicStorageController {
     @Body() body: { passcode?: string; limit?: number; cursor?: string },
     @Req() req: any
   ) {
-    const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
+    const clientIp = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
     return this.storageService.getPublicEventPhotos(slug, body.passcode, body.limit, body.cursor, clientIp);
   }
 
@@ -117,7 +117,7 @@ export class PublicStorageController {
     @Body() body: { photoIds?: string[]; passcode?: string },
     @Req() req: any
   ) {
-    const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
+    const clientIp = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
     return this.storageService.getBulkDownloadUrls(slug, body.photoIds, body.passcode, clientIp);
   }
 
@@ -169,7 +169,7 @@ export class PublicStorageController {
     @Body() body: { r2Key?: string; vector?: number[]; eventId?: string; passcode?: string },
     @Req() req: any
   ) {
-    const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
+    const clientIp = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
     return this.storageService.searchFacePublic(body.r2Key, body.eventId, body.passcode, clientIp, body.vector);
   }
 

@@ -14,21 +14,21 @@ export class AuthController {
 
   @Post('login')
   async login(@Body() body: any, @Req() req: any) {
-    const ipAddress = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const ipAddress = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.ip || req.socket?.remoteAddress || '127.0.0.1';
     const userAgent = req.headers['user-agent'] || '';
     return this.authService.login(body, { ipAddress, userAgent });
   }
 
   @Post('google')
   async googleAuth(@Body() body: { credential: string; referralCode?: string }, @Req() req: any) {
-    const ipAddress = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const ipAddress = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.ip || req.socket?.remoteAddress || '127.0.0.1';
     const userAgent = req.headers['user-agent'] || '';
     return this.authService.googleAuth(body, { ipAddress, userAgent });
   }
 
   @Post('admin/login')
   async adminLogin(@Body() body: any, @Req() req: any) {
-    const ipAddress = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const ipAddress = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.ip || req.socket?.remoteAddress || '127.0.0.1';
     const userAgent = req.headers['user-agent'] || 'Admin Console';
     return this.authService.adminLogin(body, { ipAddress, userAgent });
   }

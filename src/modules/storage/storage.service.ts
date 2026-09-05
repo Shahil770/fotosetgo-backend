@@ -195,6 +195,18 @@ export class StorageService implements OnModuleInit {
       console.error('[StorageService] Failed to upload default logo fallback to R2:', logoErr.message);
     }
 
+    try {
+      await this.prisma.$executeRawUnsafe(`
+        CREATE INDEX IF NOT EXISTS idx_face_embeddings_hnsw 
+        ON public.face_embeddings 
+        USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64);
+      `);
+      this.logger.log('[StorageService] PostgreSQL HNSW vector index verified & active.');
+    } catch (hnswErr: any) {
+      this.logger.warn(`[StorageService] HNSW index auto-ensure warning: ${hnswErr.message}`);
+    }
+
     await this.seedPortfolioThemes();
   }
 

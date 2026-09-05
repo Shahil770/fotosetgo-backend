@@ -50,7 +50,7 @@ export class AuthService {
 
     // 5. Send Branded Email via Resend API
     const resendApiKey = process.env.RESEND_API_KEY;
-    const fromEmail = process.env.RESEND_FROM_EMAIL || 'PhotosetGo <auth@fotosetgo.com>';
+    const fromEmail = process.env.RESEND_FROM_EMAIL || 'FotoSetGo <auth@fotosetgo.com>';
 
     if (!resendApiKey) {
       this.logger.error('[Resend] RESEND_API_KEY is not configured in .env');
@@ -64,19 +64,26 @@ export class AuthService {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PhotosetGo Verification Code</title>
+  <title>FotoSetGo Verification Code</title>
 </head>
-<body style="margin: 0; padding: 0; background-color: #0b0d14; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #f3f4f6;">
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color: #0b0d14; padding: 40px 15px;">
+<body style="margin: 0; padding: 0; background-color: #08090e; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #f3f4f6;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color: #08090e; padding: 40px 15px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%" max-width="560px" style="max-width: 560px; background-color: #121520; border: 1px solid #23283a; border-radius: 24px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.5);">
+        <table role="presentation" width="100%" max-width="560px" style="max-width: 560px; background-color: #11141e; border: 1px solid #23283a; border-radius: 24px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.6);">
           
-          <!-- Header Banner -->
+          <!-- Header Brand Banner -->
           <tr>
-            <td style="padding: 32px 36px 20px; text-align: center; border-bottom: 1px solid #1f2433; background: linear-gradient(180deg, #181d2c 0%, #121520 100%);">
-              <img src="https://fotosetgo.com/fotosetgo.png" alt="PhotosetGo" style="height: 38px; max-width: 180px; object-fit: contain; display: block; margin: 0 auto;" />
-              <p style="margin: 8px 0 0; color: #9ca3af; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; font-weight: 700;">AI Cloud Photography Platform</p>
+            <td style="padding: 32px 36px 24px; text-align: center; border-bottom: 1px solid #1c2230; background: linear-gradient(180deg, #181d2a 0%, #11141e 100%);">
+              <div style="display: inline-flex; align-items: center; justify-content: center; gap: 10px;">
+                <span style="font-size: 26px; line-height: 1;">📸</span>
+                <span style="font-size: 24px; font-weight: 900; letter-spacing: -0.5px; color: #ffffff; text-transform: none;">
+                  Foto<span style="color: #f59e0b;">Set</span>Go
+                </span>
+              </div>
+              <p style="margin: 8px 0 0; color: #9ca3af; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; font-weight: 700;">
+                AI Cloud Photography Platform
+              </p>
             </td>
           </tr>
 
@@ -87,7 +94,7 @@ export class AuthService {
                 Verify Your Studio Account
               </h1>
               <p style="margin: 0 0 24px; color: #9ca3af; font-size: 14px; line-height: 1.6; text-align: center;">
-                Hello <strong style="color: #f3f4f6;">${recipientName}</strong>, welcome to PhotosetGo! Use the 6-digit verification code below to complete your registration:
+                Hello <strong style="color: #f3f4f6;">${recipientName}</strong>, welcome to <strong>FotoSetGo</strong>! Use the 6-digit verification code below to complete your registration:
               </p>
 
               <!-- OTP Code Display Card -->
@@ -109,7 +116,7 @@ export class AuthService {
                   ⏱️ <strong>Valid for 10 minutes:</strong> This code will expire soon for your security.
                 </p>
                 <p style="margin: 0; font-size: 11.5px; color: #6b7280; line-height: 1.5;">
-                  🔒 If you did not attempt to register on PhotosetGo, you can safely ignore this email.
+                  🔒 If you did not attempt to register on FotoSetGo, you can safely ignore this email.
                 </p>
               </div>
             </td>
@@ -119,10 +126,10 @@ export class AuthService {
           <tr>
             <td style="padding: 24px 36px; background-color: #0b0d14; border-top: 1px solid #1f2433; text-align: center;">
               <p style="margin: 0 0 6px; color: #6b7280; font-size: 11px; font-weight: 600;">
-                PhotosetGo • Fast AI Photo Delivery for Professional Photographers
+                FotoSetGo • Fast AI Photo Delivery for Professional Photographers
               </p>
               <p style="margin: 0; color: #4b5563; font-size: 10px;">
-                © 2026 PhotosetGo. All rights reserved. • <a href="https://fotosetgo.com" style="color: #9ca3af; text-decoration: none;">fotosetgo.com</a>
+                © 2026 FotoSetGo. All rights reserved. • <a href="https://fotosetgo.com" style="color: #9ca3af; text-decoration: none;">fotosetgo.com</a>
               </p>
             </td>
           </tr>
@@ -145,7 +152,7 @@ export class AuthService {
         body: JSON.stringify({
           from: fromEmail,
           to: [normalizedEmail],
-          subject: `${otp} is your PhotosetGo verification code`,
+          subject: `${otp} is your FotoSetGo verification code`,
           html: emailHtml,
         }),
       });

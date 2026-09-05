@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../../prisma.service';
 import { StorageService } from './storage.service';
@@ -6,18 +6,27 @@ import { StorageService } from './storage.service';
 @Injectable()
 export class StaleUploadCronService {
   private readonly logger = new Logger(StaleUploadCronService.name);
-  private isRunning = false;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly storageService: StorageService,
+    @Inject('REDIS_CLIENT') private readonly redis: any,
   ) {}
 
   // Run every 2 hours (e.g. at 00:00, 02:00, 04:00, etc.)
   @Cron('0 0 */2 * * *')
   async cleanupStaleUploads() {
-    if (this.isRunning) return;
-    this.isRunning = true;
+    const lockKey = 'lock:cron:stale-uploads';
+    let acquired: any = null;
+    try {
+      acquired = await this.redis.set(lockKey, '1', 'EX', 3600, 'NX');
+    } catch {
+      acquired = 'OK';
+    }
+    if (!acquired) {
+      this.logger.log('[StaleUploadCron] Cron skipped — already running on another cluster instance.');
+      return;
+    }
 
     try {
       // Any photo stuck in UPLOADING for more than 2 hours is verified
@@ -89,7 +98,7 @@ export class StaleUploadCronService {
     } catch (err: any) {
       this.logger.error(`[StaleUploadCron] Cron execution error: ${err.message}`);
     } finally {
-      this.isRunning = false;
+      await this.redis.del(lockKey).catch(() => {});
     }
   }
 }

@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../../prisma.service';
 import { StorageService } from './storage.service';
@@ -6,18 +6,28 @@ import { StorageService } from './storage.service';
 @Injectable()
 export class TrashPurgeCronService {
   private readonly logger = new Logger(TrashPurgeCronService.name);
-  private isRunning = false;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly storageService: StorageService,
+    @Inject('REDIS_CLIENT') private readonly redis: any,
   ) {}
 
   // Run once daily at 2 AM
   @Cron(CronExpression.EVERY_DAY_AT_2AM)
   async runAutoPurge() {
-    if (this.isRunning) return;
-    this.isRunning = true;
+    const lockKey = 'lock:cron:trash-purge';
+    let acquired: any = null;
+    try {
+      acquired = await this.redis.set(lockKey, '1', 'EX', 1800, 'NX');
+    } catch {
+      acquired = 'OK';
+    }
+    if (!acquired) {
+      this.logger.log('[TrashPurge] Cron skipped — already running on another cluster instance.');
+      return;
+    }
+
     this.logger.log('[TrashPurge] Starting 30-day automated trash purge...');
 
     try {
@@ -82,7 +92,7 @@ export class TrashPurgeCronService {
     } catch (err: any) {
       this.logger.error(`[TrashPurge] Cron execution error: ${err.message}`);
     } finally {
-      this.isRunning = false;
+      await this.redis.del(lockKey).catch(() => {});
       this.logger.log('[TrashPurge] Automated trash purge complete.');
     }
   }

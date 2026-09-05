@@ -91,21 +91,38 @@ export class BusinessCardsService {
   }
 
   private async syncAggregatedCardViews() {
+    const key = 'agg:businessCard:views';
+    const tempKey = `agg:businessCard:views:flush:${Date.now()}`;
     try {
-      const viewsMap = await this.redis.hgetall('agg:businessCard:views');
-      if (!viewsMap || Object.keys(viewsMap).length === 0) return;
+      const exists = await this.redis.exists(key);
+      if (!exists) return;
+
+      await this.redis.rename(key, tempKey);
+      const viewsMap = await this.redis.hgetall(tempKey);
+      if (!viewsMap || Object.keys(viewsMap).length === 0) {
+        await this.redis.del(tempKey).catch(() => {});
+        return;
+      }
 
       for (const [cardId, countStr] of Object.entries(viewsMap)) {
         const count = parseInt(countStr, 10);
         if (count > 0) {
-          await this.prisma.businessCard.update({
-            where: { id: cardId },
-            data: { viewsCount: { increment: count } }
-          }).catch(err => this.logger.error(`[CardViewsSync] Failed to update card ${cardId}: ${err.message}`));
-          await this.redis.hincrby('agg:businessCard:views', cardId, -count).catch(() => {});
+          try {
+            await this.prisma.businessCard.update({
+              where: { id: cardId },
+              data: { viewsCount: { increment: count } }
+            });
+          } catch (err: any) {
+            this.logger.error(`[CardViewsSync] Failed to update card ${cardId}: ${err.message}`);
+            // Restore failed counter back to main key
+            await this.redis.hincrby(key, cardId, count).catch(() => {});
+          }
         }
       }
+
+      await this.redis.del(tempKey).catch(() => {});
     } catch (err: any) {
+      if (err.message?.includes('no such key')) return;
       this.logger.error(`[CardViewsSync] Error in syncAggregatedCardViews: ${err.message}`);
     }
   }

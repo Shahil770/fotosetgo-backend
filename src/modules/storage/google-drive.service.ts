@@ -391,7 +391,25 @@ export class GoogleDriveService {
       }
 
     } catch (workerErr: any) {
-      this.logger.error(`[AutoBackup] Cloudflare Worker dispatch error: ${workerErr.message}`);
+      const isAuthError =
+        workerErr.message?.includes('invalid_grant') ||
+        workerErr.message?.includes('Google Drive is not connected') ||
+        workerErr.message?.includes('invalid_token') ||
+        workerErr.message?.includes('Could not retrieve valid Google Drive access token');
+
+      if (isAuthError) {
+        this.logger.warn(`[AutoBackup] Google Drive access token expired/revoked for photographer ${photographerId}. Disabling auto-backup.`);
+        await prisma.photographer.update({
+          where: { id: photographerId },
+          data: {
+            autoBackupToDrive: false,
+            googleDriveConnected: false,
+            googleDriveAccessToken: null,
+          },
+        }).catch(() => {});
+      } else {
+        this.logger.error(`[AutoBackup] Cloudflare Worker dispatch error for photographer ${photographerId}: ${workerErr.message}`);
+      }
       return { backed: 0, failed: pendingPhotos.length, skippedDriveFull: false };
     }
   }

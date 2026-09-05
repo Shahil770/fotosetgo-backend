@@ -1,19 +1,31 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../../prisma.service';
 
 @Injectable()
 export class CreditsRenewCronService {
   private readonly logger = new Logger(CreditsRenewCronService.name);
-  private isRunning = false;
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Inject('REDIS_CLIENT') private readonly redis: any,
+  ) {}
 
   // Run at 00:00 on the 1st day of every month (equivalent to last date midnight)
   @Cron('0 0 0 1 * *')
   async renewAllPhotographerCredits() {
-    if (this.isRunning) return;
-    this.isRunning = true;
+    const lockKey = 'lock:cron:credits-renew';
+    let acquired: any = null;
+    try {
+      acquired = await this.redis.set(lockKey, '1', 'EX', 3600, 'NX');
+    } catch {
+      acquired = 'OK';
+    }
+    if (!acquired) {
+      this.logger.log('[CreditsRenewCron] Cron skipped — already running on another cluster instance.');
+      return;
+    }
+
     this.logger.log('[CreditsRenewCron] Starting monthly credit renewal job with dynamic referral boosts...');
 
     try {
@@ -113,13 +125,25 @@ export class CreditsRenewCronService {
     } catch (error: any) {
       this.logger.error('[CreditsRenewCron] Failed to renew photographer credits:', error.message);
     } finally {
-      this.isRunning = false;
+      await this.redis.del(lockKey).catch(() => {});
     }
   }
 
   // Daily at 01:00 AM: Check expired subscriptions and expire outdated referrals
   @Cron('0 0 1 * * *')
   async checkSubscriptionExpiryAndGracePeriod() {
+    const lockKey = 'lock:cron:subscription-expiry';
+    let acquired: any = null;
+    try {
+      acquired = await this.redis.set(lockKey, '1', 'EX', 1800, 'NX');
+    } catch {
+      acquired = 'OK';
+    }
+    if (!acquired) {
+      this.logger.log('[SubscriptionExpiryCron] Cron skipped — already running on another cluster instance.');
+      return;
+    }
+
     this.logger.log('[SubscriptionExpiryCron] Checking for expired subscriptions past grace period...');
     try {
       const now = new Date();
@@ -182,6 +206,8 @@ export class CreditsRenewCronService {
       }
     } catch (error: any) {
       this.logger.error('[SubscriptionExpiryCron] Error checking subscription expirations:', error.message);
+    } finally {
+      await this.redis.del(lockKey).catch(() => {});
     }
   }
 }

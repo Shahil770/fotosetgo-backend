@@ -191,9 +191,8 @@ export class EventsService {
       throw new NotFoundException('Event not found');
     }
 
-    // Process signed URLs in small concurrent batches (e.g., 15 at a time) 
-    // to prevent CPU event loop starvation on throttled environments like Render Free Tier.
-    const batchSize = 15;
+    // Process signed URLs in concurrent chunks of 50 for fast response and minimal latency
+    const batchSize = 50;
     const photosWithUrls: any[] = [];
     
     for (let i = 0; i < event.photos.length; i += batchSize) {

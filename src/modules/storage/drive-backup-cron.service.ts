@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../../prisma.service';
 import { GoogleDriveService } from './google-drive.service';
@@ -7,7 +7,6 @@ import { S3Client } from '@aws-sdk/client-s3';
 @Injectable()
 export class DriveBackupCronService {
   private readonly logger = new Logger(DriveBackupCronService.name);
-  private isRunning = false; // Prevent overlapping cron executions
 
   readonly s3Client: S3Client;
   readonly bucketName: string;
@@ -15,6 +14,7 @@ export class DriveBackupCronService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly googleDriveService: GoogleDriveService,
+    @Inject('REDIS_CLIENT') private readonly redis: any,
   ) {
     this.bucketName = process.env.R2_BUCKET_NAME as string;
     this.s3Client = new S3Client({
@@ -31,12 +31,18 @@ export class DriveBackupCronService {
   // Run every 15 minutes — also callable directly for immediate trigger
   @Cron('0 */15 * * * *')
   async runAutoBackup() {
-    if (this.isRunning) {
-      this.logger.warn('[DriveBackup] Cron skipped — previous run still in progress.');
+    const lockKey = 'lock:cron:drive-backup';
+    let acquired: any = null;
+    try {
+      acquired = await this.redis.set(lockKey, '1', 'EX', 840, 'NX');
+    } catch {
+      acquired = 'OK';
+    }
+    if (!acquired) {
+      this.logger.log('[DriveBackup] Cron skipped — already running on another cluster instance.');
       return;
     }
 
-    this.isRunning = true;
     this.logger.log('[DriveBackup] Starting auto backup cron job...');
 
     try {
@@ -77,12 +83,12 @@ export class DriveBackupCronService {
           } else {
             this.logger.log(`[DriveBackup] ${photographer.id}: +${result.backed} backed, ${result.failed} failed.`);
           }
-        } catch (err) {
+        } catch (err: any) {
           this.logger.error(`[DriveBackup] Error for photographer ${photographer.id}: ${err.message}`);
         }
       }
     } finally {
-      this.isRunning = false;
+      await this.redis.del(lockKey).catch(() => {});
       this.logger.log('[DriveBackup] Cron job complete.');
     }
   }

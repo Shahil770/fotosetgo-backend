@@ -84,7 +84,7 @@ export class BillingService implements OnModuleInit {
         featureGuestUpload: true,
         featurePortfolioWebsite: true,
         featureDigitalBusinessCard: true,
-        featureAutoDriveBackup: false,
+        featureAutoDriveBackup: true,
         featureDisableDownload: true,
         featureWatermark: true,
         featureBeamLiveCamera: true,
@@ -142,35 +142,11 @@ export class BillingService implements OnModuleInit {
         await this.prisma.package.create({
           data: pkg
         });
-      } else {
-        await this.prisma.package.update({
-          where: { name: pkg.name },
-          data: {
-            maxStorageGb: pkg.maxStorageGb,
-            maxEventsStorageMb: pkg.maxEventsStorageMb,
-            maxPortfolioStorageMb: pkg.maxPortfolioStorageMb,
-            price: pkg.price,
-            faceScanCredits: pkg.faceScanCredits,
-            isActive: true,
-            featureAiPhotoSearch: pkg.featureAiPhotoSearch,
-            featureAiVideoSearch: pkg.featureAiVideoSearch,
-            featureCustomBranding: pkg.featureCustomBranding,
-            featureClientSelection: pkg.featureClientSelection,
-            featureGuestUpload: pkg.featureGuestUpload,
-            featurePortfolioWebsite: pkg.featurePortfolioWebsite,
-            featureDigitalBusinessCard: pkg.featureDigitalBusinessCard,
-            featureAutoDriveBackup: pkg.featureAutoDriveBackup,
-            featureDisableDownload: pkg.featureDisableDownload,
-            featureWatermark: pkg.featureWatermark,
-            featureBeamLiveCamera: pkg.featureBeamLiveCamera,
-            featureBulkDownload: pkg.featureBulkDownload,
-          }
-        });
+        this.logger.log(`[BillingService] Initialized default package: ${pkg.name}`);
       }
     }
-    this.logger.log('[BillingService] 5 Yearly Packages seeded/updated successfully in database.');
 
-    // Seed Default AI Credit Packs
+    // Seed Default AI Credit Packs if not existing
     const defaultPacks = [
       {
         name: 'Starter AI Fuel Pack',
@@ -224,23 +200,9 @@ export class BillingService implements OnModuleInit {
       });
       if (!exists) {
         await this.prisma.aiCreditPack.create({ data: pack });
-      } else {
-        await this.prisma.aiCreditPack.update({
-          where: { id: exists.id },
-          data: {
-            price: pack.price,
-            creditsGiven: pack.creditsGiven,
-            photosEstimate: pack.photosEstimate,
-            discountPercent: pack.discountPercent,
-            tax: pack.tax,
-            badge: pack.badge,
-            isPopular: pack.isPopular,
-            sortOrder: pack.sortOrder,
-          }
-        });
+        this.logger.log(`[BillingService] Initialized default AI pack: ${pack.name}`);
       }
     }
-    this.logger.log('[BillingService] AI Credit Packs seeded/updated successfully in database.');
 
     // Seed Default Referral Configs for Packages
     const allPackages = await this.prisma.package.findMany();

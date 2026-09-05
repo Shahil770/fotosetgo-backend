@@ -4,16 +4,52 @@ import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import { OAuth2Client } from 'google-auth-library';
 import Redis from 'ioredis';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  private s3Client: S3Client;
 
   constructor(
     private prisma: PrismaService,
     private jwtService: JwtService,
     @Inject('REDIS_CLIENT') private redis: Redis,
-  ) {}
+  ) {
+    this.s3Client = new S3Client({
+      region: 'auto',
+      endpoint: process.env.R2_ENDPOINT_URL || 'https://166ca4c1757a6fb1fdf38adf85eb54ba.r2.cloudflarestorage.com',
+      credentials: {
+        accessKeyId: process.env.R2_ACCESS_KEY_ID || '008e409eb6ca8ce7ca73ef1a2d5b0d34',
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '5950a06ff782c9a45c2ff18737703179d144b47ab2b4d4d6b7ea94e00e300402',
+      },
+    });
+  }
+
+  /**
+   * Get fresh 7-day signed URL for FotoSetGo official logo
+   */
+  private async getOfficialLogoUrl(): Promise<string> {
+    const cacheKey = 'cache:branding:official-logo-url';
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) return cached;
+    } catch {}
+
+    try {
+      const command = new GetObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME || 'fotosetgo-photos',
+        Key: 'branding/fotosetgo-official-logo.png',
+      });
+      const url = await getSignedUrl(this.s3Client, command, { expiresIn: 604800 }); // 7 days
+      await this.redis.set(cacheKey, url, 'EX', 500000).catch(() => {});
+      return url;
+    } catch (err: any) {
+      this.logger.error(`Failed to generate signed logo URL: ${err.message}`);
+      return 'https://fotosetgo.com/fotosetgo.png';
+    }
+  }
 
   /**
    * Send 6-Digit Email OTP for Studio Registration via Resend API
@@ -57,6 +93,7 @@ export class AuthService {
       throw new BadRequestException('Email service configuration error. Please contact support.');
     }
 
+    const officialLogoUrl = await this.getOfficialLogoUrl();
     const recipientName = name?.trim() ? name.trim() : 'Photographer';
     const emailHtml = `
 <!DOCTYPE html>
@@ -72,16 +109,11 @@ export class AuthService {
       <td align="center">
         <table role="presentation" width="100%" max-width="560px" style="max-width: 560px; background-color: #11141e; border: 1px solid #23283a; border-radius: 24px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.6);">
           
-          <!-- Header Brand Banner -->
+          <!-- Header Brand Banner with Official Logo -->
           <tr>
             <td style="padding: 32px 36px 24px; text-align: center; border-bottom: 1px solid #1c2230; background: linear-gradient(180deg, #181d2a 0%, #11141e 100%);">
-              <div style="display: inline-flex; align-items: center; justify-content: center; gap: 10px;">
-                <span style="font-size: 26px; line-height: 1;">📸</span>
-                <span style="font-size: 24px; font-weight: 900; letter-spacing: -0.5px; color: #ffffff; text-transform: none;">
-                  Foto<span style="color: #f59e0b;">Set</span>Go
-                </span>
-              </div>
-              <p style="margin: 8px 0 0; color: #9ca3af; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; font-weight: 700;">
+              <img src="${officialLogoUrl}" alt="FotoSetGo" style="height: 40px; max-width: 200px; object-fit: contain; display: block; margin: 0 auto;" />
+              <p style="margin: 10px 0 0; color: #9ca3af; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; font-weight: 700;">
                 AI Cloud Photography Platform
               </p>
             </td>

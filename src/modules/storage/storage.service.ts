@@ -1077,8 +1077,8 @@ export class StorageService implements OnModuleInit {
         }).catch(() => { });
       }
 
-      this.syncToGoogleDriveInBackground(photographerId, photo).catch(err => {
-        console.error('[StorageService] Background Google Drive sync trigger failed:', err);
+      this.triggerAutoBackupIfEnabled(photographerId, photo.id).catch(err => {
+        console.error('[StorageService] Background Google Drive sync trigger failed:', err.message);
       });
     }
 
@@ -1336,43 +1336,6 @@ export class StorageService implements OnModuleInit {
     await this.prisma.photo.delete({
       where: { id: photoId }
     }).catch(() => { });
-  }
-
-  private async syncToGoogleDriveInBackground(photographerId: string, photo: any) {
-    try {
-      const photographer = await this.prisma.photographer.findUnique({
-        where: { id: photographerId },
-      });
-
-      if (!photographer || !photographer.googleDriveConnected) {
-        return;
-      }
-
-      const event = await this.prisma.event.findUnique({
-        where: { id: photo.eventId },
-      });
-
-      if (!event) return;
-
-      const command = new GetObjectCommand({
-        Bucket: this.bucketName,
-        Key: photo.r2KeyOriginal,
-      });
-      const response = await this.s3Client.send(command);
-
-      if (!response.Body) {
-        throw new Error('R2 response body is empty');
-      }
-
-      await this.googleDriveService.uploadFile(
-        photographerId,
-        response.Body,
-        photo.filenameOriginal || `photo_${photo.id}.jpg`,
-        event.title || 'Event Gallery'
-      );
-    } catch (err) {
-      console.error(`[StorageService] Google Drive background sync failed for photo ${photo.id}:`, err.message);
-    }
   }
 
   private async updateBatchProgress(uploadBatchId: string | null | undefined, isSuccess: boolean) {
@@ -5685,49 +5648,26 @@ export class StorageService implements OnModuleInit {
     });
   }
 
-  // Auto-backup a single photo to Google Drive after it becomes READY
+  // Auto-backup pending photos to Google Drive after a photo becomes READY (via Cloudflare Edge Worker - 0% VPS load)
   private async triggerAutoBackupIfEnabled(photographerId: string, photoId: string): Promise<void> {
-    const photographer = await this.prisma.photographer.findUnique({
-      where: { id: photographerId },
-      select: { autoBackupToDrive: true, googleDriveConnected: true, googleDriveAccessToken: true },
-    });
-
-    if (!photographer?.autoBackupToDrive || !photographer?.googleDriveConnected || !photographer?.googleDriveAccessToken) {
-      return; // Auto backup not enabled or Drive not connected
-    }
-
-    const photo = await this.prisma.photo.findUnique({
-      where: { id: photoId },
-      include: { event: { select: { title: true } } },
-    });
-
-    if (!photo || photo.backedUpToDrive) return; // Already backed up or not found
-
-    const { hasSpace } = await this.googleDriveService.checkDriveHasSpace(photographerId);
-    if (!hasSpace) {
-      console.warn(`[AutoBackup] Drive full for photographer ${photographerId}. Disabling auto backup.`);
-      await this.prisma.photographer.update({
+    try {
+      const photographer = await this.prisma.photographer.findUnique({
         where: { id: photographerId },
-        data: { autoBackupToDrive: false, driveBackupFullNotified: true },
+        select: { autoBackupToDrive: true, googleDriveConnected: true, googleDriveAccessToken: true },
       });
-      return;
-    }
 
-    const eventName = photo.event?.title || 'Uncategorized';
-    const driveFileId = await this.googleDriveService.backupSinglePhoto(
-      photographerId,
-      photo,
-      eventName,
-      this.s3Client,
-      this.bucketName,
-    );
+      if (!photographer?.autoBackupToDrive || !photographer?.googleDriveConnected || !photographer?.googleDriveAccessToken) {
+        return; // Auto backup not enabled or Drive not connected
+      }
 
-    if (driveFileId) {
-      await this.prisma.photo.update({
-        where: { id: photoId },
-        data: { backedUpToDrive: true, driveFileId },
-      });
-      console.log(`[AutoBackup] ✅ Photo ${photo.filenameOriginal} backed up to Drive.`);
+      await this.googleDriveService.backupAllPendingPhotos(
+        photographerId,
+        this.s3Client,
+        this.bucketName,
+        this.prisma,
+      );
+    } catch (err: any) {
+      this.logger.error(`[AutoBackup] triggerAutoBackupIfEnabled error for photographer ${photographerId}: ${err.message}`);
     }
   }
 

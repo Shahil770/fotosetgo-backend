@@ -1,7 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { google } from 'googleapis';
 import { PrismaService } from 'src/prisma.service';
-import * as fs from 'fs';
 
 @Injectable()
 export class GoogleDriveService {
@@ -165,42 +164,6 @@ export class GoogleDriveService {
   }
 
 
-  // Upload Photo File to Google Drive (legacy method)
-  async uploadFile(photographerId: string, stream: any, filename: string, eventName: string): Promise<string | null> {
-    try {
-      // 1. Root: FotosetGo
-      const rootFolderId = await this.getOrCreateFolder(photographerId, 'FotosetGo');
-      // 2. Unique per-photographer folder using photographerId (UUID, always unique)
-      const photographerFolderId = await this.getOrCreateFolder(photographerId, photographerId, rootFolderId);
-      // 3. Event subfolder
-      const eventFolderId = await this.getOrCreateFolder(photographerId, eventName, photographerFolderId);
-
-      // 4. Upload File
-      const auth = await this.getAuthenticatedClient(photographerId);
-      const drive = google.drive({ version: 'v3', auth });
-
-      const fileMetadata = {
-        name: filename,
-        parents: [eventFolderId],
-      };
-
-      const media = {
-        body: stream,
-      };
-
-      const file = await drive.files.create({
-        requestBody: fileMetadata,
-        media: media,
-        fields: 'id, webViewLink',
-      });
-
-      this.logger.log(`Photo ${filename} successfully synced to Google Drive folder: ${eventName}`);
-      return file.data.id!;
-    } catch (err) {
-      this.logger.error(`Google Drive sync failed for ${filename}: ${err.message}`);
-      return null;
-    }
-  }
 
   // List folders and files under a specific parent folder
   async listFoldersAndFiles(photographerId: string, parentFolderId?: string) {
@@ -318,96 +281,6 @@ export class GoogleDriveService {
     }
   }
 
-  // Backup a single photo/video to Google Drive
-  async backupSinglePhoto(
-    photographerId: string,
-    photo: { id: string; r2KeyOriginal: string; filenameOriginal: string; driveFileId?: string | null },
-    eventName: string,
-    s3Client: any,
-    bucketName: string,
-  ): Promise<string | null> {
-    // Skip if already backed up
-    if (photo.driveFileId) {
-      return photo.driveFileId;
-    }
-
-    try {
-      const { GetObjectCommand } = await import('@aws-sdk/client-s3');
-
-      // Download from R2 as stream
-      const getCommand = new GetObjectCommand({
-        Bucket: bucketName,
-        Key: photo.r2KeyOriginal,
-      });
-      const s3Res = await s3Client.send(getCommand);
-      if (!s3Res.Body) {
-        this.logger.error(`[AutoBackup] Empty body from R2 for photo ${photo.id}`);
-        return null;
-      }
-
-      // Safety check — never upload thumbnails, only originals
-      if (!photo.r2KeyOriginal) {
-        this.logger.warn(`[AutoBackup] Skipping ${photo.filenameOriginal} — no r2KeyOriginal`);
-        return null;
-      }
-
-      // Determine mimeType based on filename extension
-      let mimeType = 'application/octet-stream';
-      const ext = photo.filenameOriginal.split('.').pop()?.toLowerCase();
-      if (ext === 'jpg' || ext === 'jpeg') mimeType = 'image/jpeg';
-      else if (ext === 'png') mimeType = 'image/png';
-      else if (ext === 'webp') mimeType = 'image/webp';
-      else if (ext === 'gif') mimeType = 'image/gif';
-      else if (ext === 'mp4') mimeType = 'video/mp4';
-      else if (ext === 'mov') mimeType = 'video/quicktime';
-      else if (ext === 'avi') mimeType = 'video/x-msvideo';
-      else if (ext === 'webm') mimeType = 'video/webm';
-
-      // Folder structure: FotosetGo → photographerId (UUID, always unique) → EventName
-      // Using photographerId directly — no DB query needed, guaranteed unique
-      const rootFolderId = await this.getOrCreateFolder(photographerId, 'FotosetGo');
-      const photographerFolderId = await this.getOrCreateFolder(photographerId, photographerId, rootFolderId);
-      const eventFolderId = await this.getOrCreateFolder(photographerId, eventName, photographerFolderId);
-
-      // Upload to Drive
-      const auth = await this.getAuthenticatedClient(photographerId);
-      const drive = google.drive({ version: 'v3', auth });
-
-      const file = await drive.files.create({
-        requestBody: {
-          name: photo.filenameOriginal,
-          mimeType: mimeType,
-          parents: [eventFolderId],
-        },
-        media: {
-          mimeType: mimeType,
-          body: s3Res.Body as any,
-        },
-        fields: 'id',
-      });
-
-      const driveFileId = file.data.id!;
-      
-      // Make the file publicly accessible by link so the frontend can preview/load it
-      try {
-        await drive.permissions.create({
-          fileId: driveFileId,
-          requestBody: {
-            role: 'reader',
-            type: 'anyone',
-          },
-        });
-      } catch (permissionErr) {
-        this.logger.warn(`Failed to set public reader permission for ${photo.filenameOriginal}: ${permissionErr.message}`);
-      }
-
-      this.logger.log(`[AutoBackup] ✅ ${photo.filenameOriginal} → Drive (${driveFileId})`);
-      return driveFileId;
-    } catch (err) {
-      this.logger.error(`[AutoBackup] ❌ Failed for ${photo.filenameOriginal}: ${err.message}`);
-      return null;
-    }
-  }
 
   // Backup all pending (not yet backed up) photos for a photographer via Cloudflare Worker (Zero VPS Bandwidth)
   async backupAllPendingPhotos(
@@ -452,7 +325,7 @@ export class GoogleDriveService {
 
     const workerUrl = process.env.DRIVE_BACKUP_WORKER_URL;
     const workerSecret = process.env.DRIVE_WORKER_SECRET;
-    const backendAppUrl = process.env.APP_URL || process.env.PUBLIC_API_URL;
+    const backendAppUrl = process.env.APP_URL;
     if (!workerUrl || !workerSecret || !backendAppUrl) {
       this.logger.error('CRITICAL: DRIVE_BACKUP_WORKER_URL, DRIVE_WORKER_SECRET or APP_URL is not defined in environment variables!');
       throw new Error('Drive backup worker configuration missing in environment variables');

@@ -203,12 +203,19 @@ export class BeamService implements OnModuleInit {
         
         if (fileNames.length > 0) {
           await this.redis.del(filesKey).catch(() => {});
-          await this.redis.sadd(filesKey, ...fileNames).catch(() => {});
+          const CHUNK_SIZE = 500;
+          for (let i = 0; i < fileNames.length; i += CHUNK_SIZE) {
+            const chunk = fileNames.slice(i, i + CHUNK_SIZE);
+            await this.redis.sadd(filesKey, ...chunk).catch(() => {});
+          }
           await this.redis.expire(filesKey, BEAM_SESSION_TTL_SECONDS).catch(() => {});
 
           if (this.oracleRedis && this.oracleRedis.status === 'ready') {
             await this.oracleRedis.del(filesKey).catch(() => {});
-            await this.oracleRedis.sadd(filesKey, ...fileNames).catch(() => {});
+            for (let i = 0; i < fileNames.length; i += CHUNK_SIZE) {
+              const chunk = fileNames.slice(i, i + CHUNK_SIZE);
+              await this.oracleRedis.sadd(filesKey, ...chunk).catch(() => {});
+            }
             await this.oracleRedis.expire(filesKey, BEAM_SESSION_TTL_SECONDS).catch(() => {});
           }
           this.logger.log(`[BeamService] Synced ${fileNames.length} existing filenames to Redis for event ${event.id} (TTL: 4h)`);

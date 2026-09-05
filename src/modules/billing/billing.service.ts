@@ -881,50 +881,65 @@ export class BillingService implements OnModuleInit {
     const randomSuffix = Math.floor(1000 + Math.random() * 9000);
     const invoiceNumber = `FSG-${currentYear}-${randomSuffix}`;
 
-    // Update payment order to SUCCESS
-    await this.prisma.paymentOrder.update({
-      where: { razorpayOrderId: orderId },
-      data: {
-        razorpayPaymentId: paymentId,
-        razorpaySignature: signature,
-        status: 'SUCCESS',
-        invoiceNumber,
-      },
+    const buyer = await this.prisma.photographer.findUnique({
+      where: { id: photographerId },
+      include: { user: true },
     });
 
-    // Increment Promo Code usage and record usage history
-    if (paymentOrder.promoCodeId) {
-      try {
-        await this.prisma.promoCode.update({
-          where: { id: paymentOrder.promoCodeId },
-          data: { usedCount: { increment: 1 } },
-        });
-        await this.prisma.promoCodeUsage.create({
-          data: {
-            promoCodeId: paymentOrder.promoCodeId,
-            photographerId,
-            paymentOrderId: paymentOrder.id,
-            discountAmountPaise: paymentOrder.promoDiscountAmount || 0,
-            orderType: paymentOrder.orderType,
-          },
-        });
-        this.logger.log(`[PromoCode] Successfully tracked redemption of ${paymentOrder.promoCodeText || paymentOrder.promoCodeId} by ${photographerId}`);
-      } catch (promoErr: any) {
-        this.logger.error(`[PromoCode] Error tracking promo usage: ${promoErr.message}`);
+    let targetPackage: any = null;
+    if (paymentOrder.orderType === 'SUBSCRIPTION') {
+      targetPackage = paymentOrder.package || (paymentOrder.packageId ? await this.prisma.package.findUnique({ where: { id: paymentOrder.packageId } }) : null);
+      if (!targetPackage) {
+        throw new NotFoundException('Package information missing from order');
       }
     }
 
-    // Deduct Studio Cash wallet if partially used in this order
-    if (paymentOrder.walletCashUsedAmount && paymentOrder.walletCashUsedAmount > 0) {
-      try {
-        await this.prisma.photographer.update({
+    const addedAmount = paymentOrder.creditsGiven || paymentOrder.amount;
+
+    // Execute atomic transaction for all order fulfillment operations
+    await this.prisma.$transaction(async (tx) => {
+      // 1. Update payment order to SUCCESS
+      await tx.paymentOrder.update({
+        where: { razorpayOrderId: orderId },
+        data: {
+          razorpayPaymentId: paymentId,
+          razorpaySignature: signature,
+          status: 'SUCCESS',
+          invoiceNumber,
+        },
+      });
+
+      // 2. Increment Promo Code usage and record usage history
+      if (paymentOrder.promoCodeId) {
+        try {
+          await tx.promoCode.update({
+            where: { id: paymentOrder.promoCodeId },
+            data: { usedCount: { increment: 1 } },
+          });
+          await tx.promoCodeUsage.create({
+            data: {
+              promoCodeId: paymentOrder.promoCodeId,
+              photographerId,
+              paymentOrderId: paymentOrder.id,
+              discountAmountPaise: paymentOrder.promoDiscountAmount || 0,
+              orderType: paymentOrder.orderType,
+            },
+          });
+        } catch (promoErr: any) {
+          this.logger.error(`[PromoCode] Error tracking promo usage: ${promoErr.message}`);
+        }
+      }
+
+      // 3. Deduct Studio Cash wallet if partially used in this order
+      if (paymentOrder.walletCashUsedAmount && paymentOrder.walletCashUsedAmount > 0) {
+        await tx.photographer.update({
           where: { id: photographerId },
           data: {
             walletCashBalance: { decrement: paymentOrder.walletCashUsedAmount },
           },
         });
 
-        await this.prisma.walletCashTransaction.create({
+        await tx.walletCashTransaction.create({
           data: {
             photographerId,
             amount: -paymentOrder.walletCashUsedAmount,
@@ -933,33 +948,198 @@ export class BillingService implements OnModuleInit {
             description: `Applied Studio Cash Wallet balance on checkout (-₹${(paymentOrder.walletCashUsedAmount / 100).toFixed(2)})`,
           },
         });
-        this.logger.log(`[Wallet] Deducted ₹${(paymentOrder.walletCashUsedAmount / 100).toFixed(2)} Studio Cash for order ${paymentOrder.id}`);
-      } catch (walletErr: any) {
-        this.logger.error(`[Wallet] Error deducting wallet cash: ${walletErr.message}`);
       }
-    }
+
+      if (paymentOrder.orderType === 'CREDIT_TOPUP') {
+        // Top-up credits in wallet
+        await tx.photographer.update({
+          where: { id: photographerId },
+          data: {
+            creditBalance: {
+              increment: addedAmount,
+            },
+          },
+        });
+
+        await tx.creditTransaction.create({
+          data: {
+            photographerId,
+            amount: addedAmount,
+            action: 'TOPUP',
+            description: `AI Fuel Credits Top-Up (${(addedAmount / 100).toFixed(0)} Credits) - Order: ${orderId}`,
+          },
+        });
+      } else if (targetPackage) {
+        // SUBSCRIPTION Upgrade Flow
+        const eventsMb = targetPackage.maxEventsStorageMb || 5000;
+        const portfolioMb = targetPackage.maxPortfolioStorageMb || 0;
+        const limitEventsBytes = BigInt(eventsMb) * BigInt(1024 * 1024);
+        const isPortfolioEnabled = targetPackage.featurePortfolioWebsite || targetPackage.featureCustomBranding;
+        const limitPortfolioBytes = isPortfolioEnabled
+          ? BigInt(portfolioMb * 1024 * 1024)
+          : BigInt(0);
+        const limitBytes = limitEventsBytes + limitPortfolioBytes;
+
+        // Deactivate previous active subscriptions
+        await tx.subscription.updateMany({
+          where: { photographerId, status: 'ACTIVE' },
+          data: { status: 'EXPIRED' },
+        });
+
+        const years = Math.min(3, Math.max(1, paymentOrder.yearsCount || 1));
+        const startsAt = new Date();
+        const endsAt = new Date();
+        endsAt.setDate(endsAt.getDate() + (years * 365));
+
+        await tx.subscription.create({
+          data: {
+            photographerId,
+            packageId: targetPackage.id,
+            startsAt,
+            endsAt,
+            status: 'ACTIVE',
+            yearsCount: years,
+            amountPaid: paymentOrder.amount,
+            limitBytes,
+            limitEventsBytes,
+            limitPortfolioBytes,
+            usedBytes: buyer?.totalStorageUsedBytes || BigInt(0),
+          },
+        });
+
+        // Refill Monthly AI credits on upgrade
+        const monthlyCredits = targetPackage.faceScanCredits || 0;
+        await tx.photographer.update({
+          where: { id: photographerId },
+          data: {
+            activePackageId: targetPackage.id,
+            creditBalance: {
+              increment: monthlyCredits,
+            },
+          },
+        });
+
+        if (monthlyCredits > 0) {
+          await tx.creditTransaction.create({
+            data: {
+              photographerId,
+              amount: monthlyCredits,
+              action: 'PLAN_BONUS',
+              description: `${targetPackage.name} Plan AI Credits allocation (${(monthlyCredits / 100).toFixed(0)} Credits)`,
+            },
+          });
+        }
+
+        // Auto-sync feature permissions on all existing events
+        const eventUpdateData: any = {};
+        if (!targetPackage.featureAiPhotoSearch) eventUpdateData.faceScanningEnabled = false;
+        if (!targetPackage.featureAiVideoSearch) eventUpdateData.videoScanningEnabled = false;
+        if (!targetPackage.featureClientSelection) eventUpdateData.allowFavorites = false;
+        if (!targetPackage.featureWatermark) eventUpdateData.watermarkEnabled = false;
+
+        if (Object.keys(eventUpdateData).length > 0) {
+          await tx.event.updateMany({
+            where: { photographerId },
+            data: eventUpdateData,
+          });
+        }
+
+        // REFERRAL PROGRAM CONVERSION & REWARD HOOK
+        if (buyer && buyer.referredById) {
+          const existingReferral = await tx.referral.findUnique({
+            where: { referredUserId: photographerId },
+          });
+
+          const referralConfig = await tx.referralConfig.findUnique({
+            where: { packageId: targetPackage.id },
+          });
+
+          if (!existingReferral) {
+            if (referralConfig && referralConfig.isReferralEnabled) {
+              const instantBonus = referralConfig.instantBonusCredits || 0;
+              const monthlyBoost = referralConfig.monthlyBoostCredits || 0;
+              const welcomeBonus = referralConfig.refereeWelcomeCredits || 0;
+
+              await tx.referral.create({
+                data: {
+                  referrerId: buyer.referredById,
+                  referredUserId: photographerId,
+                  packageId: targetPackage.id,
+                  tenureYears: years,
+                  instantCreditsAwarded: instantBonus,
+                  monthlyBoostCredits: monthlyBoost,
+                  status: 'ACTIVE',
+                  validFrom: startsAt,
+                  validUntil: endsAt,
+                  initialPaymentOrderId: paymentOrder.id,
+                },
+              });
+
+              if (instantBonus > 0) {
+                await tx.photographer.update({
+                  where: { id: buyer.referredById },
+                  data: { creditBalance: { increment: instantBonus } },
+                });
+                await tx.creditTransaction.create({
+                  data: {
+                    photographerId: buyer.referredById,
+                    amount: instantBonus,
+                    action: 'REFERRAL_INSTANT_BONUS',
+                    description: `Instant Referral Bonus: ${buyer.studioName || buyer.user?.name} subscribed to ${targetPackage.name} (${years} Yr) (+${(instantBonus / 100).toFixed(0)} Credits)`,
+                  },
+                });
+              }
+
+              if (welcomeBonus > 0) {
+                await tx.photographer.update({
+                  where: { id: photographerId },
+                  data: { creditBalance: { increment: welcomeBonus } },
+                });
+                await tx.creditTransaction.create({
+                  data: {
+                    photographerId,
+                    amount: welcomeBonus,
+                    action: 'REFERRAL_WELCOME_BONUS',
+                    description: `Welcome Referral Perk for joining via referral invitation (+${(welcomeBonus / 100).toFixed(0)} Credits)`,
+                  },
+                });
+              }
+            }
+          } else {
+            if (referralConfig && referralConfig.isReferralEnabled) {
+              const initialCreatedAt = existingReferral.createdAt || existingReferral.validFrom || new Date();
+              const daysSinceInitialPurchase = Math.floor(
+                (Date.now() - new Date(initialCreatedAt).getTime()) / (1000 * 60 * 60 * 24)
+              );
+              const isWithin6Months = daysSinceInitialPurchase <= 180;
+              const updatedValidUntil = isWithin6Months ? endsAt : (existingReferral.validUntil || endsAt);
+
+              await tx.referral.update({
+                where: { id: existingReferral.id },
+                data: {
+                  packageId: targetPackage.id,
+                  tenureYears: isWithin6Months ? Math.max(existingReferral.tenureYears, years) : existingReferral.tenureYears,
+                  monthlyBoostCredits: referralConfig.monthlyBoostCredits || existingReferral.monthlyBoostCredits,
+                  validUntil: updatedValidUntil,
+                  status: 'ACTIVE',
+                },
+              });
+            }
+          }
+        }
+      }
+    });
+
+    // Invalidate Redis profile/package and JWT user caches
+    try {
+      const keysToDelete = [`cache:photographer:${photographerId}:sub`];
+      if (buyer?.userId) {
+        keysToDelete.push(`cache:jwt:user:${buyer.userId}`);
+      }
+      await this.redis.del(...keysToDelete);
+    } catch (e) { }
 
     if (paymentOrder.orderType === 'CREDIT_TOPUP') {
-      // Top-up credits in wallet (crediting bonus quota if applicable)
-      const addedAmount = paymentOrder.creditsGiven || paymentOrder.amount;
-      await this.prisma.photographer.update({
-        where: { id: photographerId },
-        data: {
-          creditBalance: {
-            increment: addedAmount,
-          },
-        },
-      });
-
-      await this.prisma.creditTransaction.create({
-        data: {
-          photographerId,
-          amount: addedAmount,
-          action: 'TOPUP',
-          description: `AI Fuel Credits Top-Up (${(addedAmount / 100).toFixed(0)} Credits) - Order: ${orderId}`,
-        },
-      });
-
       return {
         success: true,
         orderType: 'CREDIT_TOPUP',
@@ -969,236 +1149,15 @@ export class BillingService implements OnModuleInit {
       };
     }
 
-    // SUBSCRIPTION Upgrade Flow
-    const targetPackage = paymentOrder.package || (paymentOrder.packageId ? await this.prisma.package.findUnique({ where: { id: paymentOrder.packageId } }) : null);
-
-    if (!targetPackage) {
-      throw new NotFoundException('Package information missing from order');
-    }
-
-    const eventsMb = targetPackage.maxEventsStorageMb || 5000;
-    const portfolioMb = targetPackage.maxPortfolioStorageMb || 0;
-    const limitEventsBytes = BigInt(eventsMb) * BigInt(1024 * 1024);
-    const isPortfolioEnabled = targetPackage.featurePortfolioWebsite || targetPackage.featureCustomBranding;
-    const limitPortfolioBytes = isPortfolioEnabled
-      ? BigInt(portfolioMb * 1024 * 1024)
-      : BigInt(0);
-    const limitBytes = limitEventsBytes + limitPortfolioBytes;
-
-    // Deactivate previous active subscriptions
-    await this.prisma.subscription.updateMany({
-      where: { photographerId, status: 'ACTIVE' },
-      data: { status: 'EXPIRED' },
-    });
-
-    // Multi-Year Validity Calculation (yearsCount * 365 Days)
-    const years = Math.min(3, Math.max(1, paymentOrder.yearsCount || 1));
-    const startsAt = new Date();
-    const endsAt = new Date();
-    endsAt.setDate(endsAt.getDate() + (years * 365));
-
-    const sub = await this.prisma.subscription.create({
-      data: {
-        photographerId,
-        packageId: targetPackage.id,
-        startsAt,
-        endsAt,
-        status: 'ACTIVE',
-        yearsCount: years,
-        amountPaid: paymentOrder.amount,
-        limitBytes,
-        limitEventsBytes,
-        limitPortfolioBytes,
-        usedBytes: BigInt(0),
-      },
-    });
-
-    const photographer = await this.prisma.photographer.findUnique({
-      where: { id: photographerId },
-    });
-    if (photographer) {
-      await this.prisma.subscription.update({
-        where: { id: sub.id },
-        data: { usedBytes: photographer.totalStorageUsedBytes }
-      });
-    }
-
-    // Refill Monthly AI credits on upgrade
-    const monthlyCredits = targetPackage.faceScanCredits || 0;
-    await this.prisma.photographer.update({
-      where: { id: photographerId },
-      data: {
-        activePackageId: targetPackage.id,
-        creditBalance: {
-          increment: monthlyCredits,
-        },
-      },
-    });
-
-    if (monthlyCredits > 0) {
-      await this.prisma.creditTransaction.create({
-        data: {
-          photographerId,
-          amount: monthlyCredits,
-          action: 'PLAN_BONUS',
-          description: `${targetPackage.name} Plan AI Credits allocation (${(monthlyCredits / 100).toFixed(0)} Credits)`,
-        },
-      });
-    }
-
-    // Auto-sync feature permissions on all existing events
-    const eventUpdateData: any = {};
-    if (!targetPackage.featureAiPhotoSearch) {
-      eventUpdateData.faceScanningEnabled = false;
-    }
-    if (!targetPackage.featureAiVideoSearch) {
-      eventUpdateData.videoScanningEnabled = false;
-    }
-    if (!targetPackage.featureClientSelection) {
-      eventUpdateData.allowFavorites = false;
-    }
-    if (!targetPackage.featureWatermark) {
-      eventUpdateData.watermarkEnabled = false;
-    }
-
-    if (Object.keys(eventUpdateData).length > 0) {
-      await this.prisma.event.updateMany({
-        where: { photographerId },
-        data: eventUpdateData,
-      });
-    }
-
-    // ==========================================
-    // REFERRAL PROGRAM CONVERSION & REWARD HOOK
-    // ==========================================
-    try {
-      const buyer = await this.prisma.photographer.findUnique({
-        where: { id: photographerId },
-        include: { user: true },
-      });
-
-      if (buyer && buyer.referredById) {
-        // Check if a Referral record already exists for this buyer
-        const existingReferral = await this.prisma.referral.findUnique({
-          where: { referredUserId: photographerId },
-        });
-
-        const referralConfig = await this.prisma.referralConfig.findUnique({
-          where: { packageId: targetPackage.id },
-        });
-
-        if (!existingReferral) {
-          // FIRST-TIME PAID SUBSCRIPTION CONVERSION!
-          if (referralConfig && referralConfig.isReferralEnabled) {
-            const instantBonus = referralConfig.instantBonusCredits || 0;
-            const monthlyBoost = referralConfig.monthlyBoostCredits || 0;
-            const welcomeBonus = referralConfig.refereeWelcomeCredits || 0;
-
-            // 1. Create Referral record with locked tenure duration
-            await this.prisma.referral.create({
-              data: {
-                referrerId: buyer.referredById,
-                referredUserId: photographerId,
-                packageId: targetPackage.id,
-                tenureYears: years,
-                instantCreditsAwarded: instantBonus,
-                monthlyBoostCredits: monthlyBoost,
-                status: 'ACTIVE',
-                validFrom: startsAt,
-                validUntil: endsAt,
-                initialPaymentOrderId: paymentOrder.id,
-              },
-            });
-
-            // 2. Award Referrer Instant Bonus if > 0
-            if (instantBonus > 0) {
-              await this.prisma.photographer.update({
-                where: { id: buyer.referredById },
-                data: { creditBalance: { increment: instantBonus } },
-              });
-              await this.prisma.creditTransaction.create({
-                data: {
-                  photographerId: buyer.referredById,
-                  amount: instantBonus,
-                  action: 'REFERRAL_INSTANT_BONUS',
-                  description: `Instant Referral Bonus: ${buyer.studioName || buyer.user.name} subscribed to ${targetPackage.name} (${years} Yr) (+${(instantBonus / 100).toFixed(0)} Credits)`,
-                },
-              });
-            }
-
-            // 3. Award Referee (Buyer) Welcome Bonus if > 0
-            if (welcomeBonus > 0) {
-              await this.prisma.photographer.update({
-                where: { id: photographerId },
-                data: { creditBalance: { increment: welcomeBonus } },
-              });
-              await this.prisma.creditTransaction.create({
-                data: {
-                  photographerId,
-                  amount: welcomeBonus,
-                  action: 'REFERRAL_WELCOME_BONUS',
-                  description: `Welcome Referral Perk for joining via referral invitation (+${(welcomeBonus / 100).toFixed(0)} Credits)`,
-                },
-              });
-            }
-
-            this.logger.log(`[Referral] Successfully converted referral for ${buyer.user.email} -> Referrer: ${buyer.referredById} (Instant: ₹${instantBonus/100}, Monthly: ₹${monthlyBoost/100}/mo, Years: ${years})`);
-          }
-        } else {
-          // Mid-cycle Upgrade Handling:
-          if (referralConfig && referralConfig.isReferralEnabled) {
-            const initialCreatedAt = existingReferral.createdAt || existingReferral.validFrom || new Date();
-            const daysSinceInitialPurchase = Math.floor(
-              (Date.now() - new Date(initialCreatedAt).getTime()) / (1000 * 60 * 60 * 24)
-            );
-            const isWithin6Months = daysSinceInitialPurchase <= 180;
-
-            // Rule:
-            // 1. Within 6 months (<= 180 days): Extend validity date to new plan endsAt.
-            // 2. After 6 months (> 180 days): Keep the original fixed validUntil date (do NOT extend).
-            const updatedValidUntil = isWithin6Months
-              ? endsAt
-              : (existingReferral.validUntil || endsAt);
-
-            await this.prisma.referral.update({
-              where: { id: existingReferral.id },
-              data: {
-                packageId: targetPackage.id,
-                tenureYears: isWithin6Months ? Math.max(existingReferral.tenureYears, years) : existingReferral.tenureYears,
-                monthlyBoostCredits: referralConfig.monthlyBoostCredits || existingReferral.monthlyBoostCredits,
-                validUntil: updatedValidUntil,
-                status: 'ACTIVE',
-              },
-            });
-            this.logger.log(
-              `[Referral] Updated referral terms for upgraded buyer ${buyer.user.email} to ${targetPackage.name} (Upgrade on day ${daysSinceInitialPurchase}. Within 6-months: ${isWithin6Months}. Validity: ${updatedValidUntil.toISOString()})`
-            );
-          }
-        }
-      }
-    } catch (refErr: any) {
-      this.logger.error(`[Referral] Error handling referral reward: ${refErr.message}`);
-    }
-
-    // Invalidate Redis profile/package and JWT user caches
-    try {
-      const keysToDelete = [`cache:photographer:${photographerId}:sub`];
-      if (photographer?.userId) {
-        keysToDelete.push(`cache:jwt:user:${photographer.userId}`);
-      }
-      await this.redis.del(...keysToDelete);
-    } catch (e) { }
-
     return {
       success: true,
       orderType: 'SUBSCRIPTION',
-      packageName: targetPackage.name,
+      packageName: targetPackage?.name,
       invoiceNumber,
-      startsAt,
-      endsAt,
-      maxEventsStorageMb: targetPackage.maxEventsStorageMb,
-      maxPortfolioStorageMb: targetPackage.maxPortfolioStorageMb,
-      monthlyCredits: monthlyCredits / 100,
+      message: `Successfully activated ${targetPackage?.name} subscription plan!`,
+      maxEventsStorageMb: targetPackage?.maxEventsStorageMb,
+      maxPortfolioStorageMb: targetPackage?.maxPortfolioStorageMb,
+      monthlyCredits: (targetPackage?.faceScanCredits || 0) / 100,
     };
   }
 

@@ -1874,20 +1874,22 @@ export class StorageService implements OnModuleInit {
     try {
       if (eventId) {
         results = await this.prisma.$queryRaw<any[]>`
-          SELECT DISTINCT "photoId", 1 - (embedding <=> ${vectorStr}::vector) as similarity
+          SELECT "photoId", MAX(1 - (embedding <=> ${vectorStr}::vector)) as similarity
           FROM face_embeddings
           WHERE "photographerId" = ${photographerId}
             AND "eventId" = ${eventId}
             AND 1 - (embedding <=> ${vectorStr}::vector) >= ${threshold}
+          GROUP BY "photoId"
           ORDER BY similarity DESC
           LIMIT 100
         `;
       } else {
         results = await this.prisma.$queryRaw<any[]>`
-          SELECT DISTINCT "photoId", 1 - (embedding <=> ${vectorStr}::vector) as similarity
+          SELECT "photoId", MAX(1 - (embedding <=> ${vectorStr}::vector)) as similarity
           FROM face_embeddings
           WHERE "photographerId" = ${photographerId}
             AND 1 - (embedding <=> ${vectorStr}::vector) >= ${threshold}
+          GROUP BY "photoId"
           ORDER BY similarity DESC
           LIMIT 100
         `;
@@ -2051,10 +2053,11 @@ export class StorageService implements OnModuleInit {
     let results: any[] = [];
     try {
       results = await this.prisma.$queryRaw<any[]>`
-        SELECT DISTINCT "photoId", 1 - (embedding <=> ${vectorStr}::vector) as similarity
+        SELECT "photoId", MAX(1 - (embedding <=> ${vectorStr}::vector)) as similarity
         FROM face_embeddings
         WHERE "eventId" = ANY(${eventIdsFilter})
           AND 1 - (embedding <=> ${vectorStr}::vector) >= ${threshold}
+        GROUP BY "photoId"
         ORDER BY similarity DESC
         LIMIT 100
       `;

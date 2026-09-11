@@ -29,15 +29,15 @@ export class GoogleDriveController {
     @Query('state') state: string,
     @Res() res: Response,
   ) {
+    const dashboardUrl = process.env.DASHBOARD_URL || 
+      (process.env.NODE_ENV === 'production' ? 'https://dashboard.fotosetgo.com' : 'http://localhost:3000');
     try {
       const photographerId = state;
-      const frontendUrl = process.env.FRONTEND_URL;
       await this.googleDriveService.handleCallback(code, photographerId);
-      return res.redirect(`${frontendUrl}/dashboard/storage?drive=connected`);
+      return res.redirect(`${dashboardUrl}/dashboard/storage?drive=connected`);
     } catch (err) {
       console.error('[GoogleDrive] Auth callback failed:', err);
-      const frontendUrl = process.env.FRONTEND_URL;
-      return res.redirect(`${frontendUrl}/dashboard/storage?drive=error`);
+      return res.redirect(`${dashboardUrl}/dashboard/storage?drive=error`);
     }
   }
 

@@ -27,32 +27,31 @@ async function bootstrap() {
 
   app.setGlobalPrefix('api');
 
-  // Production vs Local Environment-aware CORS with full Subdomain support (*.localhost:3000 & *.fotosetgo.com)
+  // Universal CORS Configuration with full Subdomain support (*.fotosetgo.com & local dev)
   app.enableCors({
     origin: (origin, callback) => {
       // Allow requests with no origin (like mobile apps, curl, server-to-server)
       if (!origin) return callback(null, true);
 
-      if (process.env.NODE_ENV === 'production') {
-        const isAllowedProd =
-          origin === 'https://fotosetgo.com' ||
-          origin === 'https://admin.fotosetgo.com' ||
-          origin === 'https://api.fotosetgo.com' ||
-          origin.endsWith('.fotosetgo.com') ||
-          origin.includes('localhost') ||
-          origin.includes('127.0.0.1');
-        return callback(null, isAllowedProd);
-      } else {
-        // Development mode: Allow localhost, 127.0.0.1, and subdomains like chitrkalaclicks.localhost:3000
-        const isAllowedDev =
-          origin.includes('localhost') ||
-          origin.includes('127.0.0.1');
-        return callback(null, isAllowedDev);
+      const isAllowed =
+        origin === 'https://fotosetgo.com' ||
+        origin === 'http://fotosetgo.com' ||
+        origin === 'https://dashboard.fotosetgo.com' ||
+        origin === 'http://dashboard.fotosetgo.com' ||
+        origin === 'https://admin.fotosetgo.com' ||
+        origin === 'https://api.fotosetgo.com' ||
+        origin.endsWith('.fotosetgo.com') ||
+        origin.includes('localhost') ||
+        origin.includes('127.0.0.1');
+
+      if (isAllowed) {
+        return callback(null, true);
       }
+      return callback(null, false);
     },
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
   });
 
   await app.listen(process.env.PORT ?? 5000);

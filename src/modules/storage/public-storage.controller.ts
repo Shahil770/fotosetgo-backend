@@ -271,5 +271,11 @@ export class PublicStorageController {
   ) {
     return this.storageService.completePhotoFaceWebhook(body);
   }
+
+  // Public AI Models Presigned Direct Download URLs (From Cloudflare R2)
+  @Get('ai-models/urls')
+  async getAiModelUrls() {
+    return this.storageService.getAiModelUrls();
+  }
 }
 

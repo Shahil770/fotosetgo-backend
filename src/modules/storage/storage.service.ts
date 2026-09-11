@@ -1752,7 +1752,7 @@ export class StorageService implements OnModuleInit {
       Key: key,
     });
     const url = await getSignedUrl(this.s3Client, getCommand, { expiresIn: 3600 }); // 1 hour expiration
-    
+
     try {
       await this.redis.set(redisKey, url, 'EX', 3000); // 50 minutes TTL
     } catch (err: any) {
@@ -3946,7 +3946,7 @@ export class StorageService implements OnModuleInit {
         }
         throw new UnauthorizedException('Invalid event passcode');
       } else {
-        this.redis.del(failKey).catch(() => {});
+        this.redis.del(failKey).catch(() => { });
       }
     }
 
@@ -6519,6 +6519,14 @@ export class StorageService implements OnModuleInit {
     } finally {
       await this.redis.del(`lock:scan:event:${eventId}`).catch(() => { });
     }
+  }
+
+  async getAiModelUrls() {
+    const [detectorUrl, arcfaceUrl] = await Promise.all([
+      this.getReadUrl('ai-models/det_10g.onnx'),
+      this.getReadUrl('ai-models/w600k_r50.onnx'),
+    ]);
+    return { detectorUrl, arcfaceUrl };
   }
 }
 

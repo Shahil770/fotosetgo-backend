@@ -406,7 +406,7 @@ export class GoogleDriveService {
             googleDriveConnected: false,
             googleDriveAccessToken: null,
           },
-        }).catch(() => {});
+        }).catch(() => { });
       } else {
         this.logger.error(`[AutoBackup] Cloudflare Worker dispatch error for photographer ${photographerId}: ${workerErr.message}`);
       }

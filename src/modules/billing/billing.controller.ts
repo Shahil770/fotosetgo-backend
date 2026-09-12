@@ -233,6 +233,7 @@ export class BillingController {
           featureCustomBranding: plan.features.featureCustomBranding,
           featureClientSelection: plan.features.featureClientSelection,
           featureGuestUpload: plan.features.featureGuestUpload,
+          featurePortfolioWebsite: plan.features.featurePortfolioWebsite,
           featureDigitalBusinessCard: plan.features.featureDigitalBusinessCard,
           featureAutoDriveBackup: plan.features.featureAutoDriveBackup,
           featureDisableDownload: plan.features.featureDisableDownload,
@@ -241,6 +242,14 @@ export class BillingController {
           featureBulkDownload: plan.features.featureBulkDownload ?? false,
         }
       });
+
+      // Invalidate Redis profile caches for instant reflection
+      try {
+        const userKeys = await this.redis.keys('cache:jwt:user:*');
+        if (userKeys && userKeys.length > 0) {
+          await this.redis.del(...userKeys);
+        }
+      } catch (_) {}
 
       // Synchronize all active subscriptions tied to this package
       await this.prismaService.subscription.updateMany({

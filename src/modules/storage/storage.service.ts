@@ -3628,16 +3628,37 @@ export class StorageService implements OnModuleInit {
       const photoIds = members.filter(id => id && id !== '__INIT__');
 
       if (photoIds.length > 0) {
-        const data = photoIds.map(photoId => ({
-          eventId,
-          photoId,
-          clientSessionId: 'SHARED_SELECTION'
-        }));
+        // Validate that photoIds actually exist in database and belong to this event (prevent Foreign Key violation)
+        const validPhotos = await this.prisma.photo.findMany({
+          where: {
+            id: { in: photoIds },
+            eventId,
+            isDeleted: false
+          },
+          select: { id: true }
+        });
+        const validPhotoIds = validPhotos.map(p => p.id);
 
-        await this.prisma.$transaction([
-          this.prisma.favoritePhoto.deleteMany({ where: { eventId } }),
-          this.prisma.favoritePhoto.createMany({ data })
-        ]);
+        // Remove any stale/deleted photoIds from Redis set
+        const invalidPhotoIds = photoIds.filter(id => !validPhotoIds.includes(id));
+        if (invalidPhotoIds.length > 0) {
+          await this.redis.srem(setKey, ...invalidPhotoIds).catch(() => {});
+        }
+
+        if (validPhotoIds.length > 0) {
+          const data = validPhotoIds.map(photoId => ({
+            eventId,
+            photoId,
+            clientSessionId: 'SHARED_SELECTION'
+          }));
+
+          await this.prisma.$transaction([
+            this.prisma.favoritePhoto.deleteMany({ where: { eventId } }),
+            this.prisma.favoritePhoto.createMany({ data, skipDuplicates: true })
+          ]);
+        } else {
+          await this.prisma.favoritePhoto.deleteMany({ where: { eventId } });
+        }
       } else {
         await this.prisma.favoritePhoto.deleteMany({ where: { eventId } });
       }
@@ -3811,12 +3832,12 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Event not found');
     }
 
-    // Flush any pending sync so DB has latest
+    // Always flush any latest Redis state to DB so DB & Redis stay 100% in sync
     if (this.favoritesSyncTimers.has(eventId)) {
       clearTimeout(this.favoritesSyncTimers.get(eventId)!);
       this.favoritesSyncTimers.delete(eventId);
-      await this.flushFavoritesToDb(eventId);
     }
+    await this.flushFavoritesToDb(eventId);
 
     const favorites = await this.prisma.favoritePhoto.findMany({
       where: { eventId },

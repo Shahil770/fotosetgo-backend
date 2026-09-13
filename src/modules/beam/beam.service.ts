@@ -177,6 +177,26 @@ export class BeamService implements OnModuleInit {
       const usedBytes = BigInt(breakdown.eventsBytes || 0);
       const remainingBytes = limitBytes > usedBytes ? limitBytes - usedBytes : BigInt(0);
 
+      // Retrieve plan limits
+      const activeSub = await this.prisma.subscription.findFirst({
+        where: { photographerId, status: 'ACTIVE' },
+        include: { package: true },
+        orderBy: { createdAt: 'desc' }
+      });
+      const maxBeamFtpPhotos = activeSub?.package?.maxBeamFtpPhotos ?? 0;
+      const maxConcurrentCameras = activeSub?.package?.maxConcurrentCameras ?? 0;
+      const hasBeamPlanAccess = activeSub?.package ? activeSub.package.featureBeamLiveCamera : false;
+
+      const currentCycle = this.getCurrentCycle();
+      const photographer = await this.prisma.photographer.findUnique({
+        where: { id: photographerId },
+        select: { beamFtpPhotosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
+      });
+      let usedPhotos = photographer?.beamFtpPhotosUsedThisMonth || 0;
+      if (photographer?.beamFtpPhotosBillingCycle !== currentCycle) {
+        usedPhotos = 0;
+      }
+
       const authData = JSON.stringify({
         username,
         ftpUsername: username,
@@ -193,6 +213,10 @@ export class BeamService implements OnModuleInit {
         storageLimitBytes: limitBytes.toString(),
         storageUsedBytes: usedBytes.toString(),
         storageRemainingBytes: remainingBytes.toString(),
+        maxBeamFtpPhotos,
+        maxConcurrentCameras,
+        hasBeamPlanAccess,
+        beamFtpPhotosUsedThisMonth: usedPhotos,
         expiresAt: event.beamExpiresAt ? new Date(event.beamExpiresAt).toISOString() : undefined,
         updatedAt: new Date().toISOString()
       });
@@ -208,6 +232,8 @@ export class BeamService implements OnModuleInit {
       await this.syncToAllRedis(`auth:ftp:${username}`, authData, 'set', BEAM_SESSION_TTL_SECONDS);
       await this.syncToAllRedis(`beam:auth:${username}`, authData, 'set', BEAM_SESSION_TTL_SECONDS);
       await this.syncToAllRedis(`beam:storage:${photographerId}`, storageData, 'set', BEAM_SESSION_TTL_SECONDS);
+      await this.syncToAllRedis(`beam:photographer:used:${photographerId}:${currentCycle}`, usedPhotos.toString(), 'set', BEAM_SESSION_TTL_SECONDS);
+      await this.syncToAllRedis(`beam:photographer:limits:${photographerId}`, JSON.stringify({ maxPhotos: maxBeamFtpPhotos, maxCameras: maxConcurrentCameras }), 'set', BEAM_SESSION_TTL_SECONDS);
 
       // Also set hash for Oracle VM storage check with 4-hour TTL
       if (this.oracleRedis && this.oracleRedis.status === 'ready') {
@@ -463,6 +489,10 @@ export class BeamService implements OnModuleInit {
           beamFtpPhotosBillingCycle: currentCycle
         }
       });
+      await this.redis.set(`beam:photographer:used:${payload.photographerId}:${currentCycle}`, '1').catch(() => {});
+      if (this.oracleRedis && this.oracleRedis.status === 'ready') {
+        await this.oracleRedis.set(`beam:photographer:used:${payload.photographerId}:${currentCycle}`, '1').catch(() => {});
+      }
     } else {
       await this.prisma.photographer.update({
         where: { id: payload.photographerId },
@@ -470,6 +500,10 @@ export class BeamService implements OnModuleInit {
           beamFtpPhotosUsedThisMonth: { increment: 1 }
         }
       });
+      await this.redis.incr(`beam:photographer:used:${payload.photographerId}:${currentCycle}`).catch(() => {});
+      if (this.oracleRedis && this.oracleRedis.status === 'ready') {
+        await this.oracleRedis.incr(`beam:photographer:used:${payload.photographerId}:${currentCycle}`).catch(() => {});
+      }
     }
 
     const photoId = uuidv4();

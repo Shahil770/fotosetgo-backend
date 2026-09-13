@@ -16,8 +16,13 @@ export class PublicStorageController {
     @Param('slug') slug: string,
     @Res({ passthrough: true }) res: any
   ) {
-    res.setHeader('Cache-Control', 'public, max-age=15, s-maxage=30, stale-while-revalidate=60');
-    return this.storageService.getPublicEventBySlug(slug);
+    const result = await this.storageService.getPublicEventBySlug(slug);
+    if (result && !result.requiresPasscode) {
+      res.setHeader('Cache-Control', 'public, max-age=15, s-maxage=30, stale-while-revalidate=60');
+    } else {
+      res.setHeader('Cache-Control', 'no-store, private');
+    }
+    return result;
   }
 
   @Post('events/:slug/init')
@@ -28,12 +33,13 @@ export class PublicStorageController {
     @Res({ passthrough: true }) res: any
   ) {
     const clientIp = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
-    if (!body.passcode) {
+    const result = await this.storageService.getPublicEventInit(slug, body.passcode, clientIp);
+    if (result && result.event && !result.event.requiresPasscode) {
       res.setHeader('Cache-Control', 'public, max-age=15, s-maxage=30, stale-while-revalidate=60');
     } else {
       res.setHeader('Cache-Control', 'no-store, private');
     }
-    return this.storageService.getPublicEventInit(slug, body.passcode, clientIp);
+    return result;
   }
 
   @Post('events/:slug/photos')
@@ -44,12 +50,13 @@ export class PublicStorageController {
     @Res({ passthrough: true }) res: any
   ) {
     const clientIp = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
+    const result = await this.storageService.getPublicEventPhotos(slug, body.passcode, body.limit, body.cursor, clientIp);
     if (!body.passcode) {
       res.setHeader('Cache-Control', 'public, max-age=15, s-maxage=30, stale-while-revalidate=60');
     } else {
       res.setHeader('Cache-Control', 'no-store, private');
     }
-    return this.storageService.getPublicEventPhotos(slug, body.passcode, body.limit, body.cursor, clientIp);
+    return result;
   }
 
   @Post('events/:slug/guest-upload-url')

@@ -37,8 +37,8 @@ export class BeamController {
   }
 
   @Post('internal/camera-connected')
-  async handleCameraConnected(@Body() body: { photographerId: string; sessionId: string; eventId: string }) {
-    return this.beamService.registerCameraSession(body.photographerId, body.sessionId, body.eventId);
+  async handleCameraConnected(@Body() body: { photographerId: string; sessionId: string; eventId: string; ip?: string; deviceName?: string }) {
+    return this.beamService.registerCameraSession(body.photographerId, body.sessionId, body.eventId, { ip: body.ip, deviceName: body.deviceName });
   }
 
   @Post('internal/camera-disconnected')

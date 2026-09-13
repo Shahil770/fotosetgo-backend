@@ -138,19 +138,31 @@ export class BeamService implements OnModuleInit {
     const maxPhotos = activeSub?.package?.maxBeamFtpPhotos ?? 0;
     const maxCameras = activeSub?.package?.maxConcurrentCameras ?? 0;
     let activeCamerasCount = 0;
+    const activeDevices: Array<{
+      sessionId: string;
+      ip?: string;
+      deviceName?: string;
+      connectedAt?: string;
+      eventId?: string;
+    }> = [];
+
     try {
       const sessionIds = await this.redis.smembers(`beam:active_cameras:${photographerId}`);
       if (sessionIds && sessionIds.length > 0) {
-        const aliveSessions: string[] = [];
         for (const sid of sessionIds) {
-          const isAlive = await this.redis.exists(`beam:session_meta:${sid}`);
-          if (isAlive) {
-            aliveSessions.push(sid);
+          const metaStr = await this.redis.get(`beam:session_meta:${sid}`);
+          if (metaStr) {
+            try {
+              const parsed = JSON.parse(metaStr);
+              activeDevices.push(parsed);
+            } catch (_) {
+              activeDevices.push({ sessionId: sid, deviceName: 'FTP Camera' });
+            }
           } else {
             await this.redis.srem(`beam:active_cameras:${photographerId}`, sid).catch(() => {});
           }
         }
-        activeCamerasCount = aliveSessions.length;
+        activeCamerasCount = activeDevices.length;
       }
     } catch (_) {}
 
@@ -169,6 +181,7 @@ export class BeamService implements OnModuleInit {
       beamFtpPhotosUsedThisMonth: usedPhotos,
       maxConcurrentCameras: maxCameras,
       activeCamerasCount,
+      activeDevices,
     };
   }
 
@@ -429,11 +442,28 @@ export class BeamService implements OnModuleInit {
     };
   }
 
-  async registerCameraSession(photographerId: string, sessionId: string, eventId: string) {
+  async registerCameraSession(
+    photographerId: string,
+    sessionId: string,
+    eventId: string,
+    meta?: { ip?: string; deviceName?: string }
+  ) {
     try {
+      const sessionData = JSON.stringify({
+        sessionId,
+        photographerId,
+        eventId,
+        ip: meta?.ip || 'Direct Connection',
+        deviceName: meta?.deviceName || 'FTP Camera',
+        connectedAt: new Date().toISOString()
+      });
       await this.redis.sadd(`beam:active_cameras:${photographerId}`, sessionId);
-      await this.redis.set(`beam:session_meta:${sessionId}`, JSON.stringify({ photographerId, eventId, connectedAt: new Date().toISOString() }), 'EX', 86400);
-      this.logger.log(`[BeamService] Registered live camera session ${sessionId} for photographer ${photographerId}`);
+      await this.redis.set(`beam:session_meta:${sessionId}`, sessionData, 'EX', 1800);
+      if (this.oracleRedis && this.oracleRedis.status === 'ready') {
+        await this.oracleRedis.sadd(`beam:active_cameras:${photographerId}`, sessionId).catch(() => {});
+        await this.oracleRedis.set(`beam:session_meta:${sessionId}`, sessionData, 'EX', 1800).catch(() => {});
+      }
+      this.logger.log(`[BeamService] Registered live camera session ${sessionId} (${meta?.deviceName || 'Camera'}) for photographer ${photographerId}`);
     } catch (err: any) {
       this.logger.warn(`[BeamService] Failed to register camera session: ${err.message}`);
     }

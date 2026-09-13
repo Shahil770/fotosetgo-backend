@@ -2531,7 +2531,27 @@ export class StorageService implements OnModuleInit {
       for (const eid of idList) {
         keys.push(`cache:event:detail:${eid}`);
       }
-      await this.redis.del(...keys);
+
+      // Also invalidate public event & photo caches for real-time guest sync
+      const events = await this.prisma.event.findMany({
+        where: { id: { in: idList } },
+        select: { slug: true }
+      });
+      for (const evt of events) {
+        if (evt.slug) {
+          keys.push(`cache:public:event:${evt.slug}`);
+          try {
+            const photoCacheKeys = await this.redis.keys(`cache:public:photos:${evt.slug}:*`);
+            if (photoCacheKeys && photoCacheKeys.length > 0) {
+              keys.push(...photoCacheKeys);
+            }
+          } catch {}
+        }
+      }
+
+      if (keys.length > 0) {
+        await this.redis.del(...keys);
+      }
       this.logger.log(`[Cache Invalidate] Cleared event photo caches for event(s): ${idList.join(', ')}`);
     } catch (err: any) {
       this.logger.error(`[Cache Invalidate] Failed: ${err.message}`);

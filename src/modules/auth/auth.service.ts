@@ -370,6 +370,52 @@ export class AuthService {
   }
 
   /**
+   * Verify 6-Digit Email OTP for Password Reset
+   */
+  async verifyForgotPasswordOtp(email: string, otp: string) {
+    const normalizedEmail = (email || '').toLowerCase().trim();
+    const cleanOtp = (otp || '').trim();
+
+    if (!normalizedEmail || !cleanOtp || cleanOtp.length !== 6) {
+      throw new BadRequestException('Please provide a valid 6-digit verification code.');
+    }
+
+    const otpKey = `otp:forgot:${normalizedEmail}`;
+    const stored = await this.redis.get(otpKey);
+
+    if (!stored) {
+      throw new BadRequestException('Password reset code has expired or was not requested. Please request a new code.');
+    }
+
+    let parsedOtp: { otp: string; attempts: number };
+    try {
+      parsedOtp = JSON.parse(stored);
+    } catch {
+      parsedOtp = { otp: stored, attempts: 0 };
+    }
+
+    if (parsedOtp.attempts >= 5) {
+      await this.redis.del(otpKey);
+      throw new BadRequestException('Too many invalid attempts. This reset code has been invalidated. Please request a new code.');
+    }
+
+    if (parsedOtp.otp !== cleanOtp) {
+      parsedOtp.attempts += 1;
+      const ttl = await this.redis.ttl(otpKey);
+      if (ttl > 0) {
+        await this.redis.set(otpKey, JSON.stringify(parsedOtp), 'EX', ttl);
+      }
+      const remaining = Math.max(0, 5 - parsedOtp.attempts);
+      throw new BadRequestException(`Invalid verification code. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`);
+    }
+
+    return {
+      success: true,
+      message: 'Verification code verified successfully',
+    };
+  }
+
+  /**
    * Reset Password with OTP Verification
    */
   async resetPassword(data: { email: string; otp: string; newPassword: string }) {

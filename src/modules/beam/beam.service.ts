@@ -139,7 +139,19 @@ export class BeamService implements OnModuleInit {
     const maxCameras = activeSub?.package?.maxConcurrentCameras ?? 0;
     let activeCamerasCount = 0;
     try {
-      activeCamerasCount = await this.redis.scard(`beam:active_cameras:${photographerId}`) || 0;
+      const sessionIds = await this.redis.smembers(`beam:active_cameras:${photographerId}`);
+      if (sessionIds && sessionIds.length > 0) {
+        const aliveSessions: string[] = [];
+        for (const sid of sessionIds) {
+          const isAlive = await this.redis.exists(`beam:session_meta:${sid}`);
+          if (isAlive) {
+            aliveSessions.push(sid);
+          } else {
+            await this.redis.srem(`beam:active_cameras:${photographerId}`, sid).catch(() => {});
+          }
+        }
+        activeCamerasCount = aliveSessions.length;
+      }
     } catch (_) {}
 
     return {
@@ -288,14 +300,16 @@ export class BeamService implements OnModuleInit {
       await this.syncToAllRedis(`auth:ftp:${username}`, '', 'del');
       await this.syncToAllRedis(`beam:auth:${username}`, '', 'del');
       await this.syncToAllRedis(`beam:storage:${photographerId}`, '', 'del');
+      await this.syncToAllRedis(`beam:active_cameras:${photographerId}`, '', 'del');
       await this.redis.del(`beam:event:files:${event.id}`).catch(() => {});
       if (this.oracleRedis && this.oracleRedis.status === 'ready') {
         try {
           await this.oracleRedis.del(`storage:photographer:${photographerId}`);
           await this.oracleRedis.del(`beam:event:files:${event.id}`);
+          await this.oracleRedis.del(`beam:active_cameras:${photographerId}`);
         } catch (err: any) {}
       }
-      this.logger.log(`[BeamService] Completely removed auth & storage cache for user ${username} from Redis`);
+      this.logger.log(`[BeamService] Completely removed auth, storage & active cameras cache for user ${username} from Redis`);
     }
   }
 

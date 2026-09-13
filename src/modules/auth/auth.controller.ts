@@ -24,6 +24,16 @@ export class AuthController {
     return this.authService.verifyAndSignup(body, { ipAddress, userAgent });
   }
 
+  @Post('forgot-password')
+  async forgotPassword(@Body() body: { email: string }) {
+    return this.authService.sendForgotPasswordOtp(body.email);
+  }
+
+  @Post('reset-password')
+  async resetPassword(@Body() body: { email: string; otp: string; newPassword: string }) {
+    return this.authService.resetPassword(body);
+  }
+
   @Post('login')
   async login(@Body() body: any, @Req() req: any) {
     const ipAddress = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.ip || req.socket?.remoteAddress || '127.0.0.1';

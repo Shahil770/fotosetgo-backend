@@ -1,4 +1,4 @@
-import { Injectable, ConflictException, UnauthorizedException, BadRequestException, Inject, Logger } from '@nestjs/common';
+import { Injectable, ConflictException, UnauthorizedException, BadRequestException, NotFoundException, Inject, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
@@ -208,6 +208,239 @@ export class AuthService {
       if (err instanceof BadRequestException || err instanceof ConflictException) throw err;
       throw new BadRequestException('Unable to deliver verification email. Please try again.');
     }
+  }
+
+  /**
+   * Send 6-Digit Email OTP for Password Reset via Resend API
+   */
+  async sendForgotPasswordOtp(email: string) {
+    const normalizedEmail = (email || '').toLowerCase().trim();
+    if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      throw new BadRequestException('Please enter a valid email address.');
+    }
+
+    // 1. Check if user exists with this email
+    const user = await this.prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+    if (!user) {
+      throw new NotFoundException('No account found with this email address.');
+    }
+
+    // 2. Rate limit cooldown (60 seconds between password reset requests)
+    const rateKey = `rate:forgot:otp:${normalizedEmail}`;
+    const isCoolingDown = await this.redis.get(rateKey);
+    if (isCoolingDown) {
+      const ttl = await this.redis.ttl(rateKey);
+      throw new BadRequestException(`Please wait ${ttl > 0 ? ttl : 60} seconds before requesting a new reset code.`);
+    }
+
+    // 3. Generate Cryptographic 6-digit numeric OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // 4. Store in Redis with 10 minutes (600s) TTL
+    const otpKey = `otp:forgot:${normalizedEmail}`;
+    await this.redis.set(otpKey, JSON.stringify({ otp, attempts: 0 }), 'EX', 600);
+    await this.redis.set(rateKey, '1', 'EX', 60);
+
+    // 5. Send Branded Email via Resend API
+    const resendApiKey = process.env.RESEND_API_KEY;
+    const fromEmail = process.env.RESEND_FROM_EMAIL || 'FotoSetGo <auth@fotosetgo.com>';
+
+    if (!resendApiKey) {
+      this.logger.error('[Resend] RESEND_API_KEY is not configured in .env');
+      throw new BadRequestException('Email service configuration error. Please contact support.');
+    }
+
+    const officialLogoUrl = await this.getOfficialLogoUrl();
+    const recipientName = user.name?.trim() || 'Photographer';
+    const emailHtml = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reset Your FotoSetGo Password</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #08090e; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #f3f4f6;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color: #08090e; padding: 40px 15px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" max-width="560px" style="max-width: 560px; background-color: #11141e; border: 1px solid #23283a; border-radius: 24px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.6);">
+          
+          <!-- Header Brand Banner with Official Logo -->
+          <tr>
+            <td style="padding: 32px 36px 24px; text-align: center; border-bottom: 1px solid #1c2230; background: linear-gradient(180deg, #181d2a 0%, #11141e 100%);">
+              <img src="${officialLogoUrl}" alt="FotoSetGo" style="height: 40px; max-width: 200px; object-fit: contain; display: block; margin: 0 auto;" />
+              <p style="margin: 10px 0 0; color: #9ca3af; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; font-weight: 700;">
+                AI Cloud Photography Platform
+              </p>
+            </td>
+          </tr>
+
+          <!-- Main Content -->
+          <tr>
+            <td style="padding: 36px 36px 28px;">
+              <h1 style="margin: 0 0 12px; color: #ffffff; font-size: 22px; font-weight: 800; text-align: center; letter-spacing: -0.5px;">
+                Reset Your Password
+              </h1>
+              <p style="margin: 0 0 24px; color: #9ca3af; font-size: 14px; line-height: 1.6; text-align: center;">
+                Hello <strong style="color: #f3f4f6;">${recipientName}</strong>, we received a request to reset the password for your <strong>FotoSetGo</strong> account. Use the 6-digit code below to set a new password:
+              </p>
+
+              <!-- OTP Code Display Card -->
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin: 28px 0;">
+                <tr>
+                  <td align="center">
+                    <div style="display: inline-block; background: #08090e; border: 2px solid #f59e0b; border-radius: 16px; padding: 18px 36px; text-align: center; box-shadow: 0 8px 24px rgba(245,158,11,0.15);">
+                      <span style="font-family: 'SF Mono', Consolas, Monaco, monospace; font-size: 36px; font-weight: 900; letter-spacing: 12px; color: #fbbf24; display: block; margin-left: 12px;">
+                        ${otp}
+                      </span>
+                    </div>
+                  </td>
+                </tr>
+              </table>
+
+              <!-- Notice Box -->
+              <div style="background-color: #171b29; border: 1px solid #283046; border-radius: 14px; padding: 16px; margin: 24px 0 12px; text-align: left;">
+                <p style="margin: 0 0 6px; font-size: 12px; color: #d1d5db; font-weight: 600;">
+                  ⏱️ <strong>Valid for 10 minutes:</strong> This reset code will expire soon for your account safety.
+                </p>
+                <p style="margin: 0; font-size: 11.5px; color: #6b7280; line-height: 1.5;">
+                  🔒 If you did not request a password reset, please ignore this email. Your password will remain unchanged.
+                </p>
+              </div>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 24px 36px; background-color: #0b0d14; border-top: 1px solid #1f2433; text-align: center;">
+              <p style="margin: 0 0 6px; color: #6b7280; font-size: 11px; font-weight: 600;">
+                FotoSetGo • Fast AI Photo Delivery for Professional Photographers
+              </p>
+              <p style="margin: 0; color: #4b5563; font-size: 10px;">
+                © 2026 FotoSetGo. All rights reserved. • <a href="https://fotosetgo.com" style="color: #9ca3af; text-decoration: none;">fotosetgo.com</a>
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`;
+
+    try {
+      const resendResponse = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${resendApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: fromEmail,
+          to: [normalizedEmail],
+          subject: `${otp} is your FotoSetGo Password Reset code`,
+          html: emailHtml,
+        }),
+      });
+
+      const resendData = await resendResponse.json();
+
+      if (!resendResponse.ok) {
+        this.logger.error(`[Resend] Failed to send password reset OTP: ${JSON.stringify(resendData)}`);
+        throw new BadRequestException(resendData.message || 'Failed to deliver password reset email. Please check your email address.');
+      }
+
+      this.logger.log(`[AuthService] Password reset OTP dispatched to ${normalizedEmail} (ID: ${resendData.id})`);
+
+      return {
+        success: true,
+        message: `Password reset code sent to ${normalizedEmail}`,
+        email: normalizedEmail,
+      };
+    } catch (err: any) {
+      this.logger.error(`[AuthService] Error sending password reset OTP: ${err.message}`);
+      if (err instanceof BadRequestException || err instanceof NotFoundException) throw err;
+      throw new BadRequestException('Unable to deliver password reset email. Please try again.');
+    }
+  }
+
+  /**
+   * Reset Password with OTP Verification
+   */
+  async resetPassword(data: { email: string; otp: string; newPassword: string }) {
+    const normalizedEmail = (data.email || '').toLowerCase().trim();
+    const cleanOtp = (data.otp || '').trim();
+    const cleanPassword = (data.newPassword || '').trim();
+
+    if (!normalizedEmail || !cleanOtp || cleanOtp.length !== 6) {
+      throw new BadRequestException('Please provide a valid email and 6-digit verification code.');
+    }
+
+    if (!cleanPassword || cleanPassword.length < 6) {
+      throw new BadRequestException('Password must be at least 6 characters long.');
+    }
+
+    // 1. Verify user exists
+    const user = await this.prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+    if (!user) {
+      throw new NotFoundException('No account found with this email address.');
+    }
+
+    // 2. Fetch OTP from Redis
+    const otpKey = `otp:forgot:${normalizedEmail}`;
+    const stored = await this.redis.get(otpKey);
+
+    if (!stored) {
+      throw new BadRequestException('Password reset code has expired or was not requested. Please request a new code.');
+    }
+
+    let parsedOtp: { otp: string; attempts: number };
+    try {
+      parsedOtp = JSON.parse(stored);
+    } catch {
+      parsedOtp = { otp: stored, attempts: 0 };
+    }
+
+    // Check brute-force attempts
+    if (parsedOtp.attempts >= 5) {
+      await this.redis.del(otpKey);
+      throw new BadRequestException('Too many invalid attempts. This reset code has been invalidated. Please request a new code.');
+    }
+
+    if (parsedOtp.otp !== cleanOtp) {
+      parsedOtp.attempts += 1;
+      const ttl = await this.redis.ttl(otpKey);
+      if (ttl > 0) {
+        await this.redis.set(otpKey, JSON.stringify(parsedOtp), 'EX', ttl);
+      }
+      const remaining = Math.max(0, 5 - parsedOtp.attempts);
+      throw new BadRequestException(`Invalid verification code. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`);
+    }
+
+    // 3. Hash new password & update in database
+    const hashedPassword = await bcrypt.hash(cleanPassword, 10);
+    await this.prisma.user.update({
+      where: { email: normalizedEmail },
+      data: { passwordHash: hashedPassword },
+    });
+
+    // 4. Delete used OTP from Redis
+    await this.redis.del(otpKey);
+    await this.redis.del(`rate:forgot:otp:${normalizedEmail}`);
+
+    this.logger.log(`[AuthService] Password reset completed successfully for ${normalizedEmail}`);
+
+    return {
+      success: true,
+      message: 'Your password has been reset successfully. You can now log in with your new password.',
+    };
   }
 
   /**

@@ -126,6 +126,22 @@ export class BeamService implements OnModuleInit {
       });
     }
 
+    const currentCycle = this.getCurrentCycle();
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { id: photographerId },
+      select: { beamFtpPhotosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
+    });
+    let usedPhotos = photographer?.beamFtpPhotosUsedThisMonth || 0;
+    if (photographer?.beamFtpPhotosBillingCycle !== currentCycle) {
+      usedPhotos = 0;
+    }
+    const maxPhotos = activeSub?.package?.maxBeamFtpPhotos ?? 0;
+    const maxCameras = activeSub?.package?.maxConcurrentCameras ?? 0;
+    let activeCamerasCount = 0;
+    try {
+      activeCamerasCount = await this.redis.scard(`beam:active_cameras:${photographerId}`) || 0;
+    } catch (_) {}
+
     return {
       host,
       port,
@@ -137,7 +153,18 @@ export class BeamService implements OnModuleInit {
       lastCameraConnectedAt: event.lastCameraConnectedAt,
       lastCameraModel: event.lastCameraModel,
       hasBeamPlanAccess: hasBeam,
+      maxBeamFtpPhotos: maxPhotos,
+      beamFtpPhotosUsedThisMonth: usedPhotos,
+      maxConcurrentCameras: maxCameras,
+      activeCamerasCount,
     };
+  }
+
+  getCurrentCycle(): string {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    return `${year}_${month}`;
   }
 
   private async syncEventAuthToRedis(photographerId: string, event: any, enabled: boolean) {
@@ -276,7 +303,7 @@ export class BeamService implements OnModuleInit {
     return updated;
   }
 
-  async verifyCredentials(username: string, password: string) {
+  async verifyCredentials(username: string, password: string, sessionId?: string) {
     const event = await this.prisma.event.findFirst({
       where: { ftpUsername: username, isDeleted: false },
     });
@@ -295,6 +322,51 @@ export class BeamService implements OnModuleInit {
       return { valid: false, message: 'Beam session has expired after 4 hours' };
     }
 
+    // 1. Check Package Plan & Concurrent Camera limits
+    const activeSub = await this.prisma.subscription.findFirst({
+      where: { photographerId: event.photographerId, status: 'ACTIVE' },
+      include: { package: true },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const hasBeamFeature = activeSub?.package ? activeSub.package.featureBeamLiveCamera : false;
+    if (!hasBeamFeature) {
+      return { valid: false, message: 'Beam Live Camera is not enabled on your subscription plan.' };
+    }
+
+    const maxConcurrentCameras = activeSub?.package?.maxConcurrentCameras ?? 0;
+    if (maxConcurrentCameras <= 0) {
+      return { valid: false, message: 'Live Camera Tethering limit is 0 on your plan. Please upgrade.' };
+    }
+
+    // 2. Check Monthly FTP Photo Quota
+    const currentCycle = this.getCurrentCycle();
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { id: event.photographerId },
+      select: { beamFtpPhotosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
+    });
+    let usedPhotos = photographer?.beamFtpPhotosUsedThisMonth || 0;
+    if (photographer?.beamFtpPhotosBillingCycle !== currentCycle) {
+      usedPhotos = 0;
+    }
+    const maxBeamFtpPhotos = activeSub?.package?.maxBeamFtpPhotos ?? 0;
+    if (maxBeamFtpPhotos > 0 && usedPhotos >= maxBeamFtpPhotos) {
+      return { valid: false, message: `Monthly Beam FTP photo limit (${maxBeamFtpPhotos}) reached for this billing cycle.` };
+    }
+
+    // 3. Check Live Concurrent Connected Cameras across studio in Redis
+    let activeCamerasCount = 0;
+    try {
+      activeCamerasCount = await this.redis.scard(`beam:active_cameras:${event.photographerId}`) || 0;
+    } catch (_) {}
+
+    if (maxConcurrentCameras > 0 && activeCamerasCount >= maxConcurrentCameras) {
+      return {
+        valid: false,
+        message: `Maximum simultaneous camera connections limit (${maxConcurrentCameras}) reached for your studio account.`
+      };
+    }
+
     const breakdown = await this.storageService.getStorageBreakdown(event.photographerId);
     const limitBytes = BigInt(breakdown.limitEventsBytes || 5242880000);
     const usedBytes = BigInt(breakdown.eventsBytes || 0);
@@ -309,8 +381,34 @@ export class BeamService implements OnModuleInit {
       beamEnabled: event.beamEnabled,
       ftpPassword: event.ftpPassword,
       beamUploadMode: event.beamUploadMode || 'PHOTOS_ONLY',
-      storageRemainingBytes: remainingBytes.toString()
+      storageRemainingBytes: remainingBytes.toString(),
+      maxConcurrentCameras,
+      activeCamerasCount,
+      maxBeamFtpPhotos,
+      beamFtpPhotosUsedThisMonth: usedPhotos,
     };
+  }
+
+  async registerCameraSession(photographerId: string, sessionId: string, eventId: string) {
+    try {
+      await this.redis.sadd(`beam:active_cameras:${photographerId}`, sessionId);
+      await this.redis.set(`beam:session_meta:${sessionId}`, JSON.stringify({ photographerId, eventId, connectedAt: new Date().toISOString() }), 'EX', 86400);
+      this.logger.log(`[BeamService] Registered live camera session ${sessionId} for photographer ${photographerId}`);
+    } catch (err: any) {
+      this.logger.warn(`[BeamService] Failed to register camera session: ${err.message}`);
+    }
+    return { success: true };
+  }
+
+  async deregisterCameraSession(photographerId: string, sessionId: string) {
+    try {
+      await this.redis.srem(`beam:active_cameras:${photographerId}`, sessionId);
+      await this.redis.del(`beam:session_meta:${sessionId}`);
+      this.logger.log(`[BeamService] Deregistered camera session ${sessionId} for photographer ${photographerId}`);
+    } catch (err: any) {
+      this.logger.warn(`[BeamService] Failed to deregister camera session: ${err.message}`);
+    }
+    return { success: true };
   }
 
   async regeneratePin(photographerId: string, eventId: string) {
@@ -335,7 +433,6 @@ export class BeamService implements OnModuleInit {
 
     if (updated.beamEnabled) {
       await this.syncEventAuthToRedis(photographerId, updated, true);
-      this.logger.log(`[BeamService] Updated upload mode to ${mode} for event ${eventId}`);
     }
 
     return updated;
@@ -351,6 +448,30 @@ export class BeamService implements OnModuleInit {
     cameraModel?: string;
     duration?: number;
   }) {
+    // 1. Quota increment and billing cycle check
+    const currentCycle = this.getCurrentCycle();
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { id: payload.photographerId },
+      select: { beamFtpPhotosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
+    });
+
+    if (photographer?.beamFtpPhotosBillingCycle !== currentCycle) {
+      await this.prisma.photographer.update({
+        where: { id: payload.photographerId },
+        data: {
+          beamFtpPhotosUsedThisMonth: 1,
+          beamFtpPhotosBillingCycle: currentCycle
+        }
+      });
+    } else {
+      await this.prisma.photographer.update({
+        where: { id: payload.photographerId },
+        data: {
+          beamFtpPhotosUsedThisMonth: { increment: 1 }
+        }
+      });
+    }
+
     const photoId = uuidv4();
     const fileSizeBigInt = BigInt(payload.fileSize || 0);
     const isVideo = payload.mimeType?.startsWith('video/') || payload.filenameOriginal?.match(/\.(mp4|mov|mkv|webm)$/i);
@@ -369,6 +490,7 @@ export class BeamService implements OnModuleInit {
         type: isVideo ? 'VIDEO' : 'IMAGE',
         duration: payload.duration || 0,
         status: 'READY' as any,
+        uploadSource: 'FTP_BEAM',
       },
     });
 

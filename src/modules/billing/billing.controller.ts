@@ -201,7 +201,9 @@ export class BillingController {
           featureWatermark: boolean;
           featureBeamLiveCamera?: boolean;
           featureBulkDownload?: boolean;
-        }
+        };
+        maxBeamFtpPhotos?: number;
+        maxConcurrentCameras?: number;
       }>
     }
   ) {
@@ -240,6 +242,8 @@ export class BillingController {
           featureWatermark: plan.features.featureWatermark,
           featureBeamLiveCamera: plan.features.featureBeamLiveCamera ?? false,
           featureBulkDownload: plan.features.featureBulkDownload ?? false,
+          maxBeamFtpPhotos: plan.maxBeamFtpPhotos !== undefined ? Number(plan.maxBeamFtpPhotos) : undefined,
+          maxConcurrentCameras: plan.maxConcurrentCameras !== undefined ? Number(plan.maxConcurrentCameras) : undefined,
         }
       });
 

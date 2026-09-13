@@ -32,8 +32,18 @@ export class BeamController {
   }
 
   @Post('internal/verify-credentials')
-  async verifyCredentials(@Body() body: { username: string; password: string }) {
-    return this.beamService.verifyCredentials(body.username, body.password);
+  async verifyCredentials(@Body() body: { username: string; password: string; sessionId?: string }) {
+    return this.beamService.verifyCredentials(body.username, body.password, body.sessionId);
+  }
+
+  @Post('internal/camera-connected')
+  async handleCameraConnected(@Body() body: { photographerId: string; sessionId: string; eventId: string }) {
+    return this.beamService.registerCameraSession(body.photographerId, body.sessionId, body.eventId);
+  }
+
+  @Post('internal/camera-disconnected')
+  async handleCameraDisconnected(@Body() body: { photographerId: string; sessionId: string }) {
+    return this.beamService.deregisterCameraSession(body.photographerId, body.sessionId);
   }
 
   @Post('internal/photo-ingested')
@@ -41,3 +51,4 @@ export class BeamController {
     return this.beamService.handlePhotoIngested(body);
   }
 }
+

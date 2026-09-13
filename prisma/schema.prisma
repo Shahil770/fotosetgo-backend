@@ -123,6 +123,8 @@ model Photographer {
   autoBackupToDrive          Boolean        @default(false)  // Auto backup all events to Google Drive
   driveBackupFullNotified    Boolean        @default(false)  // Drive full notification sent
   videoFaceScanningEnabled   Boolean        @default(false)
+  beamFtpPhotosUsedThisMonth Int            @default(0)      // Permanent monthly Beam FTP uploaded photos count
+  beamFtpPhotosBillingCycle  String?                         // Billing month tag e.g. "2026_09" for automatic reset
   creditBalance              Int            @default(0) // credit balance in Paise (10 paise per photo, 50 paise per video minute)
   walletCashBalance          Int            @default(0) // Permanent Studio Cash balance in Paise (Never expires, usable on checkout)
   referralCode               String?        @unique
@@ -170,6 +172,8 @@ model Package {
   featureWatermark            Boolean        @default(false)
   featureBeamLiveCamera       Boolean        @default(false)
   featureBulkDownload         Boolean        @default(false)
+  maxBeamFtpPhotos            Int            @default(0)     // Monthly Beam FTP photos limit (0 = disabled, e.g. 5000)
+  maxConcurrentCameras        Int            @default(0)     // Max simultaneous active cameras across studio (0 = disabled, e.g. 1, 2)
 
   // MULTI-YEAR & 2-CATEGORY DISCOUNT PERCENTAGES
   firstTimeDiscount1Yr        Int            @default(0)     // First-time buyer 1-Year %
@@ -360,6 +364,7 @@ model Photo {
   faceCount        Int                 @default(0)
   isDeleted        Boolean             @default(false)
   deletedAt        DateTime?
+  uploadSource     String              @default("WEB") // "FTP_BEAM", "WEB", "GUEST_QR"
   isGuestUpload    Boolean             @default(false)
   backedUpToDrive  Boolean             @default(false)  // Has been uploaded to Google Drive
   driveFileId      String?                               // Google Drive file ID reference

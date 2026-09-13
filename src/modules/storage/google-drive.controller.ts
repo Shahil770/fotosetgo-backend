@@ -18,6 +18,15 @@ export class GoogleDriveController {
   @Get('auth-url')
   async getAuthUrl(@Req() req: any) {
     const photographerId = req.user.photographer?.id || req.user.id;
+    const activeSub = await this.prisma.subscription.findFirst({
+      where: { photographerId, status: 'ACTIVE' },
+      include: { package: true },
+      orderBy: { createdAt: 'desc' }
+    });
+    const hasAutoBackup = activeSub?.package ? activeSub.package.featureAutoDriveBackup : false;
+    if (!hasAutoBackup) {
+      throw new ForbiddenException('Google Drive integration is only available on PRO plans.');
+    }
     const url = this.googleDriveService.getAuthUrl(photographerId);
     return { url };
   }

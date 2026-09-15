@@ -12,7 +12,7 @@ export class BillingController {
     private billingService: BillingService,
     private prismaService: PrismaService,
     @Inject('REDIS_CLIENT') private redis: Redis,
-  ) {}
+  ) { }
 
   @Get('plans')
   async getPlans() {
@@ -203,6 +203,7 @@ export class BillingController {
           featureBulkDownload?: boolean;
         };
         maxBeamFtpPhotos?: number;
+        maxBeamFtpVideos?: number;
         maxConcurrentCameras?: number;
       }>
     }
@@ -243,6 +244,7 @@ export class BillingController {
           featureBeamLiveCamera: plan.features.featureBeamLiveCamera ?? false,
           featureBulkDownload: plan.features.featureBulkDownload ?? false,
           maxBeamFtpPhotos: plan.maxBeamFtpPhotos !== undefined ? Number(plan.maxBeamFtpPhotos) : undefined,
+          maxBeamFtpVideos: plan.maxBeamFtpVideos !== undefined ? Number(plan.maxBeamFtpVideos) : undefined,
           maxConcurrentCameras: plan.maxConcurrentCameras !== undefined ? Number(plan.maxConcurrentCameras) : undefined,
         }
       });
@@ -253,7 +255,7 @@ export class BillingController {
         if (userKeys && userKeys.length > 0) {
           await this.redis.del(...userKeys);
         }
-      } catch (_) {}
+      } catch (_) { }
 
       // Synchronize all active subscriptions tied to this package
       await this.prismaService.subscription.updateMany({
@@ -357,11 +359,34 @@ export class BillingController {
 
   @UseGuards(JwtAuthGuard)
   @Get('credits/history')
-  async getCreditHistory(@CurrentUser() user: any) {
-    return this.prismaService.creditTransaction.findMany({
-      where: { photographerId: user.photographer.id },
-      orderBy: { createdAt: 'desc' }
-    });
+  async getCreditHistory(
+    @CurrentUser() user: any,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const pageNum = Math.max(1, parseInt(page || '1', 10));
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit || '20', 10)));
+    const skip = (pageNum - 1) * limitNum;
+
+    const [data, total] = await Promise.all([
+      this.prismaService.creditTransaction.findMany({
+        where: { photographerId: user.photographer.id },
+        orderBy: { createdAt: 'desc' },
+        take: limitNum,
+        skip,
+      }),
+      this.prismaService.creditTransaction.count({
+        where: { photographerId: user.photographer.id },
+      }),
+    ]);
+
+    return {
+      data,
+      total,
+      page: pageNum,
+      limit: limitNum,
+      hasMore: skip + data.length < total,
+    };
   }
 
   @UseGuards(AdminGuard)

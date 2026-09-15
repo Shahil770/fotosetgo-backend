@@ -388,6 +388,8 @@ export class StorageService implements OnModuleInit {
         fileSize: BigInt(data.fileSize),
         status: 'UPLOADING',
         type: isVideo ? 'VIDEO' : 'IMAGE',
+        uploadSource: 'WEB',
+        isGuestUpload: false,
         uploadBatchId: data.uploadBatchId || undefined,
       },
     });
@@ -541,6 +543,8 @@ export class StorageService implements OnModuleInit {
         fileSize: BigInt(f.fileSize),
         status: 'UPLOADING',
         type: f.isVideo ? 'VIDEO' : 'IMAGE',
+        uploadSource: 'WEB',
+        isGuestUpload: false,
         uploadBatchId,
       }))
     });
@@ -889,6 +893,7 @@ export class StorageService implements OnModuleInit {
         fileSize: BigInt(data.fileSize),
         status: 'PENDING_APPROVAL',
         type: isVideo ? 'VIDEO' : 'IMAGE',
+        uploadSource: 'GUEST_QR',
         isGuestUpload: true
       },
     });
@@ -1405,13 +1410,28 @@ export class StorageService implements OnModuleInit {
       const videoSignedUrl = await getSignedUrl(this.s3Client, getCmd, { expiresIn: 3600 });
 
       // 2. Check if client-side actually generated and uploaded a valid thumbnail
-      const hasValidClientThumb = currentVideo.thumbSizeBytes && Number(currentVideo.thumbSizeBytes) > 0;
-      if (hasValidClientThumb && currentVideo.r2KeyThumb) {
+      let hasValidClientThumb = currentVideo.thumbSizeBytes && Number(currentVideo.thumbSizeBytes) > 0;
+      let videoThumbSize = Number(currentVideo.thumbSizeBytes || 0);
+
+      // If uploaded from browser (WEB or GUEST_QR), verify if thumbnail already exists on R2
+      if (!hasValidClientThumb && currentVideo.r2KeyThumb && currentVideo.uploadSource !== 'FTP_BEAM') {
+        try {
+          const headCmd = new HeadObjectCommand({ Bucket: this.bucketName, Key: currentVideo.r2KeyThumb });
+          const headRes = await this.s3Client.send(headCmd);
+          if (headRes.ContentLength && headRes.ContentLength > 0) {
+            hasValidClientThumb = true;
+            actualThumbKey = currentVideo.r2KeyThumb;
+            videoThumbSize = Number(headRes.ContentLength);
+            this.logger.log(`[VideoProcessing] Verified client thumb exists on R2 for video ${photoId} (Source: ${currentVideo.uploadSource || 'WEB'}): ${actualThumbKey} (${videoThumbSize} bytes)`);
+          }
+        } catch (_) {
+          // Thumbnail not present on R2
+        }
+      } else if (hasValidClientThumb && currentVideo.r2KeyThumb) {
         actualThumbKey = currentVideo.r2KeyThumb;
-        this.logger.log(`[VideoProcessing] Using verified client thumb for video ${photoId}: ${actualThumbKey}`);
+        this.logger.log(`[VideoProcessing] Using verified client thumb for video ${photoId} (Source: ${currentVideo.uploadSource || 'WEB'}): ${actualThumbKey}`);
       }
 
-      let videoThumbSize = 0;
       if (!actualThumbKey) {
         try {
           const thumbnailEngineUrl = process.env.THUMBNAIL_ENGINE_URL;

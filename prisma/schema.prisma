@@ -124,6 +124,7 @@ model Photographer {
   driveBackupFullNotified    Boolean        @default(false)  // Drive full notification sent
   videoFaceScanningEnabled   Boolean        @default(false)
   beamFtpPhotosUsedThisMonth Int            @default(0)      // Permanent monthly Beam FTP uploaded photos count
+  beamFtpVideosUsedThisMonth Int            @default(0)      // Permanent monthly Beam FTP uploaded videos count
   beamFtpPhotosBillingCycle  String?                         // Billing month tag e.g. "2026_09" for automatic reset
   creditBalance              Int            @default(0) // credit balance in Paise (10 paise per photo, 50 paise per video minute)
   walletCashBalance          Int            @default(0) // Permanent Studio Cash balance in Paise (Never expires, usable on checkout)
@@ -173,6 +174,7 @@ model Package {
   featureBeamLiveCamera       Boolean        @default(false)
   featureBulkDownload         Boolean        @default(false)
   maxBeamFtpPhotos            Int            @default(0)     // Monthly Beam FTP photos limit (0 = disabled, e.g. 5000)
+  maxBeamFtpVideos            Int            @default(0)     // Monthly Beam FTP video limit (0 = disabled, e.g. 50)
   maxConcurrentCameras        Int            @default(0)     // Max simultaneous active cameras across studio (0 = disabled, e.g. 1, 2)
 
   // MULTI-YEAR & 2-CATEGORY DISCOUNT PERCENTAGES

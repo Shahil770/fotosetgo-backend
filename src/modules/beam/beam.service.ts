@@ -129,13 +129,16 @@ export class BeamService implements OnModuleInit {
     const currentCycle = this.getCurrentCycle();
     const photographer = await this.prisma.photographer.findUnique({
       where: { id: photographerId },
-      select: { beamFtpPhotosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
+      select: { beamFtpPhotosUsedThisMonth: true, beamFtpVideosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
     });
     let usedPhotos = photographer?.beamFtpPhotosUsedThisMonth || 0;
+    let usedVideos = photographer?.beamFtpVideosUsedThisMonth || 0;
     if (photographer?.beamFtpPhotosBillingCycle !== currentCycle) {
       usedPhotos = 0;
+      usedVideos = 0;
     }
     const maxPhotos = activeSub?.package?.maxBeamFtpPhotos ?? 0;
+    const maxVideos = activeSub?.package?.maxBeamFtpVideos ?? 0;
     const maxCameras = activeSub?.package?.maxConcurrentCameras ?? 0;
     let activeCamerasCount = 0;
     const activeDevices: Array<{
@@ -179,6 +182,8 @@ export class BeamService implements OnModuleInit {
       hasBeamPlanAccess: hasBeam,
       maxBeamFtpPhotos: maxPhotos,
       beamFtpPhotosUsedThisMonth: usedPhotos,
+      maxBeamFtpVideos: maxVideos,
+      beamFtpVideosUsedThisMonth: usedVideos,
       maxConcurrentCameras: maxCameras,
       activeCamerasCount,
       activeDevices,
@@ -209,17 +214,20 @@ export class BeamService implements OnModuleInit {
         orderBy: { createdAt: 'desc' }
       });
       const maxBeamFtpPhotos = activeSub?.package?.maxBeamFtpPhotos ?? 0;
+      const maxBeamFtpVideos = activeSub?.package?.maxBeamFtpVideos ?? 0;
       const maxConcurrentCameras = activeSub?.package?.maxConcurrentCameras ?? 0;
       const hasBeamPlanAccess = activeSub?.package ? activeSub.package.featureBeamLiveCamera : false;
 
       const currentCycle = this.getCurrentCycle();
       const photographer = await this.prisma.photographer.findUnique({
         where: { id: photographerId },
-        select: { beamFtpPhotosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
+        select: { beamFtpPhotosUsedThisMonth: true, beamFtpVideosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
       });
       let usedPhotos = photographer?.beamFtpPhotosUsedThisMonth || 0;
+      let usedVideos = photographer?.beamFtpVideosUsedThisMonth || 0;
       if (photographer?.beamFtpPhotosBillingCycle !== currentCycle) {
         usedPhotos = 0;
+        usedVideos = 0;
       }
 
       const authData = JSON.stringify({
@@ -239,9 +247,11 @@ export class BeamService implements OnModuleInit {
         storageUsedBytes: usedBytes.toString(),
         storageRemainingBytes: remainingBytes.toString(),
         maxBeamFtpPhotos,
+        maxBeamFtpVideos,
         maxConcurrentCameras,
         hasBeamPlanAccess,
         beamFtpPhotosUsedThisMonth: usedPhotos,
+        beamFtpVideosUsedThisMonth: usedVideos,
         expiresAt: event.beamExpiresAt ? new Date(event.beamExpiresAt).toISOString() : undefined,
         updatedAt: new Date().toISOString()
       });
@@ -392,18 +402,21 @@ export class BeamService implements OnModuleInit {
       return { valid: false, message: 'Live Camera Tethering limit is 0 on your plan. Please upgrade.' };
     }
 
-    // 2. Check Monthly FTP Photo Quota
+    // 2. Check Monthly FTP Quota (Photos / Videos)
     const currentCycle = this.getCurrentCycle();
     const photographer = await this.prisma.photographer.findUnique({
       where: { id: event.photographerId },
-      select: { beamFtpPhotosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
+      select: { beamFtpPhotosUsedThisMonth: true, beamFtpVideosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
     });
     let usedPhotos = photographer?.beamFtpPhotosUsedThisMonth || 0;
+    let usedVideos = photographer?.beamFtpVideosUsedThisMonth || 0;
     if (photographer?.beamFtpPhotosBillingCycle !== currentCycle) {
       usedPhotos = 0;
+      usedVideos = 0;
     }
     const maxBeamFtpPhotos = activeSub?.package?.maxBeamFtpPhotos ?? 0;
-    if (maxBeamFtpPhotos > 0 && usedPhotos >= maxBeamFtpPhotos) {
+    const maxBeamFtpVideos = activeSub?.package?.maxBeamFtpVideos ?? 0;
+    if (maxBeamFtpPhotos > 0 && usedPhotos >= maxBeamFtpPhotos && event.beamUploadMode === 'PHOTOS_ONLY') {
       return { valid: false, message: `Monthly Beam FTP photo limit (${maxBeamFtpPhotos}) reached for this billing cycle.` };
     }
 
@@ -439,6 +452,8 @@ export class BeamService implements OnModuleInit {
       activeCamerasCount,
       maxBeamFtpPhotos,
       beamFtpPhotosUsedThisMonth: usedPhotos,
+      maxBeamFtpVideos,
+      beamFtpVideosUsedThisMonth: usedVideos,
     };
   }
 
@@ -518,41 +533,57 @@ export class BeamService implements OnModuleInit {
     cameraModel?: string;
     duration?: number;
   }) {
+    const isVideo = payload.mimeType?.startsWith('video/') || payload.filenameOriginal?.match(/\.(mp4|mov|mkv|webm)$/i);
+
     // 1. Quota increment and billing cycle check
     const currentCycle = this.getCurrentCycle();
     const photographer = await this.prisma.photographer.findUnique({
       where: { id: payload.photographerId },
-      select: { beamFtpPhotosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
+      select: { beamFtpPhotosUsedThisMonth: true, beamFtpVideosUsedThisMonth: true, beamFtpPhotosBillingCycle: true }
     });
 
     if (photographer?.beamFtpPhotosBillingCycle !== currentCycle) {
       await this.prisma.photographer.update({
         where: { id: payload.photographerId },
         data: {
-          beamFtpPhotosUsedThisMonth: 1,
+          beamFtpPhotosUsedThisMonth: isVideo ? 0 : 1,
+          beamFtpVideosUsedThisMonth: isVideo ? 1 : 0,
           beamFtpPhotosBillingCycle: currentCycle
         }
       });
-      await this.redis.set(`beam:photographer:used:${payload.photographerId}:${currentCycle}`, '1').catch(() => {});
-      if (this.oracleRedis && this.oracleRedis.status === 'ready') {
-        await this.oracleRedis.set(`beam:photographer:used:${payload.photographerId}:${currentCycle}`, '1').catch(() => {});
+      if (isVideo) {
+        await this.syncToAllRedis(`beam:photographer:videos_used:${payload.photographerId}:${currentCycle}`, '1', 'set');
+      } else {
+        await this.syncToAllRedis(`beam:photographer:used:${payload.photographerId}:${currentCycle}`, '1', 'set');
       }
     } else {
-      await this.prisma.photographer.update({
-        where: { id: payload.photographerId },
-        data: {
-          beamFtpPhotosUsedThisMonth: { increment: 1 }
+      if (isVideo) {
+        await this.prisma.photographer.update({
+          where: { id: payload.photographerId },
+          data: {
+            beamFtpVideosUsedThisMonth: { increment: 1 }
+          }
+        });
+        await this.redis.incr(`beam:photographer:videos_used:${payload.photographerId}:${currentCycle}`).catch(() => {});
+        if (this.oracleRedis && this.oracleRedis.status === 'ready') {
+          await this.oracleRedis.incr(`beam:photographer:videos_used:${payload.photographerId}:${currentCycle}`).catch(() => {});
         }
-      });
-      await this.redis.incr(`beam:photographer:used:${payload.photographerId}:${currentCycle}`).catch(() => {});
-      if (this.oracleRedis && this.oracleRedis.status === 'ready') {
-        await this.oracleRedis.incr(`beam:photographer:used:${payload.photographerId}:${currentCycle}`).catch(() => {});
+      } else {
+        await this.prisma.photographer.update({
+          where: { id: payload.photographerId },
+          data: {
+            beamFtpPhotosUsedThisMonth: { increment: 1 }
+          }
+        });
+        await this.redis.incr(`beam:photographer:used:${payload.photographerId}:${currentCycle}`).catch(() => {});
+        if (this.oracleRedis && this.oracleRedis.status === 'ready') {
+          await this.oracleRedis.incr(`beam:photographer:used:${payload.photographerId}:${currentCycle}`).catch(() => {});
+        }
       }
     }
 
     const photoId = uuidv4();
     const fileSizeBigInt = BigInt(payload.fileSize || 0);
-    const isVideo = payload.mimeType?.startsWith('video/') || payload.filenameOriginal?.match(/\.(mp4|mov|mkv|webm)$/i);
 
     const photo = await this.prisma.photo.create({
       data: {

@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Put, Delete, Body, Param, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Put, Delete, Body, Param, Query, UseGuards } from '@nestjs/common';
 import { EventsService } from './events.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -14,8 +14,19 @@ export class EventsController {
   }
 
   @Get()
-  async findAll(@CurrentUser() user: any) {
-    return this.eventsService.findAll(user.photographer.id);
+  async findAll(
+    @CurrentUser() user: any,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('search') search?: string,
+    @Query('status') status?: string,
+  ) {
+    return this.eventsService.findAll(user.photographer.id, {
+      page: page ? parseInt(page, 10) : undefined,
+      limit: limit ? parseInt(limit, 10) : undefined,
+      search,
+      status,
+    });
   }
 
   @Get(':id')

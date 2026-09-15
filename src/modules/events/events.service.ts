@@ -13,7 +13,8 @@ export class EventsService {
 
   private async invalidateCache(photographerId: string, eventId?: string) {
     try {
-      const keys = [`cache:events:list:${photographerId}`];
+      const listKeys = await this.redis.keys(`cache:events:list:${photographerId}*`);
+      const keys = [...listKeys];
       if (eventId) {
         keys.push(`cache:event:detail:${eventId}`);
         // Fetch event slug and ftpUsername to clear public caches and Beam credentials
@@ -27,7 +28,9 @@ export class EventsService {
           keys.push(`beam:auth:${event.ftpUsername}`);
         }
       }
-      await this.redis.del(...keys);
+      if (keys.length > 0) {
+        await this.redis.del(...keys);
+      }
     } catch (err) {
       console.error('[EventsService] Failed to invalidate Redis cache:', err);
     }
@@ -75,8 +78,17 @@ export class EventsService {
     return event;
   }
 
-  async findAll(photographerId: string) {
-    const cacheKey = `cache:events:list:${photographerId}`;
+  async findAll(
+    photographerId: string,
+    query?: { page?: number; limit?: number; search?: string; status?: string }
+  ) {
+    const page = Math.max(1, query?.page || 1);
+    const limit = Math.min(Math.max(1, query?.limit || 12), 50);
+    const skip = (page - 1) * limit;
+    const search = query?.search?.trim() || '';
+    const status = query?.status?.toUpperCase();
+
+    const cacheKey = `cache:events:list:${photographerId}:${page}:${limit}:${search}:${status || ''}`;
     try {
       const cached = await this.redis.get(cacheKey);
       if (cached) return JSON.parse(cached);
@@ -84,10 +96,48 @@ export class EventsService {
       console.error('[EventsService] Redis get failed inside findAll:', err);
     }
 
-    const [events, storageGroup, typeGroup] = await Promise.all([
+    const where: any = {
+      photographerId,
+      isDeleted: false,
+    };
+
+    const conditions: any[] = [];
+
+    if (search) {
+      conditions.push({
+        OR: [
+          { title: { contains: search, mode: 'insensitive' } },
+          { location: { contains: search, mode: 'insensitive' } },
+          { slug: { contains: search, mode: 'insensitive' } },
+        ],
+      });
+    }
+
+    if (status === 'PUBLISHED') {
+      conditions.push({
+        status: 'PUBLISHED',
+        visibility: { not: 'PRIVATE' },
+      });
+    } else if (status === 'DRAFT') {
+      conditions.push({
+        OR: [
+          { status: 'DRAFT' },
+          { visibility: 'PRIVATE' },
+        ],
+      });
+    }
+
+    if (conditions.length > 0) {
+      where.AND = conditions;
+    }
+
+    const [total, events] = await Promise.all([
+      this.prisma.event.count({ where }),
       this.prisma.event.findMany({
-        where: { photographerId, isDeleted: false },
+        where,
         orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
         include: {
           _count: {
             select: { photos: { where: { isDeleted: false } } },
@@ -95,22 +145,31 @@ export class EventsService {
           photos: {
             where: { isDeleted: false },
             orderBy: { createdAt: 'desc' },
-            take: 1,
-            select: { id: true, r2KeyThumb: true, r2KeyPreview: true, r2KeyOriginal: true },
+            take: 5,
+            select: { id: true, r2KeyThumb: true, r2KeyPreview: true, r2KeyOriginal: true, type: true },
           },
         },
       }),
-      this.prisma.photo.groupBy({
-        by: ['eventId'],
-        where: { photographerId, isDeleted: false },
-        _sum: { fileSize: true, thumbSizeBytes: true, previewSizeBytes: true },
-      }),
-      this.prisma.photo.groupBy({
-        by: ['eventId', 'type'],
-        where: { photographerId, isDeleted: false },
-        _count: { id: true },
-      }),
     ]);
+
+    const eventIds = events.map((e) => e.id);
+    let storageGroup: any[] = [];
+    let typeGroup: any[] = [];
+
+    if (eventIds.length > 0) {
+      [storageGroup, typeGroup] = await Promise.all([
+        this.prisma.photo.groupBy({
+          by: ['eventId'],
+          where: { eventId: { in: eventIds }, isDeleted: false },
+          _sum: { fileSize: true, thumbSizeBytes: true, previewSizeBytes: true },
+        }),
+        this.prisma.photo.groupBy({
+          by: ['eventId', 'type'],
+          where: { eventId: { in: eventIds }, isDeleted: false },
+          _count: { id: true },
+        }),
+      ]);
+    }
 
     const storageMap: Record<string, number> = {};
     for (const item of storageGroup) {
@@ -135,10 +194,13 @@ export class EventsService {
 
     const results = await Promise.all(
       events.map(async (event: any) => {
-        const firstPhoto = event.photos?.[0];
+        const coverPhoto = event.photos?.[0];
         let autoCover: string | null = null;
-        if (firstPhoto) {
-          const key = firstPhoto.r2KeyThumb || firstPhoto.r2KeyPreview || firstPhoto.r2KeyOriginal;
+        if (coverPhoto) {
+          const isVideo = coverPhoto.type === 'VIDEO' || coverPhoto.mimeType?.startsWith('video');
+          const key = isVideo
+            ? (coverPhoto.r2KeyThumb || coverPhoto.r2KeyPreview)
+            : (coverPhoto.r2KeyPreview || coverPhoto.r2KeyOriginal || coverPhoto.r2KeyThumb);
           if (key) {
             try {
               autoCover = await this.storageService.getReadUrl(key);
@@ -159,13 +221,23 @@ export class EventsService {
       })
     );
 
+    const totalPages = Math.ceil(total / limit);
+    const responsePayload = {
+      events: results,
+      total,
+      page,
+      limit,
+      totalPages,
+      hasMore: page < totalPages,
+    };
+
     try {
-      await this.redis.set(cacheKey, JSON.stringify(results), 'EX', 120); // 2 minutes cache TTL (invalidated automatically on create/update/delete)
+      await this.redis.set(cacheKey, JSON.stringify(responsePayload), 'EX', 120); // 2 minutes cache TTL
     } catch (err) {
       console.error('[EventsService] Redis set failed inside findAll:', err);
     }
 
-    return results;
+    return responsePayload;
   }
 
   async findOne(photographerId: string, eventId: string) {
@@ -200,17 +272,21 @@ export class EventsService {
       const signedBatch = await Promise.all(
         batch.map(async (photo) => {
           try {
-            const fullKey = photo.type === 'VIDEO'
+            const isVideo = photo.type === 'VIDEO';
+            const fullKey = isVideo
               ? photo.r2KeyOriginal
-              : (photo.r2KeyPreview || photo.r2KeyThumb || photo.r2KeyOriginal);
-            const url = await this.storageService.getReadUrl(fullKey);
+              : (photo.r2KeyPreview || photo.r2KeyOriginal || photo.r2KeyThumb);
+            const url = fullKey ? await this.storageService.getReadUrl(fullKey) : '';
+            const previewUrl = isVideo
+              ? (photo.r2KeyThumb ? await this.storageService.getReadUrl(photo.r2KeyThumb) : url)
+              : (photo.r2KeyPreview ? await this.storageService.getReadUrl(photo.r2KeyPreview) : url);
             const thumbUrl = photo.r2KeyThumb
               ? await this.storageService.getReadUrl(photo.r2KeyThumb)
-              : url;
-            return { ...photo, url, thumbUrl };
+              : (isVideo ? url : previewUrl);
+            return { ...photo, url, previewUrl, thumbUrl };
           } catch (err) {
             console.error(`[EventsService] Failed to sign URL for photo ${photo.id}:`, err);
-            return { ...photo, url: '', thumbUrl: '' };
+            return { ...photo, url: '', previewUrl: '', thumbUrl: '' };
           }
         })
       );
@@ -252,8 +328,8 @@ export class EventsService {
       throw new ForbiddenException('Your current plan does not support disabling photo downloads. Please upgrade.');
     }
 
-    const faceScanningEnabled = hasPhotoAi ? data.faceScanningEnabled : false;
-    const videoScanningEnabled = hasVideoAi ? data.videoScanningEnabled : false;
+    const faceScanningEnabled = data.faceScanningEnabled !== undefined ? (hasPhotoAi ? Boolean(data.faceScanningEnabled) : false) : undefined;
+    const videoScanningEnabled = data.videoScanningEnabled !== undefined ? (hasVideoAi ? Boolean(data.videoScanningEnabled) : false) : undefined;
 
     const updatedEvent = await this.prisma.event.update({
       where: { id: eventId },
@@ -267,8 +343,8 @@ export class EventsService {
         allowDownload: data.allowDownload !== undefined ? Boolean(data.allowDownload) : undefined,
         allowFavorites: data.allowFavorites !== undefined ? Boolean(data.allowFavorites) : undefined,
         faceSearchEnabled: data.faceSearchEnabled !== undefined ? Boolean(data.faceSearchEnabled) : undefined,
-        faceScanningEnabled,
-        videoScanningEnabled,
+        faceScanningEnabled: faceScanningEnabled !== undefined ? faceScanningEnabled : undefined,
+        videoScanningEnabled: videoScanningEnabled !== undefined ? videoScanningEnabled : undefined,
         maxFavorites: data.maxFavorites !== undefined ? Number(data.maxFavorites) : undefined,
         watermarkEnabled: data.watermarkEnabled,
         themeKey: data.themeKey,

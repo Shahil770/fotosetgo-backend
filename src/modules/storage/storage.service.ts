@@ -1931,13 +1931,30 @@ export class StorageService implements OnModuleInit {
         isDeleted: false,
       },
       include: {
-        event: true,
+        event: {
+          include: {
+            photographer: {
+              select: {
+                subscriptions: {
+                  where: { status: 'ACTIVE' },
+                  include: { package: true },
+                  take: 1,
+                  orderBy: { createdAt: 'desc' }
+                }
+              }
+            }
+          }
+        },
       },
     });
 
     return Promise.all(
       matchedPhotos.map(async (photo) => {
-        const r2Key = photo.event.allowDownload
+        const activeSub = photo.event?.photographer?.subscriptions?.[0];
+        const canDisableDownload = activeSub?.package ? activeSub.package.featureDisableDownload : false;
+        const effectiveAllowDownload = canDisableDownload ? Boolean(photo.event?.allowDownload) : true;
+
+        const r2Key = effectiveAllowDownload
           ? photo.r2KeyOriginal
           : (photo.r2KeyThumb || photo.r2KeyOriginal);
 
@@ -1952,7 +1969,7 @@ export class StorageService implements OnModuleInit {
           filenameOriginal: photo.filenameOriginal,
           fileSize: Number(photo.fileSize),
           tags: photo.hasFaces ? ['face'] : ['general'],
-          allowDownload: photo.event.allowDownload,
+          allowDownload: effectiveAllowDownload,
           eventId: photo.eventId,
         };
       }),
@@ -2114,6 +2131,16 @@ export class StorageService implements OnModuleInit {
             slug: true,
             allowDownload: true,
             watermarkEnabled: true,
+            photographer: {
+              select: {
+                subscriptions: {
+                  where: { status: 'ACTIVE' },
+                  include: { package: true },
+                  take: 1,
+                  orderBy: { createdAt: 'desc' }
+                }
+              }
+            }
           }
         }
       },
@@ -2122,12 +2149,16 @@ export class StorageService implements OnModuleInit {
     return Promise.all(
       matchedPhotos.map(async (photo) => {
         const event = photo.event;
-        const isWatermarked = event?.watermarkEnabled;
+        const activeSub = event?.photographer?.subscriptions?.[0];
+        const canDisableDownload = activeSub?.package ? activeSub.package.featureDisableDownload : false;
+        const effectiveAllowDownload = canDisableDownload ? Boolean(event?.allowDownload) : true;
+        const hasWatermark = activeSub?.package ? activeSub.package.featureWatermark : false;
+        const isWatermarked = hasWatermark ? event?.watermarkEnabled : false;
 
         let url = '';
         let thumbUrl = '';
 
-        const hideDirectStorageUrl = isWatermarked || (event && !event.allowDownload);
+        const hideDirectStorageUrl = isWatermarked || !effectiveAllowDownload;
 
         if (hideDirectStorageUrl) {
           const apiBase = process.env.PUBLIC_API_URL || process.env.APP_URL;
@@ -2149,7 +2180,7 @@ export class StorageService implements OnModuleInit {
           url,
           thumbUrl,
           tags: photo.hasFaces ? ['face'] : ['general'],
-          allowDownload: event ? event.allowDownload : true,
+          allowDownload: effectiveAllowDownload,
           eventId: photo.eventId,
           type: photo.type || 'IMAGE',
           duration: photo.duration || 0,
@@ -3413,6 +3444,7 @@ export class StorageService implements OnModuleInit {
     let hasAiFaceSearch = false;
     let hasWatermark = false;
     let hasBulkDownload = false;
+    let canDisableDownload = false;
     if (event.photographer) {
       const activeSub = await this.prisma.subscription.findFirst({
         where: { photographerId: event.photographer.id, status: 'ACTIVE' },
@@ -3425,9 +3457,11 @@ export class StorageService implements OnModuleInit {
       hasAiFaceSearch = activeSub?.package ? activeSub.package.featureAiPhotoSearch : false;
       hasWatermark = activeSub?.package ? activeSub.package.featureWatermark : false;
       hasBulkDownload = activeSub?.package ? activeSub.package.featureBulkDownload : false;
+      canDisableDownload = activeSub?.package ? activeSub.package.featureDisableDownload : false;
     }
 
     const watermarkEnabled = hasWatermark ? event.watermarkEnabled : false;
+    const effectiveAllowDownload = canDisableDownload ? Boolean(event.allowDownload) : true;
 
     const result = {
       id: event.id,
@@ -3435,7 +3469,7 @@ export class StorageService implements OnModuleInit {
       slug: event.slug,
       eventDate: event.eventDate,
       location: event.location,
-      allowDownload: event.allowDownload,
+      allowDownload: effectiveAllowDownload,
       allowBulkDownload: hasBulkDownload,
       allowFavorites: hasClientSelection ? Boolean(event.allowFavorites) : false,
       faceSearchEnabled: hasAiFaceSearch ? Boolean(event.faceSearchEnabled) : false,
@@ -3448,7 +3482,7 @@ export class StorageService implements OnModuleInit {
       maxGuestUploadFiles: event.maxGuestUploadFiles || 0,
       maxGuestUploadStorage: event.maxGuestUploadStorage ? event.maxGuestUploadStorage.toString() : '0',
       photosCount: event._count.photos,
-      photos: !requiresPasscode ? await this.getPublicPhotos(event.id, event.slug) : [],
+      photos: !requiresPasscode ? await this.getPublicPhotos(event.id, event.slug, undefined, undefined, { ...event, allowDownload: effectiveAllowDownload, watermarkEnabled }) : [],
       photographerBranding: event.photographer ? {
         id: event.photographer.id,
         studioLogoKey: hasBranding ? event.photographer.studioLogoKey : null,
@@ -3555,15 +3589,34 @@ export class StorageService implements OnModuleInit {
   }
 
   async getPublicPhotos(eventId: string, slug: string, limit?: number, cursor?: string, existingEvent?: any) {
-    const event = existingEvent || await this.prisma.event.findUnique({
-      where: { id: eventId },
-      select: {
-        id: true,
-        slug: true,
-        allowDownload: true,
-        watermarkEnabled: true,
+    let effectiveAllowDownload = true;
+    if (existingEvent) {
+      effectiveAllowDownload = existingEvent.allowDownload ?? true;
+    } else {
+      const fetchedEvent = await this.prisma.event.findUnique({
+        where: { id: eventId },
+        select: {
+          id: true,
+          slug: true,
+          allowDownload: true,
+          photographer: {
+            select: {
+              subscriptions: {
+                where: { status: 'ACTIVE' },
+                include: { package: true },
+                take: 1,
+                orderBy: { createdAt: 'desc' }
+              }
+            }
+          }
+        }
+      });
+      if (fetchedEvent) {
+        const activeSub = fetchedEvent.photographer?.subscriptions?.[0];
+        const canDisableDownload = activeSub?.package ? activeSub.package.featureDisableDownload : false;
+        effectiveAllowDownload = canDisableDownload ? Boolean(fetchedEvent.allowDownload) : true;
       }
-    });
+    }
 
     const queryArgs: any = {
       where: { eventId, status: 'READY', isDeleted: false },
@@ -3597,7 +3650,7 @@ export class StorageService implements OnModuleInit {
         let url = '';
         let thumbUrl = '';
 
-        const hideDirectStorageUrl = event && !event.allowDownload;
+        const hideDirectStorageUrl = !effectiveAllowDownload;
 
         if (hideDirectStorageUrl) {
           const apiBase = process.env.PUBLIC_API_URL || process.env.APP_URL;
@@ -3913,7 +3966,20 @@ export class StorageService implements OnModuleInit {
 
     const event = await this.prisma.event.findUnique({
       where: { slug },
-      select: { id: true, allowDownload: true }
+      select: {
+        id: true,
+        allowDownload: true,
+        photographer: {
+          select: {
+            subscriptions: {
+              where: { status: 'ACTIVE' },
+              include: { package: true },
+              take: 1,
+              orderBy: { createdAt: 'desc' }
+            }
+          }
+        }
+      }
     });
 
     if (!event) {
@@ -3929,9 +3995,13 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Photo not found');
     }
 
+    const activeSub = event.photographer?.subscriptions?.[0];
+    const canDisableDownload = activeSub?.package ? activeSub.package.featureDisableDownload : false;
+    const effectiveAllowDownload = canDisableDownload ? Boolean(event.allowDownload) : true;
+
     let directUrl: string;
     if (isDownload) {
-      if (!event.allowDownload) {
+      if (!effectiveAllowDownload) {
         throw new ForbiddenException('Download is not enabled for this gallery');
       }
       directUrl = await this.getDownloadUrl(photo.r2KeyOriginal, photo.filenameOriginal);
@@ -3977,7 +4047,24 @@ export class StorageService implements OnModuleInit {
 
     const event = await this.prisma.event.findUnique({
       where: { slug },
-      select: { id: true, title: true, status: true, visibility: true, passcode: true, allowDownload: true }
+      select: {
+        id: true,
+        title: true,
+        status: true,
+        visibility: true,
+        passcode: true,
+        allowDownload: true,
+        photographer: {
+          select: {
+            subscriptions: {
+              where: { status: 'ACTIVE' },
+              include: { package: true },
+              take: 1,
+              orderBy: { createdAt: 'desc' }
+            }
+          }
+        }
+      }
     });
 
     if (!event) {
@@ -3988,7 +4075,11 @@ export class StorageService implements OnModuleInit {
       throw new BadRequestException('This event is currently in draft.');
     }
 
-    if (!event.allowDownload) {
+    const bulkActiveSub = event.photographer?.subscriptions?.[0];
+    const canDisableBulkDownload = bulkActiveSub?.package ? bulkActiveSub.package.featureDisableDownload : false;
+    const effectiveBulkAllowDownload = canDisableBulkDownload ? Boolean(event.allowDownload) : true;
+
+    if (!effectiveBulkAllowDownload) {
       throw new ForbiddenException('Download is not enabled for this event gallery.');
     }
 

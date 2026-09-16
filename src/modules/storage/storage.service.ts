@@ -1771,10 +1771,10 @@ export class StorageService implements OnModuleInit {
       Bucket: this.bucketName,
       Key: key,
     });
-    const url = await getSignedUrl(this.s3Client, getCommand, { expiresIn: 3600 }); // 1 hour expiration
+    const url = await getSignedUrl(this.s3Client, getCommand, { expiresIn: 86400 }); // 24 hours expiration
 
     try {
-      await this.redis.set(redisKey, url, 'EX', 3000); // 50 minutes TTL
+      await this.redis.set(redisKey, url, 'EX', 82800); // 23 hours TTL
     } catch (err: any) {
       // Non-blocking Redis set error
     }
@@ -1789,7 +1789,7 @@ export class StorageService implements OnModuleInit {
       Key: key,
       ResponseContentDisposition: `attachment; filename="${safeFilename}"`,
     });
-    return await getSignedUrl(this.s3Client, getCommand, { expiresIn: 3600 }); // 1 hour direct signed download link
+    return await getSignedUrl(this.s3Client, getCommand, { expiresIn: 86400 }); // 24 hours direct signed download link
   }
 
   async getSelfieUploadUrl(filename: string, mimeType: string) {
@@ -3929,6 +3929,7 @@ export class StorageService implements OnModuleInit {
         ? fav.photo.r2KeyOriginal
         : (fav.photo.r2KeyPreview || fav.photo.r2KeyThumb || fav.photo.r2KeyOriginal);
       const url = await this.getReadUrl(fav.photo.r2KeyOriginal);
+      const originalUrl = await this.getDownloadUrl(fav.photo.r2KeyOriginal, fav.photo.filenameOriginal);
       const previewUrl = previewKey ? await this.getReadUrl(previewKey) : url;
       const thumbUrl = fav.photo.r2KeyThumb
         ? await this.getReadUrl(fav.photo.r2KeyThumb)
@@ -3939,11 +3940,14 @@ export class StorageService implements OnModuleInit {
         filenameOriginal: fav.photo.filenameOriginal,
         name: fav.photo.filenameOriginal,
         url,
+        originalUrl: originalUrl || url,
         previewUrl,
         thumbUrl,
         type: fav.photo.type || 'IMAGE',
         duration: fav.photo.duration || 0,
-        fileSize: Number(fav.photo.fileSize)
+        fileSize: Number(fav.photo.fileSize),
+        eventId: event.id,
+        eventSlug: event.slug
       });
     }
 

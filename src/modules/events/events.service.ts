@@ -3,6 +3,11 @@ import { PrismaService } from '../../prisma.service';
 import { StorageService } from '../storage/storage.service';
 import Redis from 'ioredis';
 
+function toTitleCase(str?: string): string | undefined {
+  if (str === undefined || str === null) return undefined;
+  return str.trim().replace(/(^|\s)\S/g, (match) => match.toUpperCase());
+}
+
 @Injectable()
 export class EventsService {
   constructor(
@@ -17,6 +22,8 @@ export class EventsService {
       const keys = [...listKeys];
       if (eventId) {
         keys.push(`cache:event:detail:${eventId}`);
+        const photoKeys = await this.redis.keys(`cache:event:photos:${eventId}*`);
+        keys.push(...photoKeys);
         // Fetch event slug and ftpUsername to clear public caches and Beam credentials
         const event = await this.prisma.event.findUnique({ where: { id: eventId }, select: { slug: true, ftpUsername: true } });
         if (event?.slug) {
@@ -50,13 +57,15 @@ export class EventsService {
       }
     }
 
+    const title = toTitleCase(data.title) || data.title;
+    const location = toTitleCase(data.location) || data.location;
     const slug = data.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') + '-' + Math.floor(1000 + Math.random() * 9000);
     const event = await this.prisma.event.create({
       data: {
         photographerId,
-        title: data.title,
+        title,
         slug,
-        location: data.location,
+        location,
         eventDate: data.eventDate ? new Date(data.eventDate) : null,
         visibility: data.visibility || 'PRIVATE',
         status: data.status || 'DRAFT',
@@ -249,56 +258,280 @@ export class EventsService {
       console.error('[EventsService] Redis get failed inside findOne:', err);
     }
 
+    const [event, storageAgg, typeAgg, scannedAgg] = await Promise.all([
+      this.prisma.event.findFirst({
+        where: { id: eventId, photographerId, isDeleted: false },
+        include: {
+          photos: {
+            where: { isDeleted: false, status: 'READY' },
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take: 60,
+          },
+        },
+      }),
+      this.prisma.photo.aggregate({
+        where: { eventId, isDeleted: false },
+        _sum: { fileSize: true, thumbSizeBytes: true, previewSizeBytes: true },
+      }),
+      this.prisma.photo.groupBy({
+        by: ['type'],
+        where: { eventId, isDeleted: false, status: 'READY' },
+        _count: { id: true },
+      }),
+      this.prisma.photo.groupBy({
+        by: ['type', 'faceScanStatus'],
+        where: { eventId, isDeleted: false, status: 'READY' },
+        _count: { id: true },
+      }),
+    ]);
+
+    if (!event) {
+      throw new NotFoundException('Event not found');
+    }
+
+    let totalPhotosCount = 0;
+    let totalVideosCount = 0;
+    for (const t of typeAgg) {
+      if (t.type === 'VIDEO') {
+        totalVideosCount += t._count.id;
+      } else {
+        totalPhotosCount += t._count.id;
+      }
+    }
+
+    let faceScannedPhotosCount = 0;
+    let faceScannedVideosCount = 0;
+    for (const s of scannedAgg) {
+      if (s.faceScanStatus === 'READY') {
+        if (s.type === 'VIDEO') {
+          faceScannedVideosCount += s._count.id;
+        } else {
+          faceScannedPhotosCount += s._count.id;
+        }
+      }
+    }
+
+    const storageUsedBytes =
+      Number(storageAgg._sum.fileSize || 0) +
+      Number(storageAgg._sum.thumbSizeBytes || 0) +
+      Number(storageAgg._sum.previewSizeBytes || 0);
+
+    const photosWithUrls = await Promise.all(
+      event.photos.map(async (photo) => {
+        try {
+          const originalUrl = photo.r2KeyOriginal
+            ? await this.storageService.getDownloadUrl(photo.r2KeyOriginal, photo.filenameOriginal)
+            : '';
+          const isVideo = photo.type === 'VIDEO';
+          const fullKey = isVideo
+            ? photo.r2KeyOriginal
+            : (photo.r2KeyPreview || photo.r2KeyOriginal || photo.r2KeyThumb);
+          const url = fullKey ? await this.storageService.getReadUrl(fullKey) : '';
+          const previewUrl = isVideo
+            ? (photo.r2KeyThumb ? await this.storageService.getReadUrl(photo.r2KeyThumb) : url)
+            : (photo.r2KeyPreview ? await this.storageService.getReadUrl(photo.r2KeyPreview) : url);
+          const thumbUrl = photo.r2KeyThumb
+            ? await this.storageService.getReadUrl(photo.r2KeyThumb)
+            : (isVideo ? url : previewUrl);
+          return {
+            ...photo,
+            fileSize: photo.fileSize ? Number(photo.fileSize) : 0,
+            url,
+            originalUrl: originalUrl || url,
+            previewUrl,
+            thumbUrl,
+            tags: photo.hasFaces ? ['face'] : ['general'],
+          };
+        } catch (err) {
+          console.error(`[EventsService] Failed to sign URL for photo ${photo.id}:`, err);
+          return {
+            ...photo,
+            fileSize: photo.fileSize ? Number(photo.fileSize) : 0,
+            url: '',
+            previewUrl: '',
+            thumbUrl: '',
+            tags: photo.hasFaces ? ['face'] : ['general'],
+          };
+        }
+      })
+    );
+
+    const totalMediaCount = totalPhotosCount + totalVideosCount;
+    const hasMore = totalMediaCount > event.photos.length;
+    const nextCursor = event.photos.length > 0 ? event.photos[event.photos.length - 1].id : null;
+
+    const result = {
+      ...event,
+      photosCount: totalPhotosCount,
+      videosCount: totalVideosCount,
+      faceScannedPhotosCount,
+      faceScannedVideosCount,
+      storageUsedBytes,
+      photos: photosWithUrls,
+      hasMore,
+      nextCursor,
+    };
+
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(result), 'EX', 300); // 5 minutes cache TTL
+    } catch (err) {
+      console.error('[EventsService] Redis set failed inside findOne:', err);
+    }
+
+    return result;
+  }
+
+  async getEventPhotos(
+    photographerId: string,
+    eventId: string,
+    query?: {
+      page?: number;
+      limit?: number;
+      cursor?: string;
+      type?: string;
+      search?: string;
+      sortBy?: string;
+      photoIds?: string;
+    }
+  ) {
+    const page = Math.max(1, query?.page || 1);
+    const limit = Math.min(Math.max(1, query?.limit || 60), 100);
+    const skip = (page - 1) * limit;
+    const type = query?.type?.toUpperCase();
+    const search = query?.search?.trim();
+    const sortBy = query?.sortBy || 'time_desc';
+    const photoIds = query?.photoIds ? query.photoIds.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+    const cacheKey = `cache:event:photos:${eventId}:${page}:${limit}:${type || 'ALL'}:${search || ''}:${sortBy}:${query?.photoIds || ''}`;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch (err) {
+      console.error('[EventsService] Redis get failed inside getEventPhotos:', err);
+    }
+
     const event = await this.prisma.event.findFirst({
       where: { id: eventId, photographerId, isDeleted: false },
-      include: {
-        photos: {
-          where: { isDeleted: false, status: 'READY' },
-          orderBy: { createdAt: 'desc' }
-        },
-      },
+      select: { id: true }
     });
 
     if (!event) {
       throw new NotFoundException('Event not found');
     }
 
-    // Process signed URLs in concurrent chunks of 50 for fast response and minimal latency
-    const batchSize = 50;
-    const photosWithUrls: any[] = [];
-    
-    for (let i = 0; i < event.photos.length; i += batchSize) {
-      const batch = event.photos.slice(i, i + batchSize);
-      const signedBatch = await Promise.all(
-        batch.map(async (photo) => {
-          try {
-            const isVideo = photo.type === 'VIDEO';
-            const fullKey = isVideo
-              ? photo.r2KeyOriginal
-              : (photo.r2KeyPreview || photo.r2KeyOriginal || photo.r2KeyThumb);
-            const url = fullKey ? await this.storageService.getReadUrl(fullKey) : '';
-            const previewUrl = isVideo
-              ? (photo.r2KeyThumb ? await this.storageService.getReadUrl(photo.r2KeyThumb) : url)
-              : (photo.r2KeyPreview ? await this.storageService.getReadUrl(photo.r2KeyPreview) : url);
-            const thumbUrl = photo.r2KeyThumb
-              ? await this.storageService.getReadUrl(photo.r2KeyThumb)
-              : (isVideo ? url : previewUrl);
-            return { ...photo, url, previewUrl, thumbUrl };
-          } catch (err) {
-            console.error(`[EventsService] Failed to sign URL for photo ${photo.id}:`, err);
-            return { ...photo, url: '', previewUrl: '', thumbUrl: '' };
-          }
-        })
-      );
-      photosWithUrls.push(...signedBatch);
+    const where: any = {
+      eventId,
+      isDeleted: false,
+      status: 'READY'
+    };
+
+    if (photoIds.length > 0) {
+      where.id = { in: photoIds };
     }
 
-    const result = { ...event, photos: photosWithUrls };
+    if (type === 'IMAGE' || type === 'VIDEO') {
+      where.type = type;
+    }
+
+    if (search) {
+      where.filenameOriginal = { contains: search, mode: 'insensitive' };
+    }
+
+    let orderBy: any = [{ createdAt: 'desc' }, { id: 'desc' }];
+    if (sortBy === 'time_asc') {
+      orderBy = [{ createdAt: 'asc' }, { id: 'asc' }];
+    } else if (sortBy === 'name_asc') {
+      orderBy = [{ filenameOriginal: 'asc' }, { id: 'asc' }];
+    } else if (sortBy === 'name_desc') {
+      orderBy = [{ filenameOriginal: 'desc' }, { id: 'desc' }];
+    } else if (sortBy === 'size_asc') {
+      orderBy = [{ fileSize: 'asc' }, { id: 'asc' }];
+    } else if (sortBy === 'size_desc') {
+      orderBy = [{ fileSize: 'desc' }, { id: 'desc' }];
+    }
+
+    const [photos, total] = await Promise.all([
+      this.prisma.photo.findMany({
+        where,
+        orderBy,
+        skip,
+        take: limit,
+      }),
+      this.prisma.photo.count({ where }),
+    ]);
+
+    const totalPages = Math.ceil(total / limit);
+    const hasMore = page < totalPages;
+    const nextCursor = photos.length > 0 ? photos[photos.length - 1].id : null;
+
+    const photosWithUrls = await Promise.all(
+      photos.map(async (photo) => {
+        try {
+          const originalUrl = photo.r2KeyOriginal
+            ? await this.storageService.getDownloadUrl(photo.r2KeyOriginal, photo.filenameOriginal)
+            : '';
+          const isVideo = photo.type === 'VIDEO';
+          const fullKey = isVideo
+            ? photo.r2KeyOriginal
+            : (photo.r2KeyPreview || photo.r2KeyOriginal || photo.r2KeyThumb);
+          const url = fullKey ? await this.storageService.getReadUrl(fullKey) : '';
+          const previewUrl = isVideo
+            ? (photo.r2KeyThumb ? await this.storageService.getReadUrl(photo.r2KeyThumb) : url)
+            : (photo.r2KeyPreview ? await this.storageService.getReadUrl(photo.r2KeyPreview) : url);
+          const thumbUrl = photo.r2KeyThumb
+            ? await this.storageService.getReadUrl(photo.r2KeyThumb)
+            : (isVideo ? url : previewUrl);
+          return {
+            id: photo.id,
+            url,
+            originalUrl: originalUrl || url,
+            previewUrl,
+            thumbUrl,
+            tags: photo.hasFaces ? ['face'] : ['general'],
+            status: photo.status,
+            faceScanStatus: photo.faceScanStatus,
+            filenameOriginal: photo.filenameOriginal,
+            fileSize: photo.fileSize ? Number(photo.fileSize) : 0,
+            type: photo.type || 'IMAGE',
+            duration: photo.duration || 0,
+            cameraModel: photo.cameraModel || '',
+            createdAt: photo.createdAt,
+          };
+        } catch (err) {
+          console.error(`[EventsService] Failed to sign URL for photo ${photo.id}:`, err);
+          return {
+            id: photo.id,
+            url: '',
+            previewUrl: '',
+            thumbUrl: '',
+            tags: photo.hasFaces ? ['face'] : ['general'],
+            status: photo.status,
+            faceScanStatus: photo.faceScanStatus,
+            filenameOriginal: photo.filenameOriginal,
+            fileSize: photo.fileSize ? Number(photo.fileSize) : 0,
+            type: photo.type || 'IMAGE',
+            duration: photo.duration || 0,
+            cameraModel: photo.cameraModel || '',
+            createdAt: photo.createdAt,
+          };
+        }
+      })
+    );
+
+    const result = {
+      photos: photosWithUrls,
+      page,
+      limit,
+      totalPages,
+      nextCursor,
+      hasMore,
+      total,
+    };
 
     try {
-      await this.redis.set(cacheKey, JSON.stringify(result), 'EX', 600); // 10 minutes cache TTL
+      await this.redis.set(cacheKey, JSON.stringify(result), 'EX', 300); // 5 min TTL
     } catch (err) {
-      console.error('[EventsService] Redis set failed inside findOne:', err);
+      console.error('[EventsService] Redis set failed inside getEventPhotos:', err);
     }
 
     return result;
@@ -334,8 +567,8 @@ export class EventsService {
     const updatedEvent = await this.prisma.event.update({
       where: { id: eventId },
       data: {
-        title: data.title,
-        location: data.location,
+        title: data.title !== undefined ? (toTitleCase(data.title) || data.title) : undefined,
+        location: data.location !== undefined ? (toTitleCase(data.location) || data.location) : undefined,
         eventDate: data.eventDate ? new Date(data.eventDate) : undefined,
         status: data.status,
         visibility: data.visibility,

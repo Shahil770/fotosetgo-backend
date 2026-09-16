@@ -34,6 +34,29 @@ export class EventsController {
     return this.eventsService.findOne(user.photographer.id, id);
   }
 
+  @Get(':id/photos')
+  async getPhotos(
+    @CurrentUser() user: any,
+    @Param('id') id: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+    @Query('type') type?: string,
+    @Query('search') search?: string,
+    @Query('sortBy') sortBy?: string,
+    @Query('photoIds') photoIds?: string,
+  ) {
+    return this.eventsService.getEventPhotos(user.photographer.id, id, {
+      page: page ? parseInt(page, 10) : undefined,
+      limit: limit ? parseInt(limit, 10) : undefined,
+      cursor,
+      type,
+      search,
+      sortBy,
+      photoIds,
+    });
+  }
+
   @Put(':id')
   async update(@CurrentUser() user: any, @Param('id') id: string, @Body() body: any) {
     return this.eventsService.update(user.photographer.id, id, body);

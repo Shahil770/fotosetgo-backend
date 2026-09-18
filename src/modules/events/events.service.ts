@@ -639,10 +639,7 @@ export class EventsService {
         }).catch(() => {});
       }
 
-      // 2. Trigger face scan after DB has been successfully updated
-      this.storageService.triggerFaceScanForEvent(photographerId, eventId).catch(err => {
-        console.error('[EventsService] Failed to trigger face scan on toggle on:', err);
-      });
+
     }
 
     // If face/video scanning is turned OFF, safely release only un-scanned photos without corrupting scanned ones

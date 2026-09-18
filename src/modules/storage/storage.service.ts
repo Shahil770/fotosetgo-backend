@@ -715,10 +715,6 @@ export class StorageService implements OnModuleInit {
             console.error('[StorageService] Video face scan trigger failed on approve:', err);
           });
         }
-      } else if (photo.event.faceScanningEnabled) {
-        this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
-          console.error('[StorageService] Face scan trigger failed on approve:', err);
-        });
       }
 
       await this.invalidateEventCache(photo.eventId);
@@ -1089,31 +1085,9 @@ export class StorageService implements OnModuleInit {
       this.triggerCloudflareWorker(photoId, photo.r2KeyOriginal).catch(err => {
         this.logger.error(`[processQueuedUploadCompletion] Thumbnail engine trigger error for ${photoId}: ${err.message}`);
       });
-    } else {
-      // Client-side thumbnail already ready!
-      // If AI Face Scanning is active on event, trigger face recognition directly!
-      if (!isGuest) {
-        this.prisma.event.findUnique({ where: { id: photo.eventId } }).then(event => {
-          if (event && event.faceScanningEnabled) {
-            this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
-              console.error('[StorageService] Background face scan trigger failed:', err);
-            });
-          }
-        }).catch(() => { });
-      }
     }
 
     if (!isGuest) {
-      if (photo.type === 'VIDEO') {
-        this.prisma.event.findUnique({ where: { id: photo.eventId } }).then(event => {
-          if (event && event.videoScanningEnabled) {
-            this.triggerFaceScanForEvent(photographerId, photo.eventId).catch(err => {
-              console.error('[StorageService] Video face scan loop trigger failed:', err);
-            });
-          }
-        }).catch(() => { });
-      }
-
       this.triggerAutoBackupIfEnabled(photographerId, photo.id).catch(err => {
         console.error('[StorageService] Background Google Drive sync trigger failed:', err.message);
       });
@@ -1605,16 +1579,7 @@ export class StorageService implements OnModuleInit {
           await this.invalidateStorageBreakdownCache(photographerId);
           await this.invalidateEventPhotosCache(photographerId, eventId);
 
-          // Check if event face scanning is enabled, trigger indexing
-          const event = await this.prisma.event.findUnique({
-            where: { id: eventId },
-            select: { faceScanningEnabled: true }
-          });
-          if (event?.faceScanningEnabled) {
-            this.triggerFaceScanForEvent(photographerId, eventId).catch(err => {
-              this.logger.error(`[ProcessIngestedPhoto] Face scan trigger failed for event ${eventId}:`, err);
-            });
-          }
+
           this.logger.log(`[ProcessIngestedPhoto] Photo ${photoId} thumbnail & preview generated successfully! (Thumb: ${res.thumbSize}B, Preview: ${res.previewSize}B)`);
         }
       }
@@ -5844,15 +5809,7 @@ export class StorageService implements OnModuleInit {
           this.logger.error(`[Webhook] Background video processing failed for ${photo.id}: ${err.message}`);
         });
       } else {
-        // If face scanning is enabled, trigger background batch face indexing silently without blocking photo status
-        if (photo.event.faceScanningEnabled) {
-          this.triggerFaceScanForEvent(
-            photo.photographerId,
-            photo.eventId
-          ).catch(err => {
-            console.error('[Webhook] Background Face Indexing trigger failed:', err);
-          });
-        }
+
 
         // Update upload batch progress status
         if (photo.uploadBatchId) {
@@ -5983,182 +5940,7 @@ export class StorageService implements OnModuleInit {
     await Promise.all(promises);
   }
 
-  // AI Face Toggle ON hone par ya Thumbnail complete hone par Batch Scan chalata hai (with Auto-Recheck loop)
-  async triggerFaceScanForEvent(photographerId: string, eventId: string): Promise<void> {
-    const lockKey = `lock:scan:event:${eventId}`;
-    let acquired: any = null;
-    try {
-      acquired = await this.redis.set(lockKey, '1', 'EX', 1800, 'NX');
-    } catch {
-      acquired = 'OK';
-    }
-    if (!acquired) {
-      this.logger.log(`[BatchFaceScan] Scanning is already active for event ${eventId}. Skipping trigger.`);
-      return;
-    }
-    const initialEventObj = await this.prisma.event.findUnique({ where: { id: eventId } });
-    if (!initialEventObj) {
-      await this.redis.del(lockKey).catch(() => { });
-      return;
-    }
 
-    try {
-      // Reset any stuck faceScanStatus from 'PROCESSING' to 'PENDING' at start to allow reprocessing if server crashed
-      await this.prisma.photo.updateMany({
-        where: { eventId, faceScanStatus: 'PROCESSING' },
-        data: { faceScanStatus: 'PENDING' }
-      });
-
-      while (true) {
-        // Re-fetch event settings on EVERY iteration so toggle changes are picked up dynamically
-        const eventObj = await this.prisma.event.findUnique({ where: { id: eventId } });
-        if (!eventObj) break;
-
-        // Enforce toggle settings dynamically and verify photographer's active plan features
-        const activeSub = await this.prisma.subscription.findFirst({
-          where: { photographerId, status: 'ACTIVE' },
-          include: { package: true }
-        });
-        const hasPhotoAi = activeSub?.package ? activeSub.package.featureAiPhotoSearch : false;
-        const hasVideoAi = activeSub?.package ? activeSub.package.featureAiVideoSearch : false;
-
-        const isPhotoScanningActive = Boolean(eventObj.faceScanningEnabled && hasPhotoAi);
-        const isVideoScanningActive = Boolean(eventObj.videoScanningEnabled && hasVideoAi);
-
-        if (!isPhotoScanningActive && !isVideoScanningActive) {
-          this.logger.log(`[BatchFaceScan] Both photo and video scanning are disabled or not included in plan. Aborting loop.`);
-          break;
-        }
-
-        // Check if there are active uploads in progress for this event
-        const activeUploadingCount = await this.prisma.photo.count({
-          where: { eventId, status: 'UPLOADING' }
-        });
-
-        // Build type filter from active settings
-        const typeFilter: string[] = [];
-        if (isPhotoScanningActive) typeFilter.push('IMAGE');
-        if (isVideoScanningActive) typeFilter.push('VIDEO');
-
-        const pendingItems = await this.prisma.photo.findMany({
-          where: {
-            eventId,
-            photographerId,
-            status: 'READY',
-            faceScanStatus: { notIn: ['PROCESSING', 'READY'] },
-            type: { in: typeFilter },
-            OR: [
-              { thumbnailStatus: 'READY' },
-              { r2KeyThumb: { not: null } }
-            ],
-            embeddings: { none: {} }
-          },
-          take: 30
-        });
-
-        if (pendingItems.length === 0) {
-          this.logger.log(`[BatchFaceScan] All ready items for event ${eventId} are scanned. Loop finished.`);
-          break;
-        }
-
-        // Rule: If uploading is currently active and we have less than 30 ready items, defer scanning until 30 accumulate or uploading finishes
-        if (activeUploadingCount > 0 && pendingItems.length < 30) {
-          this.logger.log(`[BatchFaceScan] Uploading in progress (${activeUploadingCount} uploading). Waiting for 30 items or upload finish. Current ready: ${pendingItems.length}`);
-          break;
-        }
-
-        this.logger.log(`[BatchFaceScan] Found ${pendingItems.length} items to batch scan for event ${eventId}`);
-
-        const photos = pendingItems.filter(p => p.type === 'IMAGE');
-        const videos = pendingItems.filter(p => p.type === 'VIDEO');
-
-        // Enforce pay-per-use credits for photos
-        const photographer = await this.prisma.photographer.findUnique({
-          where: { id: photographerId }
-        });
-        const currentCredits = photographer?.creditBalance || 0;
-        const maxPhotosAllowed = Math.floor(currentCredits / 10);
-
-        if (maxPhotosAllowed === 0) {
-          this.logger.warn(`[BatchFaceScan] Photographer ${photographerId} has insufficient credits (${currentCredits} paise). Skipping photo scanning.`);
-          // Mark as SKIPPED (not READY) so the UI knows these were NOT actually scanned
-          const photoIds = photos.map(p => p.id);
-          if (photoIds.length > 0) {
-            await this.prisma.photo.updateMany({
-              where: { id: { in: photoIds } },
-              data: { faceScanStatus: 'SKIPPED', status: 'READY' }
-            });
-            for (const p of photos) {
-              if (p.uploadBatchId) {
-                await this.updateBatchProgress(p.uploadBatchId, true);
-              }
-            }
-          }
-          // Also mark videos as SKIPPED — no credits for AI scanning
-          const videoIds = videos.map(v => v.id);
-          if (videoIds.length > 0) {
-            await this.prisma.photo.updateMany({
-              where: { id: { in: videoIds } },
-              data: { faceScanStatus: 'SKIPPED', status: 'READY' }
-            });
-            for (const v of videos) {
-              if (v.uploadBatchId) {
-                await this.updateBatchProgress(v.uploadBatchId, true);
-              }
-            }
-          }
-          // Auto-disable scanning toggles on this event since credits are exhausted
-          await this.prisma.event.update({
-            where: { id: eventId },
-            data: { faceScanningEnabled: false, videoScanningEnabled: false }
-          });
-          await this.invalidateEventCache(eventId);
-          this.logger.warn(`[BatchFaceScan] Credits exhausted. Auto-disabled scanning toggles for event ${eventId}. Breaking out of scan loop.`);
-          break; // Fully stop the loop — no more scanning possible
-        } else if (photos.length > maxPhotosAllowed) {
-          const scannablePhotos = photos.slice(0, maxPhotosAllowed);
-          const skippedPhotos = photos.slice(maxPhotosAllowed);
-
-          this.logger.warn(`[BatchFaceScan] Photographer ${photographerId} has credits for only ${maxPhotosAllowed} photos. Skipping remaining ${skippedPhotos.length} photos.`);
-          const skippedIds = skippedPhotos.map(p => p.id);
-          await this.prisma.photo.updateMany({
-            where: { id: { in: skippedIds } },
-            data: { faceScanStatus: 'SKIPPED', status: 'READY' }
-          });
-          for (const p of skippedPhotos) {
-            if (p.uploadBatchId) {
-              await this.updateBatchProgress(p.uploadBatchId, true);
-            }
-          }
-
-          photos.length = 0;
-          photos.push(...scannablePhotos);
-        }
-
-        // Offline AI Worker (RTX GPU) handles scanning via background queue polling
-        this.logger.log(`[BatchFaceScan] ${photos.length} photos and ${videos.length} videos available in PENDING queue for Offline AI Worker.`);
-        
-        // 2. Process Videos (for thumbnails / metadata)
-        for (const video of videos) {
-          await this.runBackgroundVideoProcessing(
-            photographerId,
-            video.id,
-            eventId,
-            video.r2KeyOriginal,
-            video.uploadBatchId
-          ).catch(err => {
-            this.logger.error(`[BatchFaceScan] Video thumbnail generation failed for ${video.id}:`, err);
-          });
-        }
-
-
-        // Re-check sleep pause (300ms) before checking if new ready thumbnails appeared in the meantime
-        await new Promise(resolve => setTimeout(resolve, 300));
-      }
-    } finally {
-      await this.redis.del(`lock:scan:event:${eventId}`).catch(() => { });
-    }
-  }
 
   async getAiModelUrls() {
     const [detectorUrl, arcfaceUrl] = await Promise.all([

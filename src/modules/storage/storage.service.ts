@@ -646,10 +646,46 @@ export class StorageService implements OnModuleInit {
   }
 
   async getEventPendingPhotos(photographerId: string, eventId: string) {
-    return this.prisma.photo.findMany({
+    const event = await this.prisma.event.findUnique({
+      where: { id: eventId },
+      select: { id: true, slug: true, title: true }
+    });
+
+    const pending = await this.prisma.photo.findMany({
       where: { eventId, photographerId, status: 'PENDING_APPROVAL' },
       orderBy: { createdAt: 'desc' }
     });
+
+    const photosList: any[] = [];
+    for (const photo of pending) {
+      const previewKey = photo.type === 'VIDEO'
+        ? photo.r2KeyOriginal
+        : (photo.r2KeyPreview || photo.r2KeyThumb || photo.r2KeyOriginal);
+      const url = await this.getReadUrl(photo.r2KeyOriginal);
+      const originalUrl = await this.getDownloadUrl(photo.r2KeyOriginal, photo.filenameOriginal);
+      const previewUrl = previewKey ? await this.getReadUrl(previewKey) : url;
+      const thumbUrl = photo.r2KeyThumb
+        ? await this.getReadUrl(photo.r2KeyThumb)
+        : (previewUrl || url);
+
+      photosList.push({
+        ...photo,
+        id: photo.id,
+        filenameOriginal: photo.filenameOriginal,
+        name: photo.filenameOriginal,
+        url,
+        originalUrl: originalUrl || url,
+        previewUrl,
+        thumbUrl,
+        type: photo.type || 'IMAGE',
+        duration: photo.duration || 0,
+        fileSize: Number(photo.fileSize),
+        eventId: event?.id || eventId,
+        eventSlug: event?.slug || ''
+      });
+    }
+
+    return photosList;
   }
 
   async approveGuestPhoto(photographerId: string, photoId: string) {

@@ -5,6 +5,10 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { FeatureGuard } from '../../common/guards/feature.guard';
 
+function getPhotographerId(user: any): string {
+  return user?.photographer?.id || user?.id || '';
+}
+
 @UseGuards(JwtAuthGuard)
 @Controller('storage')
 export class StorageController {
@@ -12,7 +16,7 @@ export class StorageController {
 
   @Get('breakdown')
   async getStorageBreakdown(@CurrentUser() user: any) {
-    return this.storageService.getStorageBreakdown(user.photographer?.id || user.id);
+    return this.storageService.getStorageBreakdown(getPhotographerId(user));
   }
 
 
@@ -21,7 +25,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { eventId: string; totalFiles: number },
   ) {
-    return this.storageService.startUploadBatch(user.photographer.id, body.eventId, body.totalFiles);
+    return this.storageService.startUploadBatch(getPhotographerId(user), body.eventId, body.totalFiles);
   }
 
 
@@ -30,7 +34,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { eventId: string; filename: string; mimeType: string; fileSize: number; uploadBatchId?: string },
   ) {
-    return this.storageService.getUploadPresignedUrl(user.photographer.id, body.eventId, {
+    return this.storageService.getUploadPresignedUrl(getPhotographerId(user), body.eventId, {
       filename: body.filename,
       mimeType: body.mimeType,
       fileSize: body.fileSize,
@@ -43,7 +47,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { photoId: string; thumbSizeBytes?: number; previewSizeBytes?: number; duration?: number },
   ) {
-    return this.storageService.completeUpload(user.photographer.id, body.photoId, body.thumbSizeBytes, body.previewSizeBytes, body.duration);
+    return this.storageService.completeUpload(getPhotographerId(user), body.photoId, body.thumbSizeBytes, body.previewSizeBytes, body.duration);
   }
 
   @Post('upload-url-batch')
@@ -52,7 +56,7 @@ export class StorageController {
     @Body() body: { eventId: string; uploadBatchId: string; files: { filename: string; mimeType: string; fileSize: number }[]; totalBatchBytes?: number },
   ) {
     return this.storageService.getBatchUploadPresignedUrls(
-      user.photographer.id,
+      getPhotographerId(user),
       body.eventId,
       body.uploadBatchId,
       body.files,
@@ -66,7 +70,7 @@ export class StorageController {
     @Body() body: { photoIds?: string[]; items?: { photoId: string; thumbSizeBytes?: number; previewSizeBytes?: number; duration?: number }[] },
   ) {
     const list = body.items && body.items.length > 0 ? body.items : (body.photoIds || []);
-    return this.storageService.completeBatchUpload(user.photographer.id, list);
+    return this.storageService.completeBatchUpload(getPhotographerId(user), list);
   }
 
   @Post('cancel-upload')
@@ -75,7 +79,7 @@ export class StorageController {
     @Body() body: { photoId: string },
   ) {
     // Remove orphaned UPLOADING DB entry when R2 upload failed completely
-    return this.storageService.cancelUpload(user.photographer.id, body.photoId);
+    return this.storageService.cancelUpload(getPhotographerId(user), body.photoId);
   }
 
   @Post('batch/cancel')
@@ -83,12 +87,12 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { uploadBatchId: string },
   ) {
-    return this.storageService.cancelBatchUpload(user.photographer.id, body.uploadBatchId);
+    return this.storageService.cancelBatchUpload(getPhotographerId(user), body.uploadBatchId);
   }
 
   @Post('clear-waste')
   async clearWasteStorage(@CurrentUser() user: any) {
-    return this.storageService.clearWasteStorage(user.photographer.id);
+    return this.storageService.clearWasteStorage(getPhotographerId(user));
   }
 
   @Get('events/:eventId/pending-guest-photos')
@@ -97,7 +101,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Param('eventId') eventId: string
   ) {
-    return this.storageService.getEventPendingPhotos(user.photographer.id, eventId);
+    return this.storageService.getEventPendingPhotos(getPhotographerId(user), eventId);
   }
 
   @Post('guest-photos/:photoId/approve')
@@ -106,7 +110,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Param('photoId') photoId: string
   ) {
-    return this.storageService.approveGuestPhoto(user.photographer.id, photoId);
+    return this.storageService.approveGuestPhoto(getPhotographerId(user), photoId);
   }
 
   @Post('guest-photos/:photoId/reject')
@@ -115,7 +119,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Param('photoId') photoId: string
   ) {
-    return this.storageService.rejectGuestPhoto(user.photographer.id, photoId);
+    return this.storageService.rejectGuestPhoto(getPhotographerId(user), photoId);
   }
 
 
@@ -126,7 +130,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { r2Key?: string; vector?: number[]; eventId?: string },
   ) {
-    return this.storageService.searchFace(user.photographer?.id || user.id, body.r2Key, body.eventId, body.vector);
+    return this.storageService.searchFace(getPhotographerId(user), body.r2Key, body.eventId, body.vector);
   }
 
   @Delete('photo/:id')
@@ -134,7 +138,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Param('id') id: string,
   ) {
-    return this.storageService.softDeletePhoto(user.photographer.id, id);
+    return this.storageService.softDeletePhoto(getPhotographerId(user), id);
   }
 
   @Post('batch-delete')
@@ -142,12 +146,12 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { photoIds: string[] },
   ) {
-    return this.storageService.batchSoftDeletePhotos(user.photographer.id, body.photoIds);
+    return this.storageService.batchSoftDeletePhotos(getPhotographerId(user), body.photoIds);
   }
 
   @Get('trash')
   async getTrashData(@CurrentUser() user: any) {
-    return this.storageService.getTrashData(user.photographer.id);
+    return this.storageService.getTrashData(getPhotographerId(user));
   }
 
   @Post('trash/restore-photo')
@@ -155,12 +159,12 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { photoId: string; targetEventId?: string },
   ) {
-    return this.storageService.restorePhoto(user.photographer.id, body.photoId, body.targetEventId);
+    return this.storageService.restorePhoto(getPhotographerId(user), body.photoId, body.targetEventId);
   }
 
   @Delete('trash/empty')
   async emptyTrash(@CurrentUser() user: any) {
-    return this.storageService.emptyTrash(user.photographer.id);
+    return this.storageService.emptyTrash(getPhotographerId(user));
   }
 
   @Delete('trash/photo/:id')
@@ -168,7 +172,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Param('id') id: string,
   ) {
-    return this.storageService.deletePhoto(user.photographer.id, id);
+    return this.storageService.deletePhoto(getPhotographerId(user), id);
   }
 
   @Post('trash/batch-delete')
@@ -176,7 +180,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { photoIds: string[] },
   ) {
-    return this.storageService.batchDeletePhotos(user.photographer.id, body.photoIds);
+    return this.storageService.batchDeletePhotos(getPhotographerId(user), body.photoIds);
   }
 
   @Post('trash/batch-restore')
@@ -184,7 +188,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { photoIds: string[]; targetEventId?: string },
   ) {
-    return this.storageService.batchRestorePhotos(user.photographer.id, body.photoIds, body.targetEventId);
+    return this.storageService.batchRestorePhotos(getPhotographerId(user), body.photoIds, body.targetEventId);
   }
 
 
@@ -193,7 +197,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { photoIds: string[]; targetEventId: string },
   ) {
-    return this.storageService.batchMove(user.photographer.id, body.photoIds, body.targetEventId);
+    return this.storageService.batchMove(getPhotographerId(user), body.photoIds, body.targetEventId);
   }
 
   @Post('batch-copy')
@@ -201,7 +205,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { photoIds: string[]; targetEventId: string },
   ) {
-    return this.storageService.batchCopy(user.photographer.id, body.photoIds, body.targetEventId);
+    return this.storageService.batchCopy(getPhotographerId(user), body.photoIds, body.targetEventId);
   }
 
   @Post('reindex-event/:eventId')
@@ -209,7 +213,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Param('eventId') eventId: string,
   ) {
-    return this.storageService.reindexEventPhotos(user.photographer.id, eventId);
+    return this.storageService.reindexEventPhotos(getPhotographerId(user), eventId);
   }
 
   @Get('event-faces/:eventId')
@@ -217,7 +221,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Param('eventId') eventId: string,
   ) {
-    return this.storageService.getEventFaces(user.photographer.id, eventId);
+    return this.storageService.getEventFaces(getPhotographerId(user), eventId);
   }
 
   @Post('merge-clusters')
@@ -225,7 +229,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Body() body: { eventId: string; faceIds: string[] },
   ) {
-    return this.storageService.mergeClusters(user.photographer.id, body.eventId, body.faceIds);
+    return this.storageService.mergeClusters(getPhotographerId(user), body.eventId, body.faceIds);
   }
 
   @Get('events/:eventId/favorites')
@@ -233,7 +237,7 @@ export class StorageController {
     @CurrentUser() user: any,
     @Param('eventId') eventId: string,
   ) {
-    return this.storageService.getEventFavorites(user.photographer.id, eventId);
+    return this.storageService.getEventFavorites(getPhotographerId(user), eventId);
   }
 
   @Post('watermark/settings')

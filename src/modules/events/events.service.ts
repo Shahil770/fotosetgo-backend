@@ -80,6 +80,7 @@ export class EventsService {
         allowGuestUploads: data.allowGuestUploads !== undefined ? Boolean(data.allowGuestUploads) : false,
         maxGuestUploadFiles: data.maxGuestUploadFiles !== undefined ? Math.min(200, Math.max(1, Number(data.maxGuestUploadFiles))) : 200,
         maxGuestUploadStorage: data.maxGuestUploadStorage !== undefined ? BigInt(Math.min(500 * 1024 * 1024, Number(data.maxGuestUploadStorage))) : BigInt(500 * 1024 * 1024),
+        ftpPassword: Math.floor(1000 + Math.random() * 9000).toString(),
         beamUploadMode: 'PHOTOS_ONLY',
       },
     });

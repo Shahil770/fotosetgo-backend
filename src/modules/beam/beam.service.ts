@@ -104,7 +104,7 @@ export class BeamService implements OnModuleInit {
     const host = process.env.BEAM_FTP_HOST || '';
     const port = 2121;
     const username = event.ftpUsername || `evt_${event.id.slice(0, 8)}`;
-    const pin = event.ftpPassword || '1234';
+    const pin = event.ftpPassword || Math.floor(1000 + Math.random() * 9000).toString();
     const mode = event.beamUploadMode || 'PHOTOS_ONLY';
 
     let isEnabled = event.beamEnabled;
@@ -199,7 +199,7 @@ export class BeamService implements OnModuleInit {
 
   private async syncEventAuthToRedis(photographerId: string, event: any, enabled: boolean) {
     const username = event.ftpUsername || `evt_${event.id.slice(0, 8)}`;
-    const pin = event.ftpPassword || '1234';
+    const pin = event.ftpPassword || Math.floor(1000 + Math.random() * 9000).toString();
 
     if (enabled) {
       const breakdown = await this.storageService.getStorageBreakdown(photographerId);
@@ -347,7 +347,7 @@ export class BeamService implements OnModuleInit {
     if (!event) throw new NotFoundException('Event not found');
 
     const username = event.ftpUsername || `evt_${event.id.slice(0, 8)}`;
-    const pin = event.ftpPassword || '1234';
+    const pin = event.ftpPassword || Math.floor(1000 + Math.random() * 9000).toString();
     const mode = event.beamUploadMode || 'PHOTOS_ONLY';
     const expiresAt = enabled ? new Date(Date.now() + BEAM_SESSION_TTL_SECONDS * 1000) : null;
 

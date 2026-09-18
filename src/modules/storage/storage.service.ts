@@ -43,8 +43,6 @@ export class StorageService implements OnModuleInit {
       this.logger.log(`Initializing R2 S3Client with endpoint: ${endpoint}`);
     }
 
-    const faceEngine = process.env.FACE_ENGINE_URL || '';
-    this.logger.log(`FACE_ENGINE_URL configured as: [${faceEngine}]`);
 
     this.s3Client = new S3Client({
       region: 'auto',
@@ -1533,53 +1531,19 @@ export class StorageService implements OnModuleInit {
 
       if (!isPendingApproval && photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled) {
         if (!canAffordScan) {
-          // NOT enough credits for estimated duration — skip Modal call entirely to prevent free compute
-          this.logger.warn(`[VideoProcessing] Photographer ${photographerId} has insufficient credits (${currentBalance} paise) for estimated video cost (${estimatedCost} paise, ~${estimatedMinutes} min). Skipping Modal call entirely.`);
+          // NOT enough credits for estimated duration — mark as SKIPPED
+          this.logger.warn(`[VideoProcessing] Photographer ${photographerId} has insufficient credits (${currentBalance} paise) for estimated video cost (${estimatedCost} paise, ~${estimatedMinutes} min). Marking as SKIPPED.`);
           await this.prisma.photo.update({
             where: { id: photoId },
             data: { faceScanStatus: 'SKIPPED' }
           });
         } else {
-          const faceEngineUrl = process.env.FACE_ENGINE_URL;
-          const backendAppUrl = process.env.APP_URL || process.env.PUBLIC_API_URL;
-          const webhookUrl = `${backendAppUrl}/api/public/webhook/video-face-complete`;
-          const secretKey = process.env.WORKER_SECRET_KEY || '';
-
-          try {
-            // Call Modal GPU Video Indexing Endpoint (/faces/index-video) with Webhook URL
-            const response = await fetch(`${faceEngineUrl}/faces/index-video`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': process.env.MODAL_API_KEY || ''
-              },
-              body: JSON.stringify({
-                videoUrl: videoSignedUrl,
-                photoId,
-                eventId,
-                photographerId,
-                webhookUrl,
-                secretKey
-              }),
-              signal: AbortSignal.timeout(60000)
-            });
-
-            if (response.ok) {
-              const result = await response.json();
-              if (result && result.faces) {
-                await this.completeVideoFaceWebhook({
-                  photoId,
-                  duration: result.duration || duration,
-                  faces: result.faces,
-                  secretKey
-                });
-              } else if (result && result.status === 'QUEUED') {
-                this.logger.log(`[VideoProcessing] Video ${photoId} dispatched to Modal background worker. Result will arrive via Webhook.`);
-              }
-            }
-          } catch (videoScanErr: any) {
-            this.logger.error(`[StorageService] Modal video face scan dispatch for video ${photoId}: ${videoScanErr.message}`);
-          }
+          // Set to PENDING for offline AI worker (RTX GPU) to claim and scan automatically
+          this.logger.log(`[VideoProcessing] Video ${photoId} queued for Offline AI Worker scan (faceScanStatus: PENDING).`);
+          await this.prisma.photo.update({
+            where: { id: photoId },
+            data: { faceScanStatus: 'PENDING' }
+          });
         }
       }
 
@@ -1722,54 +1686,16 @@ export class StorageService implements OnModuleInit {
       const origCommand = new GetObjectCommand({ Bucket: this.bucketName, Key: scanKey });
       const faceIndexUrl = await getSignedUrl(this.s3Client, origCommand, { expiresIn: 600 });
 
-      // Call FastAPI Face Engine with Webhook callback support
-      const faceEngineUrl = process.env.FACE_ENGINE_URL;
-      const backendAppUrl = process.env.APP_URL || process.env.PUBLIC_API_URL;
-      const webhookUrl = `${backendAppUrl}/api/public/webhook/photo-face-complete`;
-      const secretKey = process.env.WORKER_SECRET_KEY || '';
-
-      const response = await fetch(`${faceEngineUrl}/faces/index-photo`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': process.env.MODAL_API_KEY || ''
-        },
-        body: JSON.stringify({
-          photoId,
-          eventId,
-          photographerId,
-          imageUrl: faceIndexUrl,
-          webhookUrl,
-          secretKey
-        }),
-        signal: AbortSignal.timeout(40000)
-      });
-
-      if (response.ok) {
-        const result = await response.json();
-        if (result && result.faces) {
-          await this.completePhotoFaceWebhook({
-            eventId,
-            photographerId,
-            photoId,
-            faces: result.faces,
-            secretKey
-          });
-        } else if (result && result.status === 'QUEUED') {
-          this.logger.log(`[PhotoFaceIndexing] Photo ${photoId} queued in Modal worker. Result will arrive via Webhook.`);
+      // Keep faceScanStatus as PENDING so Offline AI Worker (RTX GPU) picks it up instantly
+      this.logger.log(`[PhotoFaceIndexing] Photo ${photoId} queued for Offline AI Worker scan (faceScanStatus: PENDING).`);
+      await this.prisma.photo.update({
+        where: { id: photoId },
+        data: {
+          status: 'READY',
+          faceScanStatus: 'PENDING',
+          r2KeyThumb: thumbKey,
         }
-      } else {
-        const errText = await response.text();
-        this.logger.error(`FastAPI returned non-200 status for photo ${photoId}: ${response.status} - ${errText}`);
-        await this.prisma.photo.update({
-          where: { id: photoId },
-          data: {
-            status: 'READY',
-            faceScanStatus: 'SKIPPED',
-            r2KeyThumb: thumbKey,
-          }
-        });
-      }
+      });
 
       // Auto-backup to Google Drive if enabled (non-blocking)
       this.triggerAutoBackupIfEnabled(photographerId, photoId).catch(err =>
@@ -1778,12 +1704,12 @@ export class StorageService implements OnModuleInit {
 
       await this.updateBatchProgress(uploadBatchId, true);
     } catch (err: any) {
-      this.logger.error(`[StorageService] FastAPI background face recognition error for ${photoId}: ${err.message}`);
+      this.logger.error(`[StorageService] Photo processing error for ${photoId}: ${err.message}`);
       await this.prisma.photo.update({
         where: { id: photoId },
         data: {
           status: 'READY',
-          faceScanStatus: 'SKIPPED',
+          faceScanStatus: 'PENDING',
           r2KeyThumb: thumbKey,
         }
       }).catch(e => console.error('Failed to update status:', e));
@@ -1847,68 +1773,6 @@ export class StorageService implements OnModuleInit {
     };
   }
 
-  private async extractEmbeddingFromUrl(r2Key: string): Promise<number[] | null> {
-    const faceEngineUrl = process.env.FACE_ENGINE_URL;
-    if (!faceEngineUrl) {
-      this.logger.error('FACE_ENGINE_URL is not configured in environment variables');
-      return null;
-    }
-
-    // 1. Generate a temporary presigned GET URL for the R2 key (valid for 5 mins)
-    let imageUrl = '';
-    try {
-      const getCommand = new GetObjectCommand({
-        Bucket: this.bucketName,
-        Key: r2Key,
-      });
-      imageUrl = await getSignedUrl(this.s3Client, getCommand, { expiresIn: 300 });
-    } catch (s3Err: any) {
-      this.logger.error(`Failed to generate presigned GET URL for face search: ${s3Err.message}`);
-      return null;
-    }
-
-    // 2. Call Modal API
-    try {
-      const response = await fetch(`${faceEngineUrl.replace(/\/$/, '')}/faces/extract-url`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': process.env.MODAL_API_KEY || ''
-        },
-        body: JSON.stringify({ imageUrl }),
-        signal: AbortSignal.timeout(40000)
-      });
-
-      if (!response.ok) {
-        const errBody = await response.text();
-        this.logger.error(`[StorageService] FastAPI extract-url failed: status=${response.status}, body=${errBody}`);
-        return null;
-      }
-
-      const result = await response.json();
-
-      // 3. Delete the temp selfie from R2 bucket in the background
-      this.s3Client.send(new DeleteObjectCommand({
-        Bucket: this.bucketName,
-        Key: r2Key,
-      })).catch((delErr) => {
-        this.logger.error(`Failed to delete temp selfie ${r2Key} from R2: ${delErr.message}`);
-      });
-
-      if (result.faceCount > 0 && result.embedding) {
-        return result.embedding;
-      }
-      return null;
-    } catch (err: any) {
-      this.logger.error('[StorageService] FastAPI background face extraction from URL failed:', err.message);
-      // Clean up the file anyway
-      this.s3Client.send(new DeleteObjectCommand({
-        Bucket: this.bucketName,
-        Key: r2Key,
-      })).catch(() => { });
-      return null;
-    }
-  }
 
   async searchFace(photographerId: string, r2Key?: string, eventId?: string, clientVector?: number[]) {
     let queryEmbedding: number[] | null = null;
@@ -6006,354 +5870,7 @@ export class StorageService implements OnModuleInit {
     return { success: true };
   }
 
-  async completeVideoFaceWebhook(data: {
-    photoId: string;
-    duration?: number;
-    faces?: Array<{
-      faceIndex?: number;
-      bbox?: { x: number; y: number; w: number; h: number };
-      confidence?: number;
-      embedding: number[];
-      timestamp?: number;
-    }>;
-    secretKey: string;
-    error?: string;
-  }) {
-    const secret = process.env.WORKER_SECRET_KEY;
-    if (!secret || data.secretKey !== secret) {
-      throw new UnauthorizedException('Unauthorized webhook signature mismatch');
-    }
 
-    const photo = await this.prisma.photo.findUnique({
-      where: { id: data.photoId },
-      include: { event: true }
-    });
-
-    if (!photo) {
-      throw new NotFoundException('Photo not found');
-    }
-
-    const photographerId = photo.photographerId;
-    const eventId = photo.eventId;
-    const duration = Math.round(data.duration || photo.duration || 0);
-
-    if (data.error) {
-      this.logger.error(`[VideoFaceWebhook] Processing failed for video ${data.photoId}: ${data.error}`);
-      await this.prisma.photo.update({
-        where: { id: data.photoId },
-        data: { faceScanStatus: 'SKIPPED', status: 'READY' }
-      });
-      return { success: false, message: 'Recorded failure status without deducting credits' };
-    }
-
-    // Deduct actual cost from photographer credit balance atomically upon verified success
-    const actualMinutes = Math.ceil(duration / 60) || 1;
-    const actualCost = actualMinutes * 50; // 50 paise per minute
-
-    const photographer = await this.prisma.photographer.findUnique({
-      where: { id: photographerId },
-      select: { creditBalance: true }
-    });
-    const latestBalance = photographer?.creditBalance || 0;
-    const deductAmount = Math.min(actualCost, latestBalance);
-
-    if (deductAmount > 0) {
-      await this.prisma.photographer.update({
-        where: { id: photographerId },
-        data: {
-          creditBalance: {
-            decrement: deductAmount
-          }
-        }
-      });
-
-      // Log transaction
-      await this.prisma.creditTransaction.create({
-        data: {
-          photographerId,
-          amount: -deductAmount,
-          action: 'VIDEO_SCAN',
-          description: `Scanned video (duration ${actualMinutes} min) for event: ${photo.event?.title || 'Unknown Event'}`
-        }
-      });
-    }
-
-    // Delete any existing face embeddings for this video photo first to prevent duplicates
-    await this.prisma.faceEmbedding.deleteMany({
-      where: { photoId: data.photoId }
-    });
-
-    if (data.faces && data.faces.length > 0) {
-      const faceData = data.faces.map((f: any) => ({
-        photoId: data.photoId,
-        eventId,
-        photographerId,
-        faceIndex: f.faceIndex ?? 0,
-        bboxX: f.bbox?.x ?? 0,
-        bboxY: f.bbox?.y ?? 0,
-        bboxW: f.bbox?.w ?? 0,
-        bboxH: f.bbox?.h ?? 0,
-        confidence: f.confidence ?? 0.95,
-        embedding: f.embedding,
-        timestamp: f.timestamp || 0,
-      }));
-
-      const values = faceData.map((f: any) => {
-        const vectorStr = `[${f.embedding.join(',')}]`;
-        return `('${uuidv4()}', '${f.photoId}', '${f.eventId}', '${f.photographerId}', ${f.faceIndex}, ${f.bboxX}, ${f.bboxY}, ${f.bboxW}, ${f.bboxH}, ${f.confidence}, '${vectorStr}'::vector, NULL, ${f.timestamp})`;
-      }).join(',');
-
-      await this.prisma.$executeRawUnsafe(`
-        INSERT INTO face_embeddings ("id", "photoId", "eventId", "photographerId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding", "clusterId", "timestamp")
-        VALUES ${values}
-      `);
-    }
-
-    const targetStatus = photo.status === 'PENDING_APPROVAL' ? 'PENDING_APPROVAL' : 'READY';
-    await this.prisma.photo.update({
-      where: { id: data.photoId },
-      data: {
-        faceScanStatus: 'READY',
-        status: targetStatus,
-        duration: duration > 0 ? duration : undefined
-      }
-    });
-
-    if (photo.uploadBatchId) {
-      await this.updateBatchProgress(photo.uploadBatchId, true);
-    }
-
-    await this.invalidateEventCache(eventId);
-
-    this.logger.log(`[VideoFaceWebhook] Successfully indexed video ${data.photoId} with ${data.faces?.length || 0} faces, duration ${duration}s.`);
-    return { success: true, faceCount: data.faces?.length || 0, duration };
-  }
-
-  async completePhotoFaceWebhook(data: {
-    eventId?: string;
-    photographerId?: string;
-    results?: Array<{
-      photoId: string;
-      faces?: Array<{
-        faceIndex?: number;
-        bbox?: { x: number; y: number; w: number; h: number };
-        confidence?: number;
-        embedding: number[];
-      }>;
-      faceCount?: number;
-      success?: boolean;
-      error?: string;
-    }>;
-    photoId?: string;
-    faces?: Array<{
-      faceIndex?: number;
-      bbox?: { x: number; y: number; w: number; h: number };
-      confidence?: number;
-      embedding: number[];
-    }>;
-    secretKey: string;
-    error?: string;
-  }) {
-    const secret = process.env.WORKER_SECRET_KEY;
-    if (!secret || data.secretKey !== secret) {
-      throw new UnauthorizedException('Unauthorized webhook signature mismatch');
-    }
-
-    // Normalize single-photo or batch format to standard results array
-    let items = data.results || [];
-    if (!items.length && data.photoId) {
-      items = [{
-        photoId: data.photoId,
-        faces: data.faces,
-        faceCount: data.faces?.length || 0,
-        success: !data.error,
-        error: data.error
-      }];
-    }
-
-    if (items.length === 0) {
-      return { success: true, processedCount: 0 };
-    }
-
-    const firstPhoto = await this.prisma.photo.findUnique({
-      where: { id: items[0].photoId },
-      include: { event: true }
-    });
-
-    if (!firstPhoto) {
-      this.logger.error(`[PhotoFaceWebhook] Photo ${items[0].photoId} not found`);
-      return { success: false, message: 'Photo not found' };
-    }
-
-    const photographerId = data.photographerId || firstPhoto.photographerId;
-    const eventId = data.eventId || firstPhoto.eventId;
-
-    // Filter successfully scanned photos (only deduct for photos that were actually processed without error)
-    const successfulItems = items.filter(r => r.success !== false && !r.error);
-    const totalSuccessfulPhotos = successfulItems.length;
-
-    // For failed items from Modal, update status to SKIPPED to prevent infinite background retry loops
-    const failedItems = items.filter(r => r.success === false || !!r.error);
-    if (failedItems.length > 0) {
-      const failedIds = failedItems.map(f => f.photoId);
-      await this.prisma.photo.updateMany({
-        where: { id: { in: failedIds } },
-        data: { faceScanStatus: 'SKIPPED' }
-      }).catch(err => this.logger.error(`[PhotoFaceWebhook] Error marking failed items: ${err.message}`));
-    }
-
-    // 10 paise per successfully scanned photo
-    const actualCost = totalSuccessfulPhotos * 10;
-
-    const photographer = await this.prisma.photographer.findUnique({
-      where: { id: photographerId },
-      select: { creditBalance: true }
-    });
-    const latestBalance = photographer?.creditBalance || 0;
-    const deductAmount = Math.min(actualCost, latestBalance);
-
-    if (deductAmount > 0) {
-      await this.prisma.photographer.update({
-        where: { id: photographerId },
-        data: {
-          creditBalance: {
-            decrement: deductAmount
-          }
-        }
-      });
-
-      // Log transaction
-      await this.prisma.creditTransaction.create({
-        data: {
-          photographerId,
-          amount: -deductAmount,
-          action: 'PHOTO_SCAN',
-          description: `Scanned ${totalSuccessfulPhotos} photo(s) for event: ${firstPhoto.event?.title || 'Unknown Event'}`
-        }
-      });
-    }
-
-    // Fetch existing faces in this event for auto-cluster assignment
-    interface RawExistingFace {
-      clusterId: string;
-      embeddingStr: string;
-    }
-    const existingFaces = await this.prisma.$queryRaw<RawExistingFace[]>`
-      SELECT "clusterId", "embedding"::text as "embeddingStr"
-      FROM face_embeddings
-      WHERE "eventId" = ${eventId} AND "clusterId" IS NOT NULL
-    `.catch(() => [] as RawExistingFace[]);
-
-    // Process each item: insert face embeddings and update photo record
-    for (const item of items) {
-      if (item.success === false || item.error) {
-        this.logger.warn(`[PhotoFaceWebhook] Photo ${item.photoId} face scan failed: ${item.error}`);
-        await this.prisma.photo.update({
-          where: { id: item.photoId },
-          data: { faceScanStatus: 'SKIPPED', status: 'READY' }
-        }).catch(() => { });
-        continue;
-      }
-
-      const faces = item.faces || [];
-      const hasFaces = faces.length > 0;
-      const faceCount = faces.length;
-
-      // Delete any previous face embeddings for this photo first to prevent duplicates
-      await this.prisma.faceEmbedding.deleteMany({
-        where: { photoId: item.photoId }
-      }).catch(() => { });
-
-      if (hasFaces) {
-        const faceData = faces.map((f: any, idx: number) => {
-          const newEmb = f.embedding;
-          let assignedClusterId: string | null = null;
-
-          if (Array.isArray(newEmb) && existingFaces.length > 0) {
-            let maxSimilarity = -1;
-            let bestClusterId: string | null = null;
-
-            for (const ext of existingFaces) {
-              let extEmb: any = ext.embeddingStr;
-              if (typeof extEmb === 'string') {
-                try { extEmb = JSON.parse(extEmb); } catch { continue; }
-              }
-              const extEmbArray = extEmb as number[];
-              const newEmbArray = newEmb as number[];
-              if (!Array.isArray(extEmbArray) || extEmbArray.length !== newEmbArray.length) continue;
-
-              let dotProduct = 0;
-              for (let i = 0; i < newEmbArray.length; i++) {
-                dotProduct += newEmbArray[i] * extEmbArray[i];
-              }
-
-              if (dotProduct > 0.45 && dotProduct > maxSimilarity) {
-                maxSimilarity = dotProduct;
-                bestClusterId = ext.clusterId;
-              }
-            }
-
-            if (bestClusterId) {
-              assignedClusterId = bestClusterId;
-            }
-          }
-
-          return {
-            photoId: item.photoId,
-            eventId,
-            photographerId,
-            faceIndex: f.faceIndex ?? idx,
-            bboxX: f.bbox?.x ?? 0,
-            bboxY: f.bbox?.y ?? 0,
-            bboxW: f.bbox?.w ?? 0,
-            bboxH: f.bbox?.h ?? 0,
-            confidence: f.confidence ?? 0.95,
-            embedding: f.embedding,
-            clusterId: assignedClusterId
-          };
-        });
-
-        const values = faceData.map((f: any) => {
-          const vectorStr = `[${f.embedding.join(',')}]`;
-          const clusterIdVal = f.clusterId ? `'${f.clusterId}'` : 'NULL';
-          return `('${uuidv4()}', '${f.photoId}', '${f.eventId}', '${f.photographerId}', ${f.faceIndex}, ${f.bboxX}, ${f.bboxY}, ${f.bboxW}, ${f.bboxH}, ${f.confidence}, '${vectorStr}'::vector, ${clusterIdVal})`;
-        }).join(',');
-
-        await this.prisma.$executeRawUnsafe(`
-          INSERT INTO face_embeddings ("id", "photoId", "eventId", "photographerId", "faceIndex", "bboxX", "bboxY", "bboxW", "bboxH", "confidence", "embedding", "clusterId")
-          VALUES ${values}
-        `).catch(err => {
-          this.logger.error(`[PhotoFaceWebhook] Error inserting face embeddings for photo ${item.photoId}: ${err.message}`);
-        });
-      }
-
-      const currentPhoto = await this.prisma.photo.findUnique({
-        where: { id: item.photoId },
-        select: { status: true }
-      });
-
-      const targetStatus = currentPhoto?.status === 'PENDING_APPROVAL' ? 'PENDING_APPROVAL' : 'READY';
-
-      const updated = await this.prisma.photo.update({
-        where: { id: item.photoId },
-        data: {
-          faceScanStatus: 'READY',
-          hasFaces,
-          faceCount,
-          status: targetStatus
-        }
-      }).catch(() => null);
-
-      if (updated?.uploadBatchId) {
-        await this.updateBatchProgress(updated.uploadBatchId, true).catch(() => { });
-      }
-    }
-
-    await this.invalidateEventCache(eventId);
-
-    this.logger.log(`[PhotoFaceWebhook] Successfully indexed ${totalSuccessfulPhotos}/${items.length} photos for event ${eventId}. Deducted ${deductAmount} paise.`);
-    return { success: true, processedCount: totalSuccessfulPhotos, totalCount: items.length };
-  }
 
   async triggerCloudflareWorker(photoId: string, r2KeyOriginal: string): Promise<void> {
     const modalUrl = `${process.env.THUMBNAIL_ENGINE_URL}/generate-thumbnail`;
@@ -6618,81 +6135,10 @@ export class StorageService implements OnModuleInit {
           photos.push(...scannablePhotos);
         }
 
-        // Mark items as PROCESSING
-        const finalPendingItems = [...photos, ...videos];
-        if (finalPendingItems.length === 0) {
-          await new Promise(resolve => setTimeout(resolve, 300));
-          continue;
-        }
-
-        const itemIds = finalPendingItems.map(p => p.id);
-        await this.prisma.photo.updateMany({
-          where: { id: { in: itemIds } },
-          data: { faceScanStatus: 'PROCESSING' }
-        });
-
-        // 1. Process Batch of Photos in 1 SINGLE HTTP Request to Modal GPU (/faces/index-batch-photos)
-        if (photos.length > 0) {
-          try {
-            const faceEngineUrl = process.env.FACE_ENGINE_URL;
-            const photoBatchPayload: { photoId: string; imageUrl: string }[] = [];
-
-            for (const photo of photos) {
-              // Use real r2KeyPreview if present in database (correct .jpg extension for HEIC/images), fallback to r2KeyOriginal
-              const scanKey = photo.r2KeyPreview || photo.r2KeyOriginal;
-              const signedUrl = await this.getReadUrl(scanKey);
-              if (signedUrl) {
-                photoBatchPayload.push({ photoId: photo.id, imageUrl: signedUrl });
-              }
-            }
-
-            if (photoBatchPayload.length > 0) {
-              const backendAppUrl = process.env.APP_URL || process.env.PUBLIC_API_URL;
-              const webhookUrl = `${backendAppUrl}/api/public/webhook/photo-face-complete`;
-              const secretKey = process.env.WORKER_SECRET_KEY || '';
-
-              const response = await fetch(`${faceEngineUrl}/faces/index-batch-photos`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'x-api-key': process.env.MODAL_API_KEY || ''
-                },
-                body: JSON.stringify({
-                  eventId,
-                  photographerId,
-                  items: photoBatchPayload,
-                  webhookUrl,
-                  secretKey
-                }),
-                signal: AbortSignal.timeout(40000)
-              });
-
-              if (response.ok) {
-                const batchResult = await response.json();
-                if (batchResult && batchResult.results) {
-                  // Synchronous return from Modal: complete using standard webhook handler
-                  await this.completePhotoFaceWebhook({
-                    eventId,
-                    photographerId,
-                    results: batchResult.results,
-                    secretKey
-                  });
-                } else if (batchResult && batchResult.status === 'QUEUED') {
-                  this.logger.log(`[BatchFaceScan] Batch of ${photoBatchPayload.length} photos queued in Modal worker. Result will arrive via Webhook.`);
-                }
-              }
-            }
-          } catch (batchErr: any) {
-            this.logger.error(`[BatchFaceScan] Photo batch scanning dispatch error for event ${eventId}: ${batchErr.message}`);
-            const photoIds = photos.map(p => p.id);
-            await this.prisma.photo.updateMany({
-              where: { id: { in: photoIds } },
-              data: { faceScanStatus: 'PENDING' }
-            });
-          }
-        }
-
-        // 2. Process Videos
+        // Offline AI Worker (RTX GPU) handles scanning via background queue polling
+        this.logger.log(`[BatchFaceScan] ${photos.length} photos and ${videos.length} videos available in PENDING queue for Offline AI Worker.`);
+        
+        // 2. Process Videos (for thumbnails / metadata)
         for (const video of videos) {
           await this.runBackgroundVideoProcessing(
             photographerId,
@@ -6701,9 +6147,10 @@ export class StorageService implements OnModuleInit {
             video.r2KeyOriginal,
             video.uploadBatchId
           ).catch(err => {
-            this.logger.error(`[BatchFaceScan] Video scan failed for ${video.id}:`, err);
+            this.logger.error(`[BatchFaceScan] Video thumbnail generation failed for ${video.id}:`, err);
           });
         }
+
 
         // Re-check sleep pause (300ms) before checking if new ready thumbnails appeared in the meantime
         await new Promise(resolve => setTimeout(resolve, 300));

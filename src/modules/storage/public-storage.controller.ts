@@ -258,42 +258,6 @@ export class PublicStorageController {
     return this.storageService.completeDriveBackupWebhook(body);
   }
 
-  // Public webhook call from Modal GPU upon video face indexing completion
-  @Post('webhook/video-face-complete')
-  async handleVideoFaceComplete(
-    @Body() body: {
-      photoId: string;
-      duration?: number;
-      faces?: any[];
-      secretKey: string;
-      error?: string;
-    }
-  ) {
-    return this.storageService.completeVideoFaceWebhook(body);
-  }
-
-  // Public webhook call from Modal GPU upon photo face batch/single indexing completion
-  @Post('webhook/photo-face-complete')
-  async handlePhotoFaceComplete(
-    @Body() body: {
-      eventId?: string;
-      photographerId?: string;
-      results?: Array<{
-        photoId: string;
-        faces?: any[];
-        faceCount?: number;
-        success?: boolean;
-        error?: string;
-      }>;
-      // Also support single photo payload format
-      photoId?: string;
-      faces?: any[];
-      secretKey: string;
-      error?: string;
-    }
-  ) {
-    return this.storageService.completePhotoFaceWebhook(body);
-  }
 
   // Public AI Models Presigned Direct Download URLs (From Cloudflare R2)
   @Get('ai-models/urls')

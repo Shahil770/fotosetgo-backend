@@ -1036,7 +1036,7 @@ export class AuthService {
   }
 
   async updateProfile(userId: string, data: any) {
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const updatedUser = await tx.user.update({
         where: { id: userId },
         data: {
@@ -1084,6 +1084,13 @@ export class AuthService {
         },
       });
     });
+
+    // Invalidate Redis JWT cache so next /auth/profile returns fresh data
+    try {
+      await this.redis.del(`cache:jwt:user:${userId}`);
+    } catch (_) {}
+
+    return result;
   }
 
   async changePassword(userId: string, data: any) {

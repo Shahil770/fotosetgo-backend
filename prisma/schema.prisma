@@ -61,6 +61,7 @@ model Photographer {
   slug                  String         @unique
   city                  String?
   state                 String?
+  country               String?        @default("India")
   bio                   String?
   website               String?
   totalStorageUsedBytes BigInt         @default(0)
@@ -122,7 +123,6 @@ model Photographer {
   googleDriveConnected       Boolean        @default(false)
   autoBackupToDrive          Boolean        @default(false)  // Auto backup all events to Google Drive
   driveBackupFullNotified    Boolean        @default(false)  // Drive full notification sent
-  videoFaceScanningEnabled   Boolean        @default(false)
   beamFtpPhotosUsedThisMonth Int            @default(0)      // Permanent monthly Beam FTP uploaded photos count
   beamFtpVideosUsedThisMonth Int            @default(0)      // Permanent monthly Beam FTP uploaded videos count
   beamFtpPhotosBillingCycle  String?                         // Billing month tag e.g. "2026_09" for automatic reset

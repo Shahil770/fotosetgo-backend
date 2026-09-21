@@ -1063,9 +1063,9 @@ export class AuthService {
             studioName: data.studioName,
             city: data.city,
             state: data.state,
+            country: data.country,
             bio: data.bio,
             website: data.website,
-            videoFaceScanningEnabled: data.videoFaceScanningEnabled !== undefined ? data.videoFaceScanningEnabled : undefined,
           },
         });
       }

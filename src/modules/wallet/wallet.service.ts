@@ -18,7 +18,7 @@ export class WalletService {
     private readonly prisma: PrismaService,
     @Inject(forwardRef(() => BillingService))
     private readonly billingService: BillingService,
-  ) {}
+  ) { }
 
   /**
    * Get or Seed Default Wallet Configuration
@@ -254,7 +254,7 @@ export class WalletService {
             appliedPromoCodeId = promoValidation.promoCodeId || null;
             appliedPromoCodeText = promoValidation.code || null;
           }
-        } catch (e) {}
+        } catch (e) { }
       }
 
       const finalTaxableSubtotalPaise = Math.max(

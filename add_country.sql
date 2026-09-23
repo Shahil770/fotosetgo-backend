@@ -1,0 +1,1 @@
+ALTER TABLE photographers ADD COLUMN IF NOT EXISTS country TEXT DEFAULT 'India';

@@ -132,6 +132,17 @@ export class StorageService implements OnModuleInit {
           `cache:event:detail:${eventId}`,
           'cache:public:events:list'
         ];
+
+        try {
+          const listKeys = await this.scanKeys(`cache:events:list:${event.photographerId}*`);
+          if (listKeys && listKeys.length > 0) keys.push(...listKeys);
+        } catch {}
+
+        try {
+          const photoKeys = await this.scanKeys(`cache:event:photos:${eventId}*`);
+          if (photoKeys && photoKeys.length > 0) keys.push(...photoKeys);
+        } catch {}
+
         if (event.slug) {
           keys.push(`cache:public:event:${event.slug}`);
           keys.push(`cache:public:event:limits:${event.slug}`);
@@ -141,8 +152,10 @@ export class StorageService implements OnModuleInit {
             keys.push(...matchKeys);
           }
         }
-        await this.redis.del(...keys);
-        this.logger.log(`[Cache Invalidation] Successfully cleared Redis caches for event slug: ${event.slug || eventId}`);
+        if (keys.length > 0) {
+          await this.redis.del(...keys);
+        }
+        this.logger.log(`[Cache Invalidation] Successfully cleared Redis caches (${keys.length} keys) for event: ${event.slug || eventId}`);
       }
     } catch (err: any) {
       this.logger.error(`[Cache Invalidation] Failed to clear Redis cache for event ${eventId}:`, err.message);
@@ -359,7 +372,10 @@ export class StorageService implements OnModuleInit {
       throw new BadRequestException('Events storage limit exceeded. Please empty your trash or upgrade your plan.');
     }
 
-    const isVideo = data.mimeType.startsWith('video/') || data.filename.match(/\.(mp4|mkv|mov|webm)$/i);
+    const isVideo = data.mimeType.startsWith('video/') || Boolean(data.filename.match(/\.(mp4|mkv|mov|webm)$/i));
+    if (isVideo && data.fileSize > 6 * 1024 * 1024 * 1024) {
+      throw new BadRequestException('Single video file size exceeds the maximum limit of 6 GB.');
+    }
     const fileUuid = uuidv4();
     const cleanFilename = data.filename.replace(/[^a-zA-Z0-9.-]/g, '_');
     const baseName = cleanFilename.replace(/\.[^/.]+$/, '');
@@ -505,6 +521,13 @@ export class StorageService implements OnModuleInit {
 
     if (eventsUsedBytes + incomingBatchBytes > limitBytes) {
       throw new BadRequestException('Events storage limit exceeded. Please empty your trash or upgrade your plan.');
+    }
+
+    for (const file of files) {
+      const isVideo = file.mimeType.startsWith('video/') || Boolean(file.filename.match(/\.(mp4|mkv|mov|webm)$/i));
+      if (isVideo && file.fileSize > 6 * 1024 * 1024 * 1024) {
+        throw new BadRequestException(`Single video file "${file.filename}" exceeds the maximum limit of 6 GB.`);
+      }
     }
 
     const processedFiles = files.map(file => {
@@ -1503,13 +1526,13 @@ export class StorageService implements OnModuleInit {
       const currentBalance = photographer?.creditBalance || 0;
       const canAffordScan = currentBalance >= estimatedCost;
 
-      if (!isPendingApproval && photographer?.videoFaceScanningEnabled && event?.videoScanningEnabled) {
+      if (!isPendingApproval && event?.videoScanningEnabled) {
         if (!canAffordScan) {
-          // NOT enough credits for estimated duration — mark as SKIPPED
-          this.logger.warn(`[VideoProcessing] Photographer ${photographerId} has insufficient credits (${currentBalance} paise) for estimated video cost (${estimatedCost} paise, ~${estimatedMinutes} min). Marking as SKIPPED.`);
-          await this.prisma.photo.update({
-            where: { id: photoId },
-            data: { faceScanStatus: 'SKIPPED' }
+          // NOT enough credits for estimated duration — leave as PENDING and auto-disable event video toggle
+          this.logger.warn(`[VideoProcessing] Photographer ${photographerId} has insufficient credits (${currentBalance} paise) for estimated video cost (${estimatedCost} paise, ~${estimatedMinutes} min). Leaving as PENDING and disabling video scan toggle.`);
+          await this.prisma.event.update({
+            where: { id: eventId },
+            data: { videoScanningEnabled: false }
           });
         } else {
           // Set to PENDING for offline AI worker (RTX GPU) to claim and scan automatically
@@ -2443,9 +2466,27 @@ export class StorageService implements OnModuleInit {
   async invalidateEventPhotosCache(photographerId: string, eventIds: string | string[]) {
     try {
       const idList = (Array.isArray(eventIds) ? eventIds : [eventIds]).filter(Boolean);
-      const keys = [`cache:events:list:${photographerId}`];
+      const keys: string[] = [];
+
+      try {
+        const listKeys = await this.scanKeys(`cache:events:list:${photographerId}*`);
+        if (listKeys && listKeys.length > 0) {
+          keys.push(...listKeys);
+        }
+      } catch (err: any) {
+        this.logger.error(`[Cache Invalidate] Error scanning event list keys: ${err.message}`);
+      }
+
       for (const eid of idList) {
         keys.push(`cache:event:detail:${eid}`);
+        try {
+          const photoKeys = await this.scanKeys(`cache:event:photos:${eid}*`);
+          if (photoKeys && photoKeys.length > 0) {
+            keys.push(...photoKeys);
+          }
+        } catch (err: any) {
+          this.logger.error(`[Cache Invalidate] Error scanning photo keys for ${eid}: ${err.message}`);
+        }
       }
 
       // Also invalidate public event & photo caches for real-time guest sync
@@ -2457,7 +2498,7 @@ export class StorageService implements OnModuleInit {
         if (evt.slug) {
           keys.push(`cache:public:event:${evt.slug}`);
           try {
-            const photoCacheKeys = await this.redis.keys(`cache:public:photos:${evt.slug}:*`);
+            const photoCacheKeys = await this.scanKeys(`cache:public:photos:${evt.slug}:*`);
             if (photoCacheKeys && photoCacheKeys.length > 0) {
               keys.push(...photoCacheKeys);
             }
@@ -2468,7 +2509,7 @@ export class StorageService implements OnModuleInit {
       if (keys.length > 0) {
         await this.redis.del(...keys);
       }
-      this.logger.log(`[Cache Invalidate] Cleared event photo caches for event(s): ${idList.join(', ')}`);
+      this.logger.log(`[Cache Invalidate] Cleared event photo caches (${keys.length} keys) for event(s): ${idList.join(', ')}`);
     } catch (err: any) {
       this.logger.error(`[Cache Invalidate] Failed: ${err.message}`);
     }
@@ -2514,23 +2555,30 @@ export class StorageService implements OnModuleInit {
     return { success: true, count: photoIds.length };
   }
 
-  // Get all Trash items (Deleted Events and Deleted Photos/Videos)
-  async getTrashData(photographerId: string) {
-    const deletedEvents = await this.prisma.event.findMany({
-      where: { photographerId, isDeleted: true },
-      orderBy: { deletedAt: 'desc' },
-      include: {
-        _count: { select: { photos: true } },
-      },
-    });
+  // Get all Trash items with high-speed backend pagination
+  async getTrashData(photographerId: string, page: number = 1, limit: number = 40) {
+    const skip = (page - 1) * limit;
 
-    const deletedPhotos = await this.prisma.photo.findMany({
-      where: { photographerId, isDeleted: true },
-      orderBy: { deletedAt: 'desc' },
-      include: {
-        event: { select: { id: true, title: true, isDeleted: true } },
-      },
-    });
+    const [totalEvents, totalPhotos, deletedEvents, deletedPhotos] = await Promise.all([
+      this.prisma.event.count({ where: { photographerId, isDeleted: true } }),
+      this.prisma.photo.count({ where: { photographerId, isDeleted: true } }),
+      this.prisma.event.findMany({
+        where: { photographerId, isDeleted: true },
+        orderBy: { deletedAt: 'desc' },
+        include: {
+          _count: { select: { photos: true } },
+        },
+      }),
+      this.prisma.photo.findMany({
+        where: { photographerId, isDeleted: true },
+        orderBy: { deletedAt: 'desc' },
+        skip,
+        take: limit,
+        include: {
+          event: { select: { id: true, title: true, isDeleted: true } },
+        },
+      }),
+    ]);
 
     const photosWithUrls = await Promise.all(
       deletedPhotos.map(async (photo) => {
@@ -2548,6 +2596,11 @@ export class StorageService implements OnModuleInit {
     return {
       events: deletedEvents,
       photos: photosWithUrls,
+      page,
+      limit,
+      totalEvents,
+      totalPhotos,
+      hasMorePhotos: skip + deletedPhotos.length < totalPhotos,
     };
   }
 
@@ -3419,8 +3472,11 @@ export class StorageService implements OnModuleInit {
 
     const requiresPasscode = event.visibility === 'PRIVATE' || (event.passcode && event.passcode !== '');
     if (requiresPasscode) {
-      if (!passcode || passcode !== event.passcode) {
-        // Increment failed attempts counter in Redis with 5-min sliding expiration
+      if (!passcode || passcode.trim() === '') {
+        throw new UnauthorizedException('Passcode required to view event photos.');
+      }
+      if (passcode !== event.passcode) {
+        // Increment failed attempts counter in Redis with 5-min sliding expiration only on actual wrong attempt
         try {
           const fails = await this.redis.incr(failKey);
           if (fails === 1) {
@@ -3954,7 +4010,10 @@ export class StorageService implements OnModuleInit {
 
     const requiresPasscode = event.visibility === 'PRIVATE' || (event.passcode && event.passcode !== '');
     if (requiresPasscode) {
-      if (!passcode || passcode !== event.passcode) {
+      if (!passcode || passcode.trim() === '') {
+        throw new UnauthorizedException('Passcode required to download event photos.');
+      }
+      if (passcode !== event.passcode) {
         try {
           const fails = await this.redis.incr(failKey);
           if (fails === 1) await this.redis.expire(failKey, 300);
@@ -5424,7 +5483,18 @@ export class StorageService implements OnModuleInit {
     clientPhone: string;
     eventDate?: string;
     message: string;
-  }) {
+  }, clientIp?: string) {
+    if (this.redis && clientIp) {
+      const ipKey = `rate:portfolio:inquiry:ip:${clientIp}`;
+      const count = await this.redis.incr(ipKey);
+      if (count === 1) {
+        await this.redis.expire(ipKey, 300); // 5 minutes window
+      }
+      if (count > 2) {
+        throw new HttpException('Too many inquiries sent from this network. Please wait a few minutes before submitting again.', HttpStatus.TOO_MANY_REQUESTS);
+      }
+    }
+
     const cleanSubdomain = subdomain.toLowerCase().replace(/[^a-z0-9-]/g, '');
     const photographer = await this.prisma.photographer.findUnique({
       where: { studioSubdomain: cleanSubdomain }
@@ -5609,9 +5679,21 @@ export class StorageService implements OnModuleInit {
     clientRole?: string;
     rating: number;
     comment: string;
-  }) {
+  }, clientIp?: string) {
+    if (this.redis && clientIp) {
+      const ipKey = `rate:portfolio:review:ip:${clientIp}`;
+      const count = await this.redis.incr(ipKey);
+      if (count === 1) {
+        await this.redis.expire(ipKey, 300); // 5 minutes window
+      }
+      if (count > 2) {
+        throw new HttpException('Too many reviews submitted from this network. Please wait a few minutes before submitting again.', HttpStatus.TOO_MANY_REQUESTS);
+      }
+    }
+
+    const cleanSubdomain = subdomain.toLowerCase().replace(/[^a-z0-9-]/g, '');
     const photographer = await this.prisma.photographer.findUnique({
-      where: { studioSubdomain: subdomain }
+      where: { studioSubdomain: cleanSubdomain }
     });
     if (!photographer) throw new NotFoundException('Portfolio not found');
     if (data.rating < 1 || data.rating > 5) throw new Error('Rating must be between 1 and 5');

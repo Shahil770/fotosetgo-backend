@@ -16,7 +16,7 @@ export class GoogleDriveController {
   // Auth Redirect Link Generator
   @UseGuards(JwtAuthGuard)
   @Get('auth-url')
-  async getAuthUrl(@Req() req: any) {
+  async getAuthUrl(@Query('source') source: string, @Req() req: any) {
     const photographerId = req.user.photographer?.id || req.user.id;
     const activeSub = await this.prisma.subscription.findFirst({
       where: { photographerId, status: 'ACTIVE' },
@@ -27,7 +27,8 @@ export class GoogleDriveController {
     if (!hasAutoBackup) {
       throw new ForbiddenException('Google Drive integration is only available on PRO plans.');
     }
-    const url = this.googleDriveService.getAuthUrl(photographerId);
+    const state = source ? `${photographerId}:::${source}` : `${photographerId}:::settings`;
+    const url = this.googleDriveService.getAuthUrl(state);
     return { url };
   }
 
@@ -40,13 +41,27 @@ export class GoogleDriveController {
   ) {
     const dashboardUrl = process.env.DASHBOARD_URL || 
       (process.env.NODE_ENV === 'production' ? 'https://dashboard.fotosetgo.com' : 'http://localhost:3000');
+    
+    let photographerId = state;
+    let source = 'settings';
+    if (state && state.includes(':::')) {
+      const parts = state.split(':::');
+      photographerId = parts[0];
+      source = parts[1] || 'settings';
+    }
+
+    const redirectPath = source === 'google-drive'
+      ? '/dashboard/google-drive'
+      : '/dashboard/settings?tab=storage';
+
     try {
-      const photographerId = state;
       await this.googleDriveService.handleCallback(code, photographerId);
-      return res.redirect(`${dashboardUrl}/dashboard/storage?drive=connected`);
+      const sep = redirectPath.includes('?') ? '&' : '?';
+      return res.redirect(`${dashboardUrl}${redirectPath}${sep}drive=connected`);
     } catch (err) {
       console.error('[GoogleDrive] Auth callback failed:', err);
-      return res.redirect(`${dashboardUrl}/dashboard/storage?drive=error`);
+      const sep = redirectPath.includes('?') ? '&' : '?';
+      return res.redirect(`${dashboardUrl}${redirectPath}${sep}drive=error`);
     }
   }
 

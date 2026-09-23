@@ -1293,8 +1293,8 @@ export class BillingService implements OnModuleInit {
   }
 
   /**
-   * High-Performance Async Plan Inquiry Submission with Redis Queue
-   * Scales to 10,000+ submissions on 1 vCPU / 4GB RAM with < 3ms response time
+   * High-Performance Async Plan Inquiry Submission with 24-Hour Multi-Layer Rate Limiting
+   * Prevents spam across Phone, Email, User ID, and IP Address (TTL = 24 Hours / 86400s)
    */
   async submitPlanInquiry(data: {
     photographerId?: string;
@@ -1305,11 +1305,104 @@ export class BillingService implements OnModuleInit {
     eventDate?: string;
     requirements?: string;
     source?: string;
+    clientIp?: string;
   }) {
+    const cleanPhone = (data.phone || '').replace(/\D/g, '');
+    const cleanEmail = (data.email || '').trim().toLowerCase();
+    const clientIp = (data.clientIp || '').trim();
+    const TWENTY_FOUR_HOURS_SECONDS = 86400; // 24 Hours in seconds
+
+    // 1. Layer 1: Redis Fast Cache Check (O(1) lookup across Phone, Email, User, IP)
+    if (this.redis && this.redis.status === 'ready') {
+      try {
+        const keysToCheck: string[] = [];
+        if (cleanPhone && cleanPhone.length >= 7) {
+          keysToCheck.push(`ratelimit:inquiry:phone:${cleanPhone.slice(-10)}`);
+        }
+        if (cleanEmail && cleanEmail.includes('@')) {
+          keysToCheck.push(`ratelimit:inquiry:email:${cleanEmail}`);
+        }
+        if (data.photographerId) {
+          keysToCheck.push(`ratelimit:inquiry:user:${data.photographerId}`);
+        }
+        if (clientIp) {
+          keysToCheck.push(`ratelimit:inquiry:ip:${clientIp}`);
+        }
+
+        if (keysToCheck.length > 0) {
+          const results = await this.redis.mget(...keysToCheck);
+          const hasExisting = results.some((val) => val !== null);
+          if (hasExisting) {
+            this.logger.log(`[PlanInquiry] 🛡️ Blocked duplicate request within 24h for phone:${cleanPhone} / email:${cleanEmail} / ip:${clientIp}`);
+            return {
+              success: true,
+              alreadySubmitted: true,
+              message: 'Your inquiry has already been received within the last 24 hours. Our team is reviewing it and will contact you shortly.',
+            };
+          }
+        }
+      } catch (redisErr: any) {
+        this.logger.warn(`[PlanInquiry] Redis rate limit check fallback: ${redisErr.message}`);
+      }
+    }
+
+    // 2. Layer 2: Database Fallback Check (Guarantees zero loophole if Redis was restarted)
+    try {
+      const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const orConditions: any[] = [];
+      if (cleanPhone && cleanPhone.length >= 7) {
+        orConditions.push({ phone: { contains: cleanPhone.slice(-10) } });
+      }
+      if (cleanEmail && cleanEmail.includes('@')) {
+        orConditions.push({ email: { equals: cleanEmail, mode: 'insensitive' } });
+      }
+      if (data.photographerId) {
+        orConditions.push({ photographerId: data.photographerId });
+      }
+
+      if (orConditions.length > 0) {
+        const recent = await this.prisma.planInquiry.findFirst({
+          where: {
+            createdAt: { gte: twentyFourHoursAgo },
+            OR: orConditions,
+          },
+        });
+
+        if (recent) {
+          // Re-populate Redis keys so next clicks are instantly caught
+          if (this.redis && this.redis.status === 'ready') {
+            const pipe = this.redis.pipeline();
+            if (cleanPhone && cleanPhone.length >= 7) {
+              pipe.set(`ratelimit:inquiry:phone:${cleanPhone.slice(-10)}`, '1', 'EX', TWENTY_FOUR_HOURS_SECONDS);
+            }
+            if (cleanEmail && cleanEmail.includes('@')) {
+              pipe.set(`ratelimit:inquiry:email:${cleanEmail}`, '1', 'EX', TWENTY_FOUR_HOURS_SECONDS);
+            }
+            if (data.photographerId) {
+              pipe.set(`ratelimit:inquiry:user:${data.photographerId}`, '1', 'EX', TWENTY_FOUR_HOURS_SECONDS);
+            }
+            if (clientIp) {
+              pipe.set(`ratelimit:inquiry:ip:${clientIp}`, '1', 'EX', TWENTY_FOUR_HOURS_SECONDS);
+            }
+            await pipe.exec().catch(() => {});
+          }
+
+          this.logger.log(`[PlanInquiry] 🛡️ DB Found recent lead within 24h. Rate limiting response.`);
+          return {
+            success: true,
+            alreadySubmitted: true,
+            message: 'Your inquiry has already been received within the last 24 hours. Our team is reviewing it and will contact you shortly.',
+          };
+        }
+      }
+    } catch (dbCheckErr: any) {
+      this.logger.warn(`[PlanInquiry] DB Rate check warning: ${dbCheckErr.message}`);
+    }
+
     const inquiryPayload = {
       photographerId: data.photographerId || null,
       photographerName: data.photographerName || 'Studio Owner',
-      email: data.email || null,
+      email: cleanEmail || null,
       phone: data.phone || null,
       interestedIn: data.interestedIn || 'Custom Enterprise Plan',
       eventDate: data.eventDate || null,
@@ -1319,16 +1412,30 @@ export class BillingService implements OnModuleInit {
       createdAt: new Date(),
     };
 
-    // 1. Instant Push to Redis Queue for High Throughput & Audit Log
-    try {
-      if (this.redis && this.redis.status === 'ready') {
-        await this.redis.lpush('queue:plan_inquiries', JSON.stringify(inquiryPayload));
+    // 3. Set 24-Hour Rate Limits in Redis immediately
+    if (this.redis && this.redis.status === 'ready') {
+      try {
+        const pipeline = this.redis.pipeline();
+        if (cleanPhone && cleanPhone.length >= 7) {
+          pipeline.set(`ratelimit:inquiry:phone:${cleanPhone.slice(-10)}`, '1', 'EX', TWENTY_FOUR_HOURS_SECONDS);
+        }
+        if (cleanEmail && cleanEmail.includes('@')) {
+          pipeline.set(`ratelimit:inquiry:email:${cleanEmail}`, '1', 'EX', TWENTY_FOUR_HOURS_SECONDS);
+        }
+        if (data.photographerId) {
+          pipeline.set(`ratelimit:inquiry:user:${data.photographerId}`, '1', 'EX', TWENTY_FOUR_HOURS_SECONDS);
+        }
+        if (clientIp) {
+          pipeline.set(`ratelimit:inquiry:ip:${clientIp}`, '1', 'EX', TWENTY_FOUR_HOURS_SECONDS);
+        }
+        pipeline.lpush('queue:plan_inquiries', JSON.stringify(inquiryPayload));
+        await pipeline.exec();
+      } catch (err: any) {
+        this.logger.warn(`[PlanInquiry] Redis pipeline non-blocking fallback: ${err.message}`);
       }
-    } catch (err: any) {
-      this.logger.warn(`[PlanInquiry] Redis queue non-blocking fallback: ${err.message}`);
     }
 
-    // 2. Direct Async DB Write in background without blocking HTTP response
+    // 4. Direct Async DB Write in background without blocking HTTP response
     setImmediate(async () => {
       try {
         await this.prisma.planInquiry.create({
@@ -1352,6 +1459,7 @@ export class BillingService implements OnModuleInit {
 
     return {
       success: true,
+      alreadySubmitted: false,
       message: 'Inquiry received! Our photography workflow expert will contact you shortly.',
     };
   }

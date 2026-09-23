@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Patch, Delete, Body, UseGuards, Headers, Param, Query, UnauthorizedException, Inject } from '@nestjs/common';
+import { Controller, Post, Get, Patch, Delete, Body, UseGuards, Headers, Param, Query, UnauthorizedException, Inject, Req } from '@nestjs/common';
 import { BillingService } from './billing.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { AdminGuard } from '../../common/guards/admin.guard';
@@ -149,9 +149,21 @@ export class BillingController {
       eventDate?: string;
       requirements?: string;
       source?: string;
-    }
+    },
+    @Req() req: any
   ) {
-    return this.billingService.submitPlanInquiry(body);
+    const rawIp =
+      req.headers?.['cf-connecting-ip'] ||
+      req.headers?.['x-forwarded-for'] ||
+      req.ip ||
+      req.socket?.remoteAddress ||
+      '';
+    const clientIp = typeof rawIp === 'string' ? rawIp.split(',')[0].trim() : '';
+
+    return this.billingService.submitPlanInquiry({
+      ...body,
+      clientIp,
+    });
   }
 
   @UseGuards(AdminGuard)

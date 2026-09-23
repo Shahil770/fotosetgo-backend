@@ -1,4 +1,4 @@
-import { Injectable, ConflictException, UnauthorizedException, BadRequestException, NotFoundException, Inject, Logger } from '@nestjs/common';
+import { Injectable, ConflictException, UnauthorizedException, BadRequestException, NotFoundException, HttpException, HttpStatus, Inject, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
@@ -54,13 +54,26 @@ export class AuthService {
   /**
    * Send 6-Digit Email OTP for Studio Registration via Resend API
    */
-  async sendSignupOtp(email: string, name?: string) {
+  async sendSignupOtp(email: string, name?: string, clientIp?: string) {
     const normalizedEmail = (email || '').toLowerCase().trim();
     if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
       throw new BadRequestException('Please enter a valid email address.');
     }
 
-    // 1. Check if email is already registered
+    // 1. IP-Level Rate Limiting: Max 5 OTP requests per hour per client IP
+    if (clientIp && clientIp !== '127.0.0.1') {
+      const ipKey = `rate:signup:otp:ip:${clientIp}`;
+      const countStr = await this.redis.get(ipKey);
+      const currentCount = countStr ? parseInt(countStr, 10) : 0;
+      if (currentCount >= 5) {
+        const ttl = await this.redis.ttl(ipKey);
+        throw new BadRequestException(
+          `Too many verification code requests from this device. Please try again in ${Math.ceil((ttl > 0 ? ttl : 3600) / 60)} minutes.`
+        );
+      }
+    }
+
+    // 2. Check if email is already registered
     const existing = await this.prisma.user.findUnique({
       where: { email: normalizedEmail },
     });
@@ -68,7 +81,7 @@ export class AuthService {
       throw new ConflictException('An account with this email already exists. Please login instead.');
     }
 
-    // 2. Rate limit cooldown (60 seconds between resends)
+    // 3. Rate limit cooldown (60 seconds between resends for same email)
     const rateKey = `rate:signup:otp:${normalizedEmail}`;
     const isCoolingDown = await this.redis.get(rateKey);
     if (isCoolingDown) {
@@ -76,15 +89,24 @@ export class AuthService {
       throw new BadRequestException(`Please wait ${ttl > 0 ? ttl : 60} seconds before requesting a new code.`);
     }
 
-    // 3. Generate Cryptographic 6-digit numeric OTP
+    // Increment IP counter with 1 hour TTL
+    if (clientIp && clientIp !== '127.0.0.1') {
+      const ipKey = `rate:signup:otp:ip:${clientIp}`;
+      const count = await this.redis.incr(ipKey);
+      if (count === 1) {
+        await this.redis.expire(ipKey, 3600); // 1 hour window
+      }
+    }
+
+    // 4. Generate Cryptographic 6-digit numeric OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
-    // 4. Store in Redis with 10 minutes (600s) TTL
+    // 5. Store in Redis with 10 minutes (600s) TTL
     const otpKey = `otp:signup:${normalizedEmail}`;
     await this.redis.set(otpKey, JSON.stringify({ otp, attempts: 0 }), 'EX', 600);
     await this.redis.set(rateKey, '1', 'EX', 60);
 
-    // 5. Send Branded Email via Resend API
+    // 6. Send Branded Email via Resend API
     const resendApiKey = process.env.RESEND_API_KEY;
     const fromEmail = process.env.RESEND_FROM_EMAIL || 'FotoSetGo <auth@fotosetgo.com>';
 
@@ -213,13 +235,26 @@ export class AuthService {
   /**
    * Send 6-Digit Email OTP for Password Reset via Resend API
    */
-  async sendForgotPasswordOtp(email: string) {
+  async sendForgotPasswordOtp(email: string, clientIp?: string) {
     const normalizedEmail = (email || '').toLowerCase().trim();
     if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
       throw new BadRequestException('Please enter a valid email address.');
     }
 
-    // 1. Check if user exists with this email
+    // 1. IP-Level Rate Limiting: Max 5 password reset OTP requests per hour per client IP
+    if (clientIp && clientIp !== '127.0.0.1') {
+      const ipKey = `rate:forgot:otp:ip:${clientIp}`;
+      const countStr = await this.redis.get(ipKey);
+      const currentCount = countStr ? parseInt(countStr, 10) : 0;
+      if (currentCount >= 5) {
+        const ttl = await this.redis.ttl(ipKey);
+        throw new BadRequestException(
+          `Too many password reset requests from this device. Please try again in ${Math.ceil((ttl > 0 ? ttl : 3600) / 60)} minutes.`
+        );
+      }
+    }
+
+    // 2. Check if user exists with this email
     const user = await this.prisma.user.findUnique({
       where: { email: normalizedEmail },
     });
@@ -227,7 +262,7 @@ export class AuthService {
       throw new NotFoundException('No account found with this email address.');
     }
 
-    // 2. Rate limit cooldown (60 seconds between password reset requests)
+    // 3. Rate limit cooldown (60 seconds between password reset requests for same email)
     const rateKey = `rate:forgot:otp:${normalizedEmail}`;
     const isCoolingDown = await this.redis.get(rateKey);
     if (isCoolingDown) {
@@ -235,10 +270,19 @@ export class AuthService {
       throw new BadRequestException(`Please wait ${ttl > 0 ? ttl : 60} seconds before requesting a new reset code.`);
     }
 
-    // 3. Generate Cryptographic 6-digit numeric OTP
+    // Increment IP counter with 1 hour TTL
+    if (clientIp && clientIp !== '127.0.0.1') {
+      const ipKey = `rate:forgot:otp:ip:${clientIp}`;
+      const count = await this.redis.incr(ipKey);
+      if (count === 1) {
+        await this.redis.expire(ipKey, 3600); // 1 hour window
+      }
+    }
+
+    // 4. Generate Cryptographic 6-digit numeric OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
-    // 4. Store in Redis with 10 minutes (600s) TTL
+    // 5. Store in Redis with 10 minutes (600s) TTL
     const otpKey = `otp:forgot:${normalizedEmail}`;
     await this.redis.set(otpKey, JSON.stringify({ otp, attempts: 0 }), 'EX', 600);
     await this.redis.set(rateKey, '1', 'EX', 60);
@@ -720,15 +764,238 @@ export class AuthService {
     return { device, browser, os };
   }
 
-  async login(credentials: { email: string; password: string }, requestInfo?: { ipAddress?: string; userAgent?: string }) {
+  /**
+   * Generate a secure mathematical/symbolic CAPTCHA challenge
+   */
+  async generateCaptchaChallenge(): Promise<{ challengeId: string; question: string; type: string }> {
+    const num1 = Math.floor(Math.random() * 20) + 5; // 5 to 24
+    const num2 = Math.floor(Math.random() * 15) + 3; // 3 to 17
+    const operations = ['+', '-', '+'];
+    const op = operations[Math.floor(Math.random() * operations.length)];
+
+    let answer: number;
+    let question: string;
+
+    if (op === '+') {
+      answer = num1 + num2;
+      question = `${num1} + ${num2}`;
+    } else {
+      const high = Math.max(num1, num2);
+      const low = Math.min(num1, num2);
+      answer = high - low;
+      question = `${high} - ${low}`;
+    }
+
+    const challengeId = `ch_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+    const redisKey = `captcha:challenge:${challengeId}`;
+
+    // Store in Redis with 5 minutes (300s) TTL
+    await this.redis.set(redisKey, JSON.stringify({ answer: String(answer), createdAt: Date.now() }), 'EX', 300);
+
+    return {
+      challengeId,
+      question: `${question} = ?`,
+      type: 'math',
+    };
+  }
+
+  /**
+   * Verify Cloudflare Turnstile token or built-in CAPTCHA challenge answer
+   */
+  async verifyCaptcha(token?: string, challengeId?: string, answer?: string): Promise<boolean> {
+    // 1. Verify Cloudflare Turnstile if token is provided
+    if (token) {
+      const turnstileSecret = process.env.CLOUDFLARE_TURNSTILE_SECRET_KEY;
+      if (turnstileSecret) {
+        try {
+          const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `secret=${encodeURIComponent(turnstileSecret)}&response=${encodeURIComponent(token)}`,
+          });
+          const outcome = await res.json();
+          if (outcome?.success) {
+            return true;
+          }
+        } catch (err: any) {
+          this.logger.error(`[Turnstile] Verification error: ${err.message}`);
+        }
+      } else if (token.length > 10) {
+        return true;
+      }
+    }
+
+    // 2. Verify built-in challenge
+    if (challengeId && answer !== undefined && answer !== null) {
+      const cleanAnswer = String(answer).trim().toLowerCase();
+      if (!cleanAnswer) return false;
+
+      const redisKey = `captcha:challenge:${challengeId}`;
+      const stored = await this.redis.get(redisKey);
+      if (!stored) return false;
+
+      // Consume challenge immediately to prevent replay attacks
+      await this.redis.del(redisKey).catch(() => {});
+
+      try {
+        const parsed = JSON.parse(stored);
+        return String(parsed.answer).trim().toLowerCase() === cleanAnswer;
+      } catch {
+        return stored.trim().toLowerCase() === cleanAnswer;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Check login rate limit status (lockout & conditional captcha requirement)
+   */
+  async checkLoginRateLimit(email: string, ipAddress: string): Promise<{ isLocked: boolean; lockTtl: number; requireCaptcha: boolean; failedAttempts: number }> {
+    const cleanEmail = (email || '').toLowerCase().trim();
+    const cleanIp = ipAddress || '127.0.0.1';
+
+    const ipLockKey = `ratelimit:login:lockout:ip:${cleanIp}`;
+    const emailLockKey = cleanEmail ? `ratelimit:login:lockout:email:${cleanEmail}` : null;
+
+    const [ipLock, emailLock] = await Promise.all([
+      this.redis.get(ipLockKey),
+      emailLockKey ? this.redis.get(emailLockKey) : Promise.resolve(null),
+    ]);
+
+    if (ipLock || emailLock) {
+      const ttl = await (ipLock ? this.redis.ttl(ipLockKey) : this.redis.ttl(emailLockKey!));
+      return {
+        isLocked: true,
+        lockTtl: Math.max(ttl, 60),
+        requireCaptcha: true,
+        failedAttempts: 10,
+      };
+    }
+
+    const ipAttemptsKey = `ratelimit:login:attempts:ip:${cleanIp}`;
+    const emailAttemptsKey = cleanEmail ? `ratelimit:login:attempts:email:${cleanEmail}` : null;
+
+    const [ipCountStr, emailCountStr] = await Promise.all([
+      this.redis.get(ipAttemptsKey),
+      emailAttemptsKey ? this.redis.get(emailAttemptsKey) : Promise.resolve('0'),
+    ]);
+
+    const ipCount = parseInt(ipCountStr || '0', 10);
+    const emailCount = parseInt(emailCountStr || '0', 10);
+    const failedAttempts = Math.max(ipCount, emailCount);
+
+    return {
+      isLocked: false,
+      lockTtl: 0,
+      requireCaptcha: failedAttempts >= 3,
+      failedAttempts,
+    };
+  }
+
+  /**
+   * Record login failure in Redis and calculate rate limit thresholds
+   */
+  async recordLoginFailure(email: string, ipAddress: string): Promise<{ requireCaptcha: boolean; remainingAttempts: number; isLocked: boolean; lockTtl: number }> {
+    const cleanEmail = (email || '').toLowerCase().trim();
+    const cleanIp = ipAddress || '127.0.0.1';
+
+    const ipAttemptsKey = `ratelimit:login:attempts:ip:${cleanIp}`;
+    const emailAttemptsKey = cleanEmail ? `ratelimit:login:attempts:email:${cleanEmail}` : null;
+
+    const pipe = this.redis.pipeline();
+    pipe.incr(ipAttemptsKey);
+    pipe.expire(ipAttemptsKey, 900); // 15 mins window
+    if (emailAttemptsKey) {
+      pipe.incr(emailAttemptsKey);
+      pipe.expire(emailAttemptsKey, 900);
+    }
+
+    const results = await pipe.exec();
+    const ipCount = Number(results?.[0]?.[1] || 1);
+    const emailCount = emailAttemptsKey ? Number(results?.[2]?.[1] || 1) : 0;
+    const failedAttempts = Math.max(ipCount, emailCount);
+
+    if (failedAttempts >= 10) {
+      await Promise.all([
+        this.redis.set(`ratelimit:login:lockout:ip:${cleanIp}`, '1', 'EX', 900),
+        cleanEmail ? this.redis.set(`ratelimit:login:lockout:email:${cleanEmail}`, '1', 'EX', 900) : Promise.resolve(),
+      ]);
+      return {
+        requireCaptcha: true,
+        remainingAttempts: 0,
+        isLocked: true,
+        lockTtl: 900,
+      };
+    }
+
+    return {
+      requireCaptcha: failedAttempts >= 3,
+      remainingAttempts: Math.max(0, 10 - failedAttempts),
+      isLocked: false,
+      lockTtl: 0,
+    };
+  }
+
+  /**
+   * Clear all login failure and lockout records upon successful authentication
+   */
+  async resetLoginFailures(email: string, ipAddress: string): Promise<void> {
+    const cleanEmail = (email || '').toLowerCase().trim();
+    const cleanIp = ipAddress || '127.0.0.1';
+
+    await Promise.all([
+      this.redis.del(`ratelimit:login:attempts:ip:${cleanIp}`),
+      this.redis.del(`ratelimit:login:lockout:ip:${cleanIp}`),
+      cleanEmail ? this.redis.del(`ratelimit:login:attempts:email:${cleanEmail}`) : Promise.resolve(),
+      cleanEmail ? this.redis.del(`ratelimit:login:lockout:email:${cleanEmail}`) : Promise.resolve(),
+    ]).catch(() => {});
+  }
+
+  async login(
+    credentials: { email: string; password: string; captchaToken?: string; captchaChallengeId?: string; captchaAnswer?: string },
+    requestInfo?: { ipAddress?: string; userAgent?: string },
+  ) {
     const normalizedEmail = (credentials.email || '').toLowerCase().trim();
+    const ipAddress = requestInfo?.ipAddress || '127.0.0.1';
+    const parsedUA = this.parseUserAgent(requestInfo?.userAgent || '');
+
+    // 1. Check Rate Limiting Lockout
+    const rateStatus = await this.checkLoginRateLimit(normalizedEmail, ipAddress);
+    if (rateStatus.isLocked) {
+      const waitMinutes = Math.ceil(rateStatus.lockTtl / 60);
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.TOO_MANY_REQUESTS,
+          message: `Too many failed login attempts. Please wait ${waitMinutes} minute(s) before trying again.`,
+          isLocked: true,
+          lockTtl: rateStatus.lockTtl,
+          requireCaptcha: true,
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    // 2. Enforce Captcha verification if user/IP reached >= 3 failed attempts
+    if (rateStatus.requireCaptcha) {
+      const isCaptchaValid = await this.verifyCaptcha(
+        credentials.captchaToken,
+        credentials.captchaChallengeId,
+        credentials.captchaAnswer,
+      );
+      if (!isCaptchaValid) {
+        throw new BadRequestException({
+          message: 'Security verification required. Please enter the correct captcha.',
+          requireCaptcha: true,
+        });
+      }
+    }
+
+    // 3. Find User
     const user = await this.prisma.user.findUnique({
       where: { email: normalizedEmail },
       include: { photographer: true },
     });
-
-    const parsedUA = this.parseUserAgent(requestInfo?.userAgent || '');
-    const ipAddress = requestInfo?.ipAddress || '127.0.0.1';
 
     if (!user || !user.isActive) {
       if (user) {
@@ -744,9 +1011,27 @@ export class AuthService {
           },
         });
       }
-      throw new UnauthorizedException('Invalid credentials');
+      const failure = await this.recordLoginFailure(normalizedEmail, ipAddress);
+      if (failure.isLocked) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.TOO_MANY_REQUESTS,
+            message: 'Too many failed login attempts. Account temporarily locked for 15 minutes.',
+            isLocked: true,
+            lockTtl: 900,
+            requireCaptcha: true,
+          },
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+      throw new UnauthorizedException({
+        message: failure.requireCaptcha ? 'Invalid credentials. Security verification is now required.' : 'Invalid credentials',
+        requireCaptcha: failure.requireCaptcha,
+        remainingAttempts: failure.remainingAttempts,
+      });
     }
 
+    // 4. Verify Password
     const passwordMatch = await bcrypt.compare(credentials.password, user.passwordHash);
     if (!passwordMatch) {
       await this.prisma.loginLog.create({
@@ -760,8 +1045,28 @@ export class AuthService {
           status: 'FAILED',
         },
       });
-      throw new UnauthorizedException('Invalid credentials');
+      const failure = await this.recordLoginFailure(normalizedEmail, ipAddress);
+      if (failure.isLocked) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.TOO_MANY_REQUESTS,
+            message: 'Too many failed login attempts. Account temporarily locked for 15 minutes.',
+            isLocked: true,
+            lockTtl: 900,
+            requireCaptcha: true,
+          },
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+      throw new UnauthorizedException({
+        message: failure.requireCaptcha ? 'Invalid credentials. Security verification is now required.' : 'Invalid credentials',
+        requireCaptcha: failure.requireCaptcha,
+        remainingAttempts: failure.remainingAttempts,
+      });
     }
+
+    // 5. Successful Login -> Reset all failure counters immediately
+    await this.resetLoginFailures(normalizedEmail, ipAddress);
 
     const payload = { sub: user.id, email: user.email };
     const accessToken = this.jwtService.sign(payload);

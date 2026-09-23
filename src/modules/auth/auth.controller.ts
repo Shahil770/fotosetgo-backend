@@ -13,8 +13,9 @@ export class AuthController {
   }
 
   @Post('send-signup-otp')
-  async sendSignupOtp(@Body() body: { email: string; name?: string }) {
-    return this.authService.sendSignupOtp(body.email, body.name);
+  async sendSignupOtp(@Body() body: { email: string; name?: string }, @Req() req: any) {
+    const ipAddress = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.ip || req.socket?.remoteAddress || '127.0.0.1';
+    return this.authService.sendSignupOtp(body.email, body.name, ipAddress);
   }
 
   @Post('verify-and-signup')
@@ -25,8 +26,9 @@ export class AuthController {
   }
 
   @Post('forgot-password')
-  async forgotPassword(@Body() body: { email: string }) {
-    return this.authService.sendForgotPasswordOtp(body.email);
+  async forgotPassword(@Body() body: { email: string }, @Req() req: any) {
+    const ipAddress = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.ip || req.socket?.remoteAddress || '127.0.0.1';
+    return this.authService.sendForgotPasswordOtp(body.email, ipAddress);
   }
 
   @Post('verify-forgot-password-otp')
@@ -44,6 +46,11 @@ export class AuthController {
     const ipAddress = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.ip || req.socket?.remoteAddress || '127.0.0.1';
     const userAgent = req.headers['user-agent'] || '';
     return this.authService.login(body, { ipAddress, userAgent });
+  }
+
+  @Get('captcha-challenge')
+  async getCaptchaChallenge() {
+    return this.authService.generateCaptchaChallenge();
   }
 
   @Post('google')

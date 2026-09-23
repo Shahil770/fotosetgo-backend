@@ -14,7 +14,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 
 @Controller('wallet')
 export class WalletController {
-  constructor(private readonly walletService: WalletService) {}
+  constructor(private readonly walletService: WalletService) { }
 
   /**
    * User: Get My Dual-Wallet Balances, Rate & Recent Transactions

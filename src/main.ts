@@ -54,6 +54,6 @@ async function bootstrap() {
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
   });
 
-  await app.listen(process.env.PORT ?? 5000);
+  await app.listen(Number(process.env.PORT) || 5000, '127.0.0.1');
 }
 bootstrap();

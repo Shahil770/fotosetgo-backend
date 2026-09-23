@@ -214,9 +214,11 @@ export class PublicStorageController {
       clientPhone: string;
       eventDate?: string;
       message: string;
-    }
+    },
+    @Req() req: any
   ) {
-    return this.storageService.createPortfolioInquiry(subdomain, body);
+    const clientIp = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
+    return this.storageService.createPortfolioInquiry(subdomain, body, clientIp);
   }
 
   @Post('portfolio/:subdomain/reviews')
@@ -227,9 +229,11 @@ export class PublicStorageController {
       clientRole?: string;
       rating: number;
       comment: string;
-    }
+    },
+    @Req() req: any
   ) {
-    return this.storageService.createPortfolioReview(subdomain, body);
+    const clientIp = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
+    return this.storageService.createPortfolioReview(subdomain, body, clientIp);
   }
 
   @Get('portfolio/:subdomain/reviews')

@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Body, UseGuards, UseInterceptors, UploadedFile, Delete, Param, Patch } from '@nestjs/common';
+import { Controller, Post, Get, Body, UseGuards, UseInterceptors, UploadedFile, Delete, Param, Patch, Query } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { StorageService } from './storage.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -150,8 +150,14 @@ export class StorageController {
   }
 
   @Get('trash')
-  async getTrashData(@CurrentUser() user: any) {
-    return this.storageService.getTrashData(getPhotographerId(user));
+  async getTrashData(
+    @CurrentUser() user: any,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const pageNum = page ? Math.max(1, parseInt(page, 10)) : 1;
+    const limitNum = limit ? Math.max(1, Math.min(100, parseInt(limit, 10))) : 40;
+    return this.storageService.getTrashData(getPhotographerId(user), pageNum, limitNum);
   }
 
   @Post('trash/restore-photo')

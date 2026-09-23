@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { google } from 'googleapis';
 import { PrismaService } from 'src/prisma.service';
 
@@ -6,7 +6,26 @@ import { PrismaService } from 'src/prisma.service';
 export class GoogleDriveService {
   private readonly logger = new Logger(GoogleDriveService.name);
 
-  constructor(private prisma: PrismaService) { }
+  constructor(
+    private prisma: PrismaService,
+    @Inject('REDIS_CLIENT') private redis: any,
+  ) { }
+
+  private async invalidateUserCache(photographerId: string) {
+    try {
+      const photographer = await this.prisma.photographer.findUnique({
+        where: { id: photographerId },
+        select: { userId: true },
+      });
+      if (photographer?.userId) {
+        await this.redis.del(`cache:jwt:user:${photographer.userId}`);
+      }
+      await this.redis.del(`cache:jwt:user:${photographerId}`);
+      this.logger.log(`Invalidated user Redis cache for photographer ${photographerId}`);
+    } catch (err) {
+      this.logger.warn(`Failed to invalidate user cache for photographer ${photographerId}:`, err);
+    }
+  }
 
   private getOAuthClient() {
     return new google.auth.OAuth2(
@@ -17,7 +36,7 @@ export class GoogleDriveService {
   }
 
   // Auth Link Generate
-  getAuthUrl(photographerId: string): string {
+  getAuthUrl(state: string): string {
     const oauth2Client = this.getOAuthClient();
     return oauth2Client.generateAuthUrl({
       access_type: 'offline',
@@ -25,7 +44,7 @@ export class GoogleDriveService {
       scope: [
         'https://www.googleapis.com/auth/drive',
       ],
-      state: photographerId, // pass photographer ID to callback
+      state, // pass photographer ID and optional source (e.g. ID:::google-drive) to callback
     });
   }
 
@@ -43,6 +62,8 @@ export class GoogleDriveService {
       },
     });
 
+    await this.invalidateUserCache(photographerId);
+
     this.logger.log(`Google Drive successfully linked for photographer: ${photographerId}`);
   }
 
@@ -56,6 +77,8 @@ export class GoogleDriveService {
         googleDriveConnected: false,
       },
     });
+
+    await this.invalidateUserCache(photographerId);
   }
 
   // Delete a specific file or folder from Google Drive

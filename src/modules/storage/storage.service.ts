@@ -3341,7 +3341,7 @@ export class StorageService implements OnModuleInit {
       include: {
         photographer: true,
         _count: {
-          select: { photos: { where: { status: 'READY' } } }
+          select: { photos: { where: { status: 'READY', isDeleted: false } } }
         }
       }
     });
@@ -3508,6 +3508,23 @@ export class StorageService implements OnModuleInit {
     }
 
     return results;
+  }
+
+  async getPublicEventPhotosWithCount(slug: string, passcode?: string, limit?: number, cursor?: string, clientIp?: string) {
+    const photos = await this.getPublicEventPhotos(slug, passcode, limit, cursor, clientIp);
+    const event = await this.prisma.event.findUnique({
+      where: { slug },
+      select: {
+        id: true,
+        _count: {
+          select: { photos: { where: { status: 'READY', isDeleted: false } } }
+        }
+      }
+    });
+    return {
+      photos,
+      totalCount: event?._count?.photos ?? photos.length
+    };
   }
 
   async getPublicPhotos(eventId: string, slug: string, limit?: number, cursor?: string, existingEvent?: any) {

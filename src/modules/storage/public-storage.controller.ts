@@ -50,13 +50,17 @@ export class PublicStorageController {
     @Res({ passthrough: true }) res: any
   ) {
     const clientIp = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket?.remoteAddress || '127.0.0.1';
-    const result = await this.storageService.getPublicEventPhotos(slug, body.passcode, body.limit, body.cursor, clientIp);
+    const { photos, totalCount } = await this.storageService.getPublicEventPhotosWithCount(slug, body.passcode, body.limit, body.cursor, clientIp);
+    if (typeof totalCount === 'number') {
+      res.setHeader('X-Total-Count', totalCount.toString());
+      res.setHeader('Access-Control-Expose-Headers', 'X-Total-Count');
+    }
     if (!body.passcode) {
       res.setHeader('Cache-Control', 'public, max-age=15, s-maxage=30, stale-while-revalidate=60');
     } else {
       res.setHeader('Cache-Control', 'no-store, private');
     }
-    return result;
+    return photos;
   }
 
   @Post('events/:slug/guest-upload-url')

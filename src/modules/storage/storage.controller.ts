@@ -374,6 +374,21 @@ export class StorageController {
     return this.storageService.deletePortfolioReelItem(user.id, id);
   }
 
+  @Get('portfolio/reels')
+  async getPortfolioReels(
+    @CurrentUser() user: any,
+    @Query('category') category?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.storageService.getPortfolioPaginatedReels(
+      user.id,
+      category,
+      page ? parseInt(page, 10) : 1,
+      limit ? parseInt(limit, 10) : 30,
+    );
+  }
+
   @Post('portfolio/photos/upload-url')
   async getPortfolioPhotoUploadUrl(
     @CurrentUser() user: any,
@@ -383,6 +398,21 @@ export class StorageController {
     }
   ) {
     return this.storageService.getPortfolioPhotoUploadUrl(user.id, body);
+  }
+
+  @Get('portfolio/photos')
+  async getPortfolioPhotos(
+    @CurrentUser() user: any,
+    @Query('category') category?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.storageService.getPortfolioPaginatedPhotos(
+      user.id,
+      category,
+      page ? parseInt(page, 10) : 1,
+      limit ? parseInt(limit, 10) : 50,
+    );
   }
 
   @Post('portfolio/photos/complete')
@@ -399,6 +429,14 @@ export class StorageController {
     @Param('id') id: string
   ) {
     return this.storageService.deletePortfolioPhoto(user.id, id);
+  }
+
+  @Post('portfolio/photos/batch-delete')
+  async batchDeletePortfolioPhotos(
+    @CurrentUser() user: any,
+    @Body() body: { photoIds: string[] }
+  ) {
+    return this.storageService.batchDeletePortfolioPhotos(user.id, body.photoIds || []);
   }
 
   @Delete('portfolio/category/:categoryName')

@@ -415,9 +415,9 @@ export class StorageService implements OnModuleInit {
       ContentType: data.mimeType,
     });
 
-    // Expires in 1 hour (3600 seconds) - zero timeout risk for heavy queues
+    // Expires in 12 hours (43200 seconds) - zero timeout risk for heavy queues and long uploads
     const uploadUrl = await getSignedUrl(this.s3Client, command, {
-      expiresIn: 3600,
+      expiresIn: 43200,
       unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
     });
 
@@ -430,7 +430,7 @@ export class StorageService implements OnModuleInit {
         Key: thumbKey,
         ContentType: 'image/jpeg',
       });
-      uploadUrlThumb = await getSignedUrl(this.s3Client, thumbCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+      uploadUrlThumb = await getSignedUrl(this.s3Client, thumbCmd, { expiresIn: 43200, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
     }
 
     if (!isVideo && previewKey) {
@@ -439,7 +439,7 @@ export class StorageService implements OnModuleInit {
         Key: previewKey,
         ContentType: 'image/jpeg',
       });
-      uploadUrlPreview = await getSignedUrl(this.s3Client, previewCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+      uploadUrlPreview = await getSignedUrl(this.s3Client, previewCmd, { expiresIn: 43200, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
     }
 
     return {
@@ -573,7 +573,7 @@ export class StorageService implements OnModuleInit {
     const results = await Promise.all(createdPhotos.map(async (photo, index) => {
       const command = new PutObjectCommand({ Bucket: this.bucketName, Key: photo.r2KeyOriginal!, ContentType: photo.mimeType! });
       const uploadUrl = await getSignedUrl(this.s3Client, command, {
-        expiresIn: 3600,
+        expiresIn: 43200,
         unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
       });
 
@@ -582,12 +582,12 @@ export class StorageService implements OnModuleInit {
 
       if (photo.r2KeyThumb) {
         const thumbCmd = new PutObjectCommand({ Bucket: this.bucketName, Key: photo.r2KeyThumb, ContentType: 'image/jpeg' });
-        uploadUrlThumb = await getSignedUrl(this.s3Client, thumbCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+        uploadUrlThumb = await getSignedUrl(this.s3Client, thumbCmd, { expiresIn: 43200, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
       }
 
       if (photo.type === 'IMAGE' && photo.r2KeyPreview) {
         const previewCmd = new PutObjectCommand({ Bucket: this.bucketName, Key: photo.r2KeyPreview, ContentType: 'image/jpeg' });
-        uploadUrlPreview = await getSignedUrl(this.s3Client, previewCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+        uploadUrlPreview = await getSignedUrl(this.s3Client, previewCmd, { expiresIn: 43200, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
       }
 
       return {
@@ -959,7 +959,7 @@ export class StorageService implements OnModuleInit {
     });
 
     const uploadUrl = await getSignedUrl(this.s3Client, command, {
-      expiresIn: 3600,
+      expiresIn: 43200,
       unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
     });
 
@@ -968,12 +968,12 @@ export class StorageService implements OnModuleInit {
 
     if (thumbKey) {
       const thumbCmd = new PutObjectCommand({ Bucket: this.bucketName, Key: thumbKey, ContentType: 'image/jpeg' });
-      uploadUrlThumb = await getSignedUrl(this.s3Client, thumbCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+      uploadUrlThumb = await getSignedUrl(this.s3Client, thumbCmd, { expiresIn: 43200, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
     }
 
     if (!isVideo && previewKey) {
       const previewCmd = new PutObjectCommand({ Bucket: this.bucketName, Key: previewKey, ContentType: 'image/jpeg' });
-      uploadUrlPreview = await getSignedUrl(this.s3Client, previewCmd, { expiresIn: 3600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
+      uploadUrlPreview = await getSignedUrl(this.s3Client, previewCmd, { expiresIn: 43200, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']) });
     }
 
     return {
@@ -1436,9 +1436,9 @@ export class StorageService implements OnModuleInit {
     let actualThumbKey: string | null = null;
 
     try {
-      // 1. Get Signed URL for R2 video
+      // 1. Get Signed URL for R2 video (12 Hours expiration)
       const getCmd = new GetObjectCommand({ Bucket: this.bucketName, Key: r2KeyOriginal });
-      const videoSignedUrl = await getSignedUrl(this.s3Client, getCmd, { expiresIn: 3600 });
+      const videoSignedUrl = await getSignedUrl(this.s3Client, getCmd, { expiresIn: 43200 });
 
       // 2. Check if client-side actually generated and uploaded a valid thumbnail
       let hasValidClientThumb = currentVideo.thumbSizeBytes && Number(currentVideo.thumbSizeBytes) > 0;
@@ -1753,7 +1753,7 @@ export class StorageService implements OnModuleInit {
       ContentType: mimeType,
     });
 
-    const uploadUrl = await getSignedUrl(this.s3Client, command, { expiresIn: 300 });
+    const uploadUrl = await getSignedUrl(this.s3Client, command, { expiresIn: 43200 });
 
     return {
       objectKey,
@@ -3400,7 +3400,7 @@ export class StorageService implements OnModuleInit {
       maxGuestUploadFiles: event.maxGuestUploadFiles || 0,
       maxGuestUploadStorage: event.maxGuestUploadStorage ? event.maxGuestUploadStorage.toString() : '0',
       photosCount: event._count.photos,
-      photos: !requiresPasscode ? await this.getPublicPhotos(event.id, event.slug, undefined, undefined, { ...event, allowDownload: effectiveAllowDownload, watermarkEnabled }) : [],
+      photos: !requiresPasscode ? await this.getPublicPhotos(event.id, event.slug, 60, undefined, { ...event, allowDownload: effectiveAllowDownload, watermarkEnabled }) : [],
       photographerBranding: event.photographer ? {
         id: event.photographer.id,
         studioLogoKey: hasBranding ? event.photographer.studioLogoKey : null,
@@ -4601,7 +4601,7 @@ export class StorageService implements OnModuleInit {
       ContentType: data.mimeType || 'video/mp4',
     });
     const uploadUrl = await getSignedUrl(this.s3Client, command, {
-      expiresIn: 3600,
+      expiresIn: 43200,
       unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
     });
     const url = await this.getReadUrl(key);
@@ -4614,7 +4614,7 @@ export class StorageService implements OnModuleInit {
       ContentType: data.thumbMimeType || 'image/jpeg',
     });
     const thumbUploadUrl = await getSignedUrl(this.s3Client, thumbCommand, {
-      expiresIn: 3600,
+      expiresIn: 43200,
       unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
     });
     const thumbUrl = await this.getReadUrl(thumbKey);
@@ -4805,7 +4805,7 @@ export class StorageService implements OnModuleInit {
     });
 
     const uploadUrl = await getSignedUrl(this.s3Client, command, {
-      expiresIn: 3600,
+      expiresIn: 43200,
       unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
     });
     return { uploadUrl, key };
@@ -4887,7 +4887,7 @@ export class StorageService implements OnModuleInit {
     });
 
     const uploadUrl = await getSignedUrl(this.s3Client, command, {
-      expiresIn: 3600,
+      expiresIn: 43200,
       unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
     });
     const url = await this.getReadUrl(key);
@@ -4901,7 +4901,7 @@ export class StorageService implements OnModuleInit {
     });
 
     const thumbUploadUrl = await getSignedUrl(this.s3Client, thumbCommand, {
-      expiresIn: 3600,
+      expiresIn: 43200,
       unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
     });
     const thumbUrl = await this.getReadUrl(thumbKey);
@@ -4966,7 +4966,7 @@ export class StorageService implements OnModuleInit {
     });
 
     const videoUploadUrl = await getSignedUrl(this.s3Client, videoCommand, {
-      expiresIn: 3600,
+      expiresIn: 43200,
       unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
     });
 
@@ -4978,7 +4978,7 @@ export class StorageService implements OnModuleInit {
         ContentType: 'image/jpeg',
       });
       thumbUploadUrl = await getSignedUrl(this.s3Client, thumbCommand, {
-        expiresIn: 3600,
+        expiresIn: 43200,
         unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
       });
     }
@@ -5102,11 +5102,11 @@ export class StorageService implements OnModuleInit {
     });
 
     const originalUploadUrl = await getSignedUrl(this.s3Client, originalCommand, {
-      expiresIn: 3600,
+      expiresIn: 43200,
       unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
     });
     const thumbUploadUrl = await getSignedUrl(this.s3Client, thumbCommand, {
-      expiresIn: 3600,
+      expiresIn: 43200,
       unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-mode']),
     });
 
@@ -5118,6 +5118,142 @@ export class StorageService implements OnModuleInit {
       thumb: {
         uploadUrl: thumbUploadUrl,
         key: thumbKey
+      }
+    };
+  }
+
+  async getPortfolioPaginatedPhotos(userId: string, category?: string, page: number = 1, limit: number = 50) {
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { userId }
+    });
+
+    if (!photographer) {
+      throw new NotFoundException('Photographer profile not found');
+    }
+
+    const whereClause: any = {
+      photographerId: photographer.id
+    };
+
+    if (category && category !== 'All') {
+      whereClause.category = {
+        equals: category,
+        mode: 'insensitive'
+      };
+    }
+
+    const take = Math.min(Math.max(Number(limit) || 50, 1), 100);
+    const currentPage = Math.max(Number(page) || 1, 1);
+    const skip = (currentPage - 1) * take;
+
+    const [total, photos] = await Promise.all([
+      this.prisma.portfolioPhoto.count({ where: whereClause }),
+      this.prisma.portfolioPhoto.findMany({
+        where: whereClause,
+        orderBy: [
+          { sortOrder: 'asc' },
+          { createdAt: 'desc' }
+        ],
+        skip,
+        take
+      })
+    ]);
+
+    const mappedPhotos = await Promise.all(
+      photos.map(async (p) => {
+        const url = await this.getReadUrl(p.r2KeyOriginal);
+        const thumbUrl = await this.getReadUrl(p.r2KeyThumb);
+        return {
+          id: p.id,
+          url,
+          thumbUrl,
+          category: p.category,
+          sortOrder: p.sortOrder,
+          createdAt: p.createdAt
+        };
+      })
+    );
+
+    const totalPages = Math.ceil(total / take) || 1;
+    const hasMore = currentPage < totalPages;
+
+    return {
+      success: true,
+      photos: mappedPhotos,
+      meta: {
+        total,
+        page: currentPage,
+        limit: take,
+        totalPages,
+        hasMore
+      }
+    };
+  }
+
+  async getPortfolioPaginatedReels(userId: string, category?: string, page: number = 1, limit: number = 30) {
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { userId }
+    });
+
+    if (!photographer) {
+      throw new NotFoundException('Photographer profile not found');
+    }
+
+    const whereClause: any = {
+      photographerId: photographer.id
+    };
+
+    if (category && category !== 'All') {
+      whereClause.category = {
+        equals: category,
+        mode: 'insensitive'
+      };
+    }
+
+    const take = Math.min(Math.max(Number(limit) || 30, 1), 100);
+    const currentPage = Math.max(Number(page) || 1, 1);
+    const skip = (currentPage - 1) * take;
+
+    const [total, reels] = await Promise.all([
+      this.prisma.portfolioReel.count({ where: whereClause }),
+      this.prisma.portfolioReel.findMany({
+        where: whereClause,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take
+      })
+    ]);
+
+    const mappedReels = await Promise.all(
+      reels.map(async (r) => {
+        const url = await this.getReadUrl(r.r2Key);
+        const thumbUrl = r.r2KeyThumb ? await this.getReadUrl(r.r2KeyThumb) : null;
+        return {
+          id: r.id,
+          title: r.title,
+          category: r.category,
+          r2Key: r.r2Key,
+          r2KeyThumb: r.r2KeyThumb,
+          url,
+          thumbUrl,
+          viewsCount: r.viewsCount,
+          createdAt: r.createdAt
+        };
+      })
+    );
+
+    const totalPages = Math.ceil(total / take) || 1;
+    const hasMore = currentPage < totalPages;
+
+    return {
+      success: true,
+      reels: mappedReels,
+      meta: {
+        total,
+        page: currentPage,
+        limit: take,
+        totalPages,
+        hasMore
       }
     };
   }
@@ -5207,6 +5343,63 @@ export class StorageService implements OnModuleInit {
     await this.invalidatePortfolioCache(photographer.id);
 
     return { success: true };
+  }
+
+  async batchDeletePortfolioPhotos(userId: string, photoIds: string[]) {
+    if (!photoIds || photoIds.length === 0) {
+      return { success: true, count: 0 };
+    }
+
+    const photographer = await this.prisma.photographer.findUnique({
+      where: { userId }
+    });
+
+    if (!photographer) {
+      throw new NotFoundException('Photographer profile not found');
+    }
+
+    const photos = await this.prisma.portfolioPhoto.findMany({
+      where: {
+        id: { in: photoIds },
+        photographerId: photographer.id
+      }
+    });
+
+    if (photos.length === 0) {
+      return { success: true, count: 0 };
+    }
+
+    // Delete all keys from Cloudflare R2 bucket
+    const objectsToDelete: { Key: string }[] = [];
+    for (const p of photos) {
+      if (p.r2KeyOriginal) objectsToDelete.push({ Key: p.r2KeyOriginal });
+      if (p.r2KeyThumb) objectsToDelete.push({ Key: p.r2KeyThumb });
+    }
+
+    if (objectsToDelete.length > 0) {
+      try {
+        await this.s3Client.send(new DeleteObjectsCommand({
+          Bucket: this.bucketName,
+          Delete: { Objects: objectsToDelete }
+        }));
+      } catch (err) {
+        console.error('[StorageService] Batch delete portfolio photos R2 error:', err);
+      }
+    }
+
+    // Delete DB records
+    await this.prisma.portfolioPhoto.deleteMany({
+      where: {
+        id: { in: photos.map(p => p.id) },
+        photographerId: photographer.id
+      }
+    });
+
+    // Recalculate storage and invalidate cache
+    await this.recalculateStorage(photographer.id);
+    await this.invalidatePortfolioCache(photographer.id);
+
+    return { success: true, count: photos.length };
   }
 
   async deletePortfolioCategory(userId: string, category: string) {

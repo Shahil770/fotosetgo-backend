@@ -285,6 +285,7 @@ model Event {
   slug                  String            @unique
   eventDate             DateTime?
   location              String?
+  category              String?           @default("WEDDING")
   status                EventStatus       @default(DRAFT)
   visibility            EventVisibility   @default(PRIVATE)
   allowDownload         Boolean           @default(true)

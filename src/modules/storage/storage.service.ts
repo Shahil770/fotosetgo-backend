@@ -3385,6 +3385,7 @@ export class StorageService implements OnModuleInit {
       id: event.id,
       title: event.title,
       slug: event.slug,
+      category: event.category || 'WEDDING',
       eventDate: event.eventDate,
       location: event.location,
       allowDownload: effectiveAllowDownload,

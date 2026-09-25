@@ -66,6 +66,7 @@ export class EventsService {
         title,
         slug,
         location,
+        category: data.category || 'WEDDING',
         eventDate: data.eventDate ? new Date(data.eventDate) : null,
         visibility: data.visibility || 'PRIVATE',
         status: data.status || 'DRAFT',
@@ -570,6 +571,7 @@ export class EventsService {
       data: {
         title: data.title !== undefined ? (toTitleCase(data.title) || data.title) : undefined,
         location: data.location !== undefined ? (toTitleCase(data.location) || data.location) : undefined,
+        category: data.category !== undefined ? data.category : undefined,
         eventDate: data.eventDate ? new Date(data.eventDate) : undefined,
         status: data.status,
         visibility: data.visibility,

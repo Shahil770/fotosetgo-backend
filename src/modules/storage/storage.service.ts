@@ -5571,11 +5571,27 @@ export class StorageService implements OnModuleInit {
         },
         portfolioReels: {
           orderBy: { createdAt: 'desc' }
+        },
+        subscriptions: {
+          where: { status: 'ACTIVE' },
+          include: { package: true },
+          orderBy: { createdAt: 'desc' },
+          take: 1
         }
       }
     });
 
     if (!photographer || !photographer.portfolioEnabled) {
+      return null;
+    }
+
+    const activeSub = photographer.subscriptions?.[0];
+    const hasPortfolioFeature = !!(activeSub?.package?.featurePortfolioWebsite || activeSub?.package?.featureCustomBranding);
+
+    if (!hasPortfolioFeature) {
+      try {
+        await this.redis.del(cacheKey);
+      } catch (_) {}
       return null;
     }
 

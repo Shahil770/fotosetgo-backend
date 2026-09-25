@@ -699,7 +699,7 @@ export class AuthService {
       });
 
       // Update photographer profile with active package ID & initial free plan credits
-      const updatedPhotographer = await tx.photographer.update({
+      await tx.photographer.update({
         where: { id: photographer.id },
         data: {
           activePackageId: freePackage.id,
@@ -717,6 +717,66 @@ export class AuthService {
             description: `Initial free credits from ${freePackage.name} plan`,
           },
         });
+      }
+
+      // Check dynamic ReferralConfig from DB for Free package
+      if (referredById) {
+        const referralConfig = await tx.referralConfig.findUnique({
+          where: { packageId: freePackage.id },
+        });
+
+        if (referralConfig && referralConfig.isReferralEnabled) {
+          const instantBonus = referralConfig.instantBonusCredits || 0;
+          const monthlyBoost = referralConfig.monthlyBoostCredits || 0;
+          const welcomeBonus = referralConfig.refereeWelcomeCredits || 0;
+
+          // 1. Create Active Referral Record for Free Tier
+          await tx.referral.create({
+            data: {
+              referrerId: referredById,
+              referredUserId: photographer.id,
+              packageId: freePackage.id,
+              tenureYears: 10,
+              instantCreditsAwarded: instantBonus,
+              monthlyBoostCredits: monthlyBoost,
+              status: 'ACTIVE',
+              validFrom: new Date(),
+              validUntil: new Date(new Date().setFullYear(new Date().getFullYear() + 10)),
+            },
+          });
+
+          // 2. Award Instant Bonus to Referrer
+          if (instantBonus > 0) {
+            await tx.photographer.update({
+              where: { id: referredById },
+              data: { creditBalance: { increment: instantBonus } },
+            });
+            await tx.creditTransaction.create({
+              data: {
+                photographerId: referredById,
+                amount: instantBonus,
+                action: 'REFERRAL_INSTANT_BONUS',
+                description: `Instant Referral Bonus: ${data.studioName || data.name} joined via your referral link (+${(instantBonus / 100).toFixed(0)} Credits)`,
+              },
+            });
+          }
+
+          // 3. Award Welcome Referral Credits to New User
+          if (welcomeBonus > 0) {
+            await tx.photographer.update({
+              where: { id: photographer.id },
+              data: { creditBalance: { increment: welcomeBonus } },
+            });
+            await tx.creditTransaction.create({
+              data: {
+                photographerId: photographer.id,
+                amount: welcomeBonus,
+                action: 'REFERRAL_WELCOME_BONUS',
+                description: `Welcome Referral Perk for joining via referral invitation (+${(welcomeBonus / 100).toFixed(0)} Credits)`,
+              },
+            });
+          }
+        }
       }
 
       return { userId: user.id, photographerId: photographer.id, email: user.email, name: user.name };
@@ -1110,24 +1170,156 @@ export class AuthService {
     };
   }
 
+  /**
+   * Check Admin login rate limit status (lockout status)
+   */
+  async checkAdminLoginRateLimit(email: string, ipAddress: string): Promise<{ isLocked: boolean; lockTtl: number }> {
+    const cleanEmail = (email || '').toLowerCase().trim();
+    const cleanIp = ipAddress || '127.0.0.1';
+
+    const ipLockKey = `ratelimit:admin:lockout:ip:${cleanIp}`;
+    const emailLockKey = cleanEmail ? `ratelimit:admin:lockout:email:${cleanEmail}` : null;
+
+    const [ipLock, emailLock] = await Promise.all([
+      this.redis.get(ipLockKey),
+      emailLockKey ? this.redis.get(emailLockKey) : Promise.resolve(null),
+    ]);
+
+    if (ipLock || emailLock) {
+      const ttl = await (ipLock ? this.redis.ttl(ipLockKey) : this.redis.ttl(emailLockKey!));
+      return {
+        isLocked: true,
+        lockTtl: Math.max(ttl, 60),
+      };
+    }
+
+    return {
+      isLocked: false,
+      lockTtl: 0,
+    };
+  }
+
+  /**
+   * Record Admin login failure in Redis and enforce strict 3-attempt lockout for 30 minutes
+   */
+  async recordAdminLoginFailure(email: string, ipAddress: string): Promise<{ remainingAttempts: number; isLocked: boolean; lockTtl: number }> {
+    const cleanEmail = (email || '').toLowerCase().trim();
+    const cleanIp = ipAddress || '127.0.0.1';
+
+    const ipAttemptsKey = `ratelimit:admin:attempts:ip:${cleanIp}`;
+    const emailAttemptsKey = cleanEmail ? `ratelimit:admin:attempts:email:${cleanEmail}` : null;
+
+    const pipe = this.redis.pipeline();
+    pipe.incr(ipAttemptsKey);
+    pipe.expire(ipAttemptsKey, 1800); // 30 mins window
+    if (emailAttemptsKey) {
+      pipe.incr(emailAttemptsKey);
+      pipe.expire(emailAttemptsKey, 1800);
+    }
+
+    const results = await pipe.exec();
+    const ipCount = Number(results?.[0]?.[1] || 1);
+    const emailCount = emailAttemptsKey ? Number(results?.[2]?.[1] || 1) : 0;
+    const failedAttempts = Math.max(ipCount, emailCount);
+
+    if (failedAttempts >= 3) {
+      await Promise.all([
+        this.redis.set(`ratelimit:admin:lockout:ip:${cleanIp}`, '1', 'EX', 1800),
+        cleanEmail ? this.redis.set(`ratelimit:admin:lockout:email:${cleanEmail}`, '1', 'EX', 1800) : Promise.resolve(),
+      ]);
+      return {
+        remainingAttempts: 0,
+        isLocked: true,
+        lockTtl: 1800,
+      };
+    }
+
+    return {
+      remainingAttempts: Math.max(0, 3 - failedAttempts),
+      isLocked: false,
+      lockTtl: 0,
+    };
+  }
+
+  /**
+   * Clear all Admin login failure and lockout records upon successful authentication
+   */
+  async resetAdminLoginFailures(email: string, ipAddress: string): Promise<void> {
+    const cleanEmail = (email || '').toLowerCase().trim();
+    const cleanIp = ipAddress || '127.0.0.1';
+
+    await Promise.all([
+      this.redis.del(`ratelimit:admin:attempts:ip:${cleanIp}`),
+      this.redis.del(`ratelimit:admin:lockout:ip:${cleanIp}`),
+      cleanEmail ? this.redis.del(`ratelimit:admin:attempts:email:${cleanEmail}`) : Promise.resolve(),
+      cleanEmail ? this.redis.del(`ratelimit:admin:lockout:email:${cleanEmail}`) : Promise.resolve(),
+    ]).catch(() => {});
+  }
+
   async adminLogin(credentials: { email: string; password: string }, requestInfo?: { ipAddress?: string; userAgent?: string }) {
     const normalizedEmail = (credentials.email || '').toLowerCase().trim();
+    const ipAddress = requestInfo?.ipAddress || '127.0.0.1';
+
+    // 1. Strict Anti-Brute Force Lockout Check
+    const rateStatus = await this.checkAdminLoginRateLimit(normalizedEmail, ipAddress);
+    if (rateStatus.isLocked) {
+      const waitMinutes = Math.ceil(rateStatus.lockTtl / 60);
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.TOO_MANY_REQUESTS,
+          message: `Too many failed admin login attempts. Admin access has been locked for security. Please try again after ${waitMinutes} minute(s).`,
+          isLocked: true,
+          lockTtl: rateStatus.lockTtl,
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    // 2. Lookup Admin User
     const user = await this.prisma.user.findUnique({
       where: { email: normalizedEmail },
     });
 
-    if (!user || !user.isActive) {
-      throw new UnauthorizedException('Invalid admin credentials.');
+    if (!user || !user.isActive || user.role !== 'ADMIN') {
+      const failure = await this.recordAdminLoginFailure(normalizedEmail, ipAddress);
+      if (failure.isLocked) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.TOO_MANY_REQUESTS,
+            message: 'Too many failed admin login attempts. Admin access has been locked for 30 minutes.',
+            isLocked: true,
+            lockTtl: failure.lockTtl,
+          },
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+      throw new UnauthorizedException(
+        `Invalid admin credentials. ${failure.remainingAttempts} attempt(s) remaining before security lockout.`
+      );
     }
 
-    if (user.role !== 'ADMIN') {
-      throw new UnauthorizedException('Access denied. This account does not have administrator privileges.');
-    }
-
+    // 3. Compare Password
     const passwordMatch = await bcrypt.compare(credentials.password, user.passwordHash);
     if (!passwordMatch) {
-      throw new UnauthorizedException('Invalid admin credentials.');
+      const failure = await this.recordAdminLoginFailure(normalizedEmail, ipAddress);
+      if (failure.isLocked) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.TOO_MANY_REQUESTS,
+            message: 'Too many failed admin login attempts. Admin access has been locked for 30 minutes.',
+            isLocked: true,
+            lockTtl: failure.lockTtl,
+          },
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+      throw new UnauthorizedException(
+        `Invalid admin credentials. ${failure.remainingAttempts} attempt(s) remaining before security lockout.`
+      );
     }
+
+    // 4. Success - Reset failure counter
+    await this.resetAdminLoginFailures(normalizedEmail, ipAddress);
 
     const payload = { sub: user.id, email: user.email, role: 'ADMIN', type: 'ADMIN_SESSION' };
     const token = this.jwtService.sign(payload, { expiresIn: '24h' });
@@ -1283,6 +1475,66 @@ export class AuthService {
               description: `Initial free credits from ${freePackage.name} plan`,
             },
           });
+        }
+
+        // Check dynamic ReferralConfig from DB for Free package (Google Auth)
+        if (referredById) {
+          const referralConfig = await tx.referralConfig.findUnique({
+            where: { packageId: freePackage.id },
+          });
+
+          if (referralConfig && referralConfig.isReferralEnabled) {
+            const instantBonus = referralConfig.instantBonusCredits || 0;
+            const monthlyBoost = referralConfig.monthlyBoostCredits || 0;
+            const welcomeBonus = referralConfig.refereeWelcomeCredits || 0;
+
+            // 1. Create Active Referral Record for Free Tier
+            await tx.referral.create({
+              data: {
+                referrerId: referredById,
+                referredUserId: photographer.id,
+                packageId: freePackage.id,
+                tenureYears: 10,
+                instantCreditsAwarded: instantBonus,
+                monthlyBoostCredits: monthlyBoost,
+                status: 'ACTIVE',
+                validFrom: new Date(),
+                validUntil: new Date(new Date().setFullYear(new Date().getFullYear() + 10)),
+              },
+            });
+
+            // 2. Award Instant Bonus to Referrer
+            if (instantBonus > 0) {
+              await tx.photographer.update({
+                where: { id: referredById },
+                data: { creditBalance: { increment: instantBonus } },
+              });
+              await tx.creditTransaction.create({
+                data: {
+                  photographerId: referredById,
+                  amount: instantBonus,
+                  action: 'REFERRAL_INSTANT_BONUS',
+                  description: `Instant Referral Bonus: ${name} joined via your referral link (+${(instantBonus / 100).toFixed(0)} Credits)`,
+                },
+              });
+            }
+
+            // 3. Award Welcome Referral Credits to New User
+            if (welcomeBonus > 0) {
+              await tx.photographer.update({
+                where: { id: photographer.id },
+                data: { creditBalance: { increment: welcomeBonus } },
+              });
+              await tx.creditTransaction.create({
+                data: {
+                  photographerId: photographer.id,
+                  amount: welcomeBonus,
+                  action: 'REFERRAL_WELCOME_BONUS',
+                  description: `Welcome Referral Perk for joining via referral invitation (+${(welcomeBonus / 100).toFixed(0)} Credits)`,
+                },
+              });
+            }
+          }
         }
 
         return tx.user.findUnique({

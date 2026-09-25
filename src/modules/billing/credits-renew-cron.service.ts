@@ -70,11 +70,11 @@ export class CreditsRenewCronService {
               const activeSub = photographer.subscriptions?.[0];
               const baseCredits = (activeSub && activeSub.package?.faceScanCredits) ? activeSub.package.faceScanCredits : 0;
 
-              // Referrer is only eligible for monthly referral boost if they are on an active paid AI plan (baseCredits > 0)
+              // Calculate monthly referral boost for all photographers with active referrals
               let totalReferralBoost = 0;
               const validReferrals = photographer.referralsMade || [];
 
-              if (baseCredits > 0 && validReferrals.length > 0) {
+              if (validReferrals.length > 0) {
                 totalReferralBoost = validReferrals.reduce((sum, r) => sum + (r.monthlyBoostCredits || 0), 0);
               }
 

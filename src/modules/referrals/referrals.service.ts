@@ -85,10 +85,10 @@ export class ReferralsService {
     const totalEarnedPaise = totalCreditsTx._sum.amount || 0;
 
     const activeSub = photographer.subscriptions?.[0];
-    const isReferrerActivePaidTier = !!(activeSub && (activeSub.package?.faceScanCredits || 0) > 0);
+    const isReferrerActivePaidTier = true; // All photographers with active referral boosts are eligible
 
     const packageConfigs = await this.prisma.package.findMany({
-      where: { isActive: true, name: { not: 'Free' } },
+      where: { isActive: true },
       orderBy: { price: 'asc' },
       include: { referralConfig: true },
     });

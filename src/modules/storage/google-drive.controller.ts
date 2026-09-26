@@ -51,8 +51,8 @@ export class GoogleDriveController {
     }
 
     const redirectPath = source === 'google-drive'
-      ? '/dashboard/google-drive'
-      : '/dashboard/settings?tab=storage';
+      ? '/google-drive'
+      : '/settings?tab=storage';
 
     try {
       await this.googleDriveService.handleCallback(code, photographerId);

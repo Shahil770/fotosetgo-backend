@@ -136,12 +136,12 @@ export class StorageService implements OnModuleInit {
         try {
           const listKeys = await this.scanKeys(`cache:events:list:${event.photographerId}*`);
           if (listKeys && listKeys.length > 0) keys.push(...listKeys);
-        } catch {}
+        } catch { }
 
         try {
           const photoKeys = await this.scanKeys(`cache:event:photos:${eventId}*`);
           if (photoKeys && photoKeys.length > 0) keys.push(...photoKeys);
-        } catch {}
+        } catch { }
 
         if (event.slug) {
           keys.push(`cache:public:event:${event.slug}`);
@@ -2502,7 +2502,7 @@ export class StorageService implements OnModuleInit {
             if (photoCacheKeys && photoCacheKeys.length > 0) {
               keys.push(...photoCacheKeys);
             }
-          } catch {}
+          } catch { }
         }
       }
 
@@ -3654,7 +3654,7 @@ export class StorageService implements OnModuleInit {
         // Remove any stale/deleted photoIds from Redis set
         const invalidPhotoIds = photoIds.filter(id => !validPhotoIds.includes(id));
         if (invalidPhotoIds.length > 0) {
-          await this.redis.srem(setKey, ...invalidPhotoIds).catch(() => {});
+          await this.redis.srem(setKey, ...invalidPhotoIds).catch(() => { });
         }
 
         if (validPhotoIds.length > 0) {
@@ -4026,11 +4026,28 @@ export class StorageService implements OnModuleInit {
       throw new ForbiddenException('Download is not enabled for this event gallery.');
     }
 
+    const isSelectiveDownload = Array.isArray(photoIds) && photoIds.length > 0;
     const requiresPasscode = event.visibility === 'PRIVATE' || (event.passcode && event.passcode !== '');
-    if (requiresPasscode) {
+    if (requiresPasscode && !isSelectiveDownload) {
       if (!passcode || passcode.trim() === '') {
         throw new UnauthorizedException('Passcode required to download event photos.');
       }
+      if (passcode !== event.passcode) {
+        try {
+          const fails = await this.redis.incr(failKey);
+          if (fails === 1) await this.redis.expire(failKey, 300);
+          if (fails >= 5) {
+            await this.redis.set(lockKey, '1', 'EX', 300);
+            throw new ForbiddenException('Too many incorrect passcode attempts. Your access has been locked for 5 minutes.');
+          }
+        } catch (err: any) {
+          if (err instanceof ForbiddenException) throw err;
+        }
+        throw new UnauthorizedException('Invalid event passcode');
+      } else {
+        this.redis.del(failKey).catch(() => { });
+      }
+    } else if (requiresPasscode && isSelectiveDownload && passcode && passcode.trim() !== '') {
       if (passcode !== event.passcode) {
         try {
           const fails = await this.redis.incr(failKey);
@@ -5608,7 +5625,7 @@ export class StorageService implements OnModuleInit {
     if (!hasPortfolioFeature) {
       try {
         await this.redis.del(cacheKey);
-      } catch (_) {}
+      } catch (_) { }
       return null;
     }
 

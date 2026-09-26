@@ -3912,6 +3912,7 @@ export class StorageService implements OnModuleInit {
       select: {
         id: true,
         allowDownload: true,
+        watermarkEnabled: true,
         photographer: {
           select: {
             subscriptions: {
@@ -3941,13 +3942,25 @@ export class StorageService implements OnModuleInit {
     const activeSub = event.photographer?.subscriptions?.[0];
     const canDisableDownload = activeSub?.package ? activeSub.package.featureDisableDownload : false;
     const effectiveAllowDownload = canDisableDownload ? Boolean(event.allowDownload) : true;
+    const hasWatermarkFeature = activeSub?.package ? Boolean(activeSub.package.featureWatermark) : true;
+    const isWatermarked = hasWatermarkFeature && Boolean(event.watermarkEnabled);
 
     let directUrl: string;
     if (isDownload) {
       if (!effectiveAllowDownload) {
         throw new ForbiddenException('Download is not enabled for this gallery');
       }
-      directUrl = await this.getDownloadUrl(photo.r2KeyOriginal, photo.filenameOriginal);
+      if (isWatermarked) {
+        // When watermark is enabled, serve thumbnail or preview image instead of full resolution original
+        const isVideo = photo.type === 'VIDEO';
+        const downloadKey = photo.r2KeyThumb || photo.r2KeyPreview || photo.r2KeyOriginal;
+        const downloadFilename = isVideo
+          ? `${(photo.filenameOriginal || 'video').replace(/\.[^/.]+$/, '')}_thumb.jpg`
+          : photo.filenameOriginal;
+        directUrl = await this.getDownloadUrl(downloadKey, downloadFilename);
+      } else {
+        directUrl = await this.getDownloadUrl(photo.r2KeyOriginal, photo.filenameOriginal);
+      }
     } else {
       // If thumb is requested (for video or image), always serve the .jpg thumbnail!
       // If full preview is requested: videos serve original video file, images serve 1920px preview or original
@@ -3997,6 +4010,7 @@ export class StorageService implements OnModuleInit {
         visibility: true,
         passcode: true,
         allowDownload: true,
+        watermarkEnabled: true,
         photographer: {
           select: {
             subscriptions: {
@@ -4021,6 +4035,7 @@ export class StorageService implements OnModuleInit {
     const bulkActiveSub = event.photographer?.subscriptions?.[0];
     const canDisableBulkDownload = bulkActiveSub?.package ? bulkActiveSub.package.featureDisableDownload : false;
     const effectiveBulkAllowDownload = canDisableBulkDownload ? Boolean(event.allowDownload) : true;
+    const hasBulkWatermark = (bulkActiveSub?.package ? Boolean(bulkActiveSub.package.featureWatermark) : true) && Boolean(event.watermarkEnabled);
 
     if (!effectiveBulkAllowDownload) {
       throw new ForbiddenException('Download is not enabled for this event gallery.');
@@ -4076,6 +4091,8 @@ export class StorageService implements OnModuleInit {
         id: true,
         filenameOriginal: true,
         r2KeyOriginal: true,
+        r2KeyPreview: true,
+        r2KeyThumb: true,
         type: true,
         duration: true,
         fileSize: true,
@@ -4088,12 +4105,23 @@ export class StorageService implements OnModuleInit {
 
     const downloadList = await Promise.all(
       photos.map(async (photo) => {
-        const downloadUrl = await this.getDownloadUrl(photo.r2KeyOriginal, photo.filenameOriginal);
+        const isVideo = photo.type === 'VIDEO';
+        let keyToUse = photo.r2KeyOriginal;
+        let filenameToUse = photo.filenameOriginal;
+
+        if (hasBulkWatermark) {
+          keyToUse = photo.r2KeyThumb || photo.r2KeyPreview || photo.r2KeyOriginal;
+          if (isVideo) {
+            filenameToUse = `${(photo.filenameOriginal || 'video').replace(/\.[^/.]+$/, '')}_thumb.jpg`;
+          }
+        }
+
+        const downloadUrl = await this.getDownloadUrl(keyToUse, filenameToUse);
         return {
           id: photo.id,
-          filenameOriginal: photo.filenameOriginal,
+          filenameOriginal: filenameToUse,
           downloadUrl,
-          type: photo.type || 'IMAGE',
+          type: hasBulkWatermark && isVideo ? 'IMAGE' : (photo.type || 'IMAGE'),
           duration: photo.duration || 0,
           fileSize: Number(photo.fileSize || 0)
         };

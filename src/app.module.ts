@@ -11,6 +11,7 @@ import { RedisModule } from './modules/redis/redis.module';
 import { BeamModule } from './modules/beam/beam.module';
 import { ReferralsModule } from './modules/referrals/referrals.module';
 import { WalletModule } from './modules/wallet/wallet.module';
+import { ScannerModule } from './modules/scanner/scanner.module';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { WalletModule } from './modules/wallet/wallet.module';
     BeamModule,
     ReferralsModule,
     WalletModule,
+    ScannerModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -271,6 +271,26 @@ export class StorageService implements OnModuleInit {
           isDefault: false,
           sortOrder: 5,
           isActive: true
+        },
+        {
+          key: 'VOGUE_EDITORIAL',
+          name: 'Parisian Haute Vogue',
+          description: 'Frozen platinum silk, rose-gold quartz halos, high-fashion magazine editorial lookbook',
+          previewBg: 'bg-[#090a0f]',
+          componentName: 'VogueEditorialTheme',
+          isDefault: false,
+          sortOrder: 6,
+          isActive: true
+        },
+        {
+          key: 'ATELIER_HORIZON',
+          name: 'Atelier Horizon Minimal',
+          description: 'Nordic architectural luxury, warm alabaster & obsidian tones, curated exhibition series and bespoke dossiers',
+          previewBg: 'bg-[#0c0c0e]',
+          componentName: 'AtelierTheme',
+          isDefault: false,
+          sortOrder: 7,
+          isActive: true
         }
       ];
 
@@ -4306,7 +4326,7 @@ export class StorageService implements OnModuleInit {
     if (!urlOrKey) return null;
     try {
       // 1. If it's already a raw R2 key (e.g. "uuid/portfolio/hero-video/...")
-      if (!urlOrKey.startsWith('http://') && !urlOrKey.startsWith('https://') && urlOrKey.includes('/portfolio/')) {
+      if (!urlOrKey.startsWith('http://') && !urlOrKey.startsWith('https://')) {
         return await this.getReadUrl(urlOrKey);
       }
       // 2. If it's a full URL containing a portfolio key
@@ -4443,60 +4463,83 @@ export class StorageService implements OnModuleInit {
     }
 
     try {
-      // 1. Delete replaced old Teaser Video & Thumbnail from R2 if new video is uploaded
-      if (data.portfolioVideoUrl !== undefined && photographer.portfolioVideoUrl && photographer.portfolioVideoUrl !== data.portfolioVideoUrl) {
-        const oldKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioVideoUrl, photographer.id);
-        if (oldKey) {
-          try {
-            await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldKey }));
-            this.invalidateUrlCache(oldKey);
-            this.logger.log(`[StorageService] Deleted replaced old Teaser Video from R2: ${oldKey}`);
-          } catch (err: any) {
-            this.logger.error(`[StorageService] Failed to delete replaced Teaser Video: ${err.message}`);
-          }
+      // Extract keys to accurately compare whether the file has actually changed
+      const existingVideoKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioVideoUrl, photographer.id);
+      const incomingVideoKey = data.portfolioVideoUrl !== undefined
+        ? (data.portfolioVideoUrl === '' ? '' : this.extractR2KeyFromUrlOrKey(data.portfolioVideoUrl, photographer.id))
+        : undefined;
+
+      // 1. Delete replaced old Teaser Video from R2 ONLY if a truly new/different video key was passed or explicitly cleared
+      if (incomingVideoKey !== undefined && existingVideoKey && incomingVideoKey !== existingVideoKey) {
+        try {
+          await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: existingVideoKey }));
+          this.invalidateUrlCache(existingVideoKey);
+          this.logger.log(`[StorageService] Deleted replaced old Teaser Video from R2: ${existingVideoKey}`);
+        } catch (err: any) {
+          this.logger.error(`[StorageService] Failed to delete replaced Teaser Video: ${err.message}`);
         }
       }
 
-      if (data.portfolioVideoThumbUrl !== undefined && photographer.portfolioVideoThumbUrl && photographer.portfolioVideoThumbUrl !== data.portfolioVideoThumbUrl) {
-        const oldThumbKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioVideoThumbUrl, photographer.id);
-        if (oldThumbKey) {
-          try {
-            await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldThumbKey }));
-            this.invalidateUrlCache(oldThumbKey);
-            this.logger.log(`[StorageService] Deleted replaced old Teaser Video Thumbnail from R2: ${oldThumbKey}`);
-          } catch (err: any) {
-            this.logger.error(`[StorageService] Failed to delete replaced Teaser Video Thumbnail: ${err.message}`);
-          }
+      const existingVideoThumbKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioVideoThumbUrl, photographer.id);
+      const incomingVideoThumbKey = data.portfolioVideoThumbUrl !== undefined
+        ? (data.portfolioVideoThumbUrl === '' ? '' : this.extractR2KeyFromUrlOrKey(data.portfolioVideoThumbUrl, photographer.id))
+        : undefined;
+
+      if (incomingVideoThumbKey !== undefined && existingVideoThumbKey && incomingVideoThumbKey !== existingVideoThumbKey) {
+        try {
+          await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: existingVideoThumbKey }));
+          this.invalidateUrlCache(existingVideoThumbKey);
+          this.logger.log(`[StorageService] Deleted replaced old Teaser Video Thumbnail from R2: ${existingVideoThumbKey}`);
+        } catch (err: any) {
+          this.logger.error(`[StorageService] Failed to delete replaced Teaser Video Thumbnail: ${err.message}`);
         }
       }
 
-      // 2. Delete replaced old BTS Video from R2 if new BTS video is uploaded
-      if (data.portfolioBtsUrl !== undefined && photographer.portfolioBtsUrl && photographer.portfolioBtsUrl !== data.portfolioBtsUrl) {
-        const oldKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioBtsUrl, photographer.id);
-        if (oldKey) {
-          try {
-            await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldKey }));
-            this.invalidateUrlCache(oldKey);
-            this.logger.log(`[StorageService] Deleted replaced old BTS Video from R2: ${oldKey}`);
-          } catch (err: any) {
-            this.logger.error(`[StorageService] Failed to delete replaced BTS Video: ${err.message}`);
-          }
+      // 2. Delete replaced old BTS Video from R2 ONLY if a truly new/different BTS video key was passed or explicitly cleared
+      const existingBtsKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioBtsUrl, photographer.id);
+      const incomingBtsKey = data.portfolioBtsUrl !== undefined
+        ? (data.portfolioBtsUrl === '' ? '' : this.extractR2KeyFromUrlOrKey(data.portfolioBtsUrl, photographer.id))
+        : undefined;
+
+      if (incomingBtsKey !== undefined && existingBtsKey && incomingBtsKey !== existingBtsKey) {
+        try {
+          await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: existingBtsKey }));
+          this.invalidateUrlCache(existingBtsKey);
+          this.logger.log(`[StorageService] Deleted replaced old BTS Video from R2: ${existingBtsKey}`);
+        } catch (err: any) {
+          this.logger.error(`[StorageService] Failed to delete replaced BTS Video: ${err.message}`);
         }
       }
 
-      // 3. Delete replaced old BTS Thumbnail from R2 if new BTS thumbnail is uploaded
-      if (data.portfolioBtsThumbUrl !== undefined && photographer.portfolioBtsThumbUrl && photographer.portfolioBtsThumbUrl !== data.portfolioBtsThumbUrl) {
-        const oldThumbKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioBtsThumbUrl, photographer.id);
-        if (oldThumbKey) {
-          try {
-            await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: oldThumbKey }));
-            this.invalidateUrlCache(oldThumbKey);
-            this.logger.log(`[StorageService] Deleted replaced old BTS Thumbnail from R2: ${oldThumbKey}`);
-          } catch (err: any) {
-            this.logger.error(`[StorageService] Failed to delete replaced BTS Thumbnail: ${err.message}`);
-          }
+      // 3. Delete replaced old BTS Thumbnail from R2 ONLY if a truly new/different BTS thumb key was passed or explicitly cleared
+      const existingBtsThumbKey = this.extractR2KeyFromUrlOrKey(photographer.portfolioBtsThumbUrl, photographer.id);
+      const incomingBtsThumbKey = data.portfolioBtsThumbUrl !== undefined
+        ? (data.portfolioBtsThumbUrl === '' ? '' : this.extractR2KeyFromUrlOrKey(data.portfolioBtsThumbUrl, photographer.id))
+        : undefined;
+
+      if (incomingBtsThumbKey !== undefined && existingBtsThumbKey && incomingBtsThumbKey !== existingBtsThumbKey) {
+        try {
+          await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.bucketName, Key: existingBtsThumbKey }));
+          this.invalidateUrlCache(existingBtsThumbKey);
+          this.logger.log(`[StorageService] Deleted replaced old BTS Thumbnail from R2: ${existingBtsThumbKey}`);
+        } catch (err: any) {
+          this.logger.error(`[StorageService] Failed to delete replaced BTS Thumbnail: ${err.message}`);
         }
       }
+
+      // Sanitize video/thumbnail URLs to clean R2 keys if full URLs were submitted
+      const cleanVideoUrl = data.portfolioVideoUrl !== undefined
+        ? (data.portfolioVideoUrl === '' ? null : (incomingVideoKey || data.portfolioVideoUrl))
+        : photographer.portfolioVideoUrl;
+      const cleanVideoThumbUrl = data.portfolioVideoThumbUrl !== undefined
+        ? (data.portfolioVideoThumbUrl === '' ? null : (incomingVideoThumbKey || data.portfolioVideoThumbUrl))
+        : photographer.portfolioVideoThumbUrl;
+      const cleanBtsUrl = data.portfolioBtsUrl !== undefined
+        ? (data.portfolioBtsUrl === '' ? null : (incomingBtsKey || data.portfolioBtsUrl))
+        : photographer.portfolioBtsUrl;
+      const cleanBtsThumbUrl = data.portfolioBtsThumbUrl !== undefined
+        ? (data.portfolioBtsThumbUrl === '' ? null : (incomingBtsThumbKey || data.portfolioBtsThumbUrl))
+        : photographer.portfolioBtsThumbUrl;
 
       const updated = await this.prisma.photographer.update({
         where: { id: photographer.id },
@@ -4512,13 +4555,13 @@ export class StorageService implements OnModuleInit {
           portfolioServices: data.portfolioServices !== undefined ? (data.portfolioServices as any) : (photographer.portfolioServices as any),
           portfolioStats: data.portfolioStats !== undefined ? (data.portfolioStats as any) : (photographer.portfolioStats as any),
           portfolioFaqs: data.portfolioFaqs !== undefined ? (data.portfolioFaqs as any) : (photographer.portfolioFaqs as any),
-          portfolioVideoUrl: data.portfolioVideoUrl !== undefined ? data.portfolioVideoUrl : photographer.portfolioVideoUrl,
-          portfolioVideoThumbUrl: data.portfolioVideoThumbUrl !== undefined ? data.portfolioVideoThumbUrl : photographer.portfolioVideoThumbUrl,
+          portfolioVideoUrl: cleanVideoUrl,
+          portfolioVideoThumbUrl: cleanVideoThumbUrl,
           portfolioVideoSizeBytes: data.portfolioVideoSizeBytes !== undefined ? BigInt(data.portfolioVideoSizeBytes) : (data.portfolioVideoUrl === '' ? BigInt(0) : photographer.portfolioVideoSizeBytes),
           portfolioVideoThumbSizeBytes: data.portfolioVideoThumbSizeBytes !== undefined ? BigInt(data.portfolioVideoThumbSizeBytes) : (data.portfolioVideoThumbUrl === '' ? BigInt(0) : photographer.portfolioVideoThumbSizeBytes),
           portfolioProcess: data.portfolioProcess !== undefined ? (data.portfolioProcess as any) : (photographer.portfolioProcess as any),
-          portfolioBtsUrl: data.portfolioBtsUrl !== undefined ? data.portfolioBtsUrl : photographer.portfolioBtsUrl,
-          portfolioBtsThumbUrl: data.portfolioBtsThumbUrl !== undefined ? data.portfolioBtsThumbUrl : photographer.portfolioBtsThumbUrl,
+          portfolioBtsUrl: cleanBtsUrl,
+          portfolioBtsThumbUrl: cleanBtsThumbUrl,
           portfolioBtsSizeBytes: data.portfolioBtsSizeBytes !== undefined ? BigInt(data.portfolioBtsSizeBytes) : (data.portfolioBtsUrl === '' ? BigInt(0) : photographer.portfolioBtsSizeBytes),
           portfolioBtsThumbSizeBytes: data.portfolioBtsThumbSizeBytes !== undefined ? BigInt(data.portfolioBtsThumbSizeBytes) : (data.portfolioBtsThumbUrl === '' ? BigInt(0) : photographer.portfolioBtsThumbSizeBytes),
           portfolioEquipment: data.portfolioEquipment !== undefined ? (data.portfolioEquipment as any) : (photographer.portfolioEquipment as any),

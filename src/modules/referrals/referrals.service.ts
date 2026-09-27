@@ -88,7 +88,7 @@ export class ReferralsService {
     const isReferrerActivePaidTier = true; // All photographers with active referral boosts are eligible
 
     const packageConfigs = await this.prisma.package.findMany({
-      where: { isActive: true },
+      where: { isActive: true, name: { not: 'Free' } },
       orderBy: { price: 'asc' },
       include: { referralConfig: true },
     });
